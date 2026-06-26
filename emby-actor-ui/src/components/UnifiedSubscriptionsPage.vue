@@ -199,7 +199,6 @@
                   </template>
 
                   <!-- 通用 -->
-                  <n-tooltip><template #trigger><n-button text @click="handleNullbrSearch(item)"><template #icon><n-icon :component="CloudDownloadIcon" size="18" /></template></n-button></template>NULLBR</n-tooltip>
                   <n-tooltip><template #trigger><n-button text tag="a" :href="getTMDbLink(item)" target="_blank"><template #icon><n-icon :component="TMDbIcon" size="18" /></template></n-button></template>TMDb</n-tooltip>
               </div>
                 </div>
@@ -281,59 +280,10 @@
         <n-alert type="info" :show-icon="false" style="margin-bottom: 16px;">
           <li>新片，采用“搜索 N 天 -> 暂停 M 天”的循环机制，大幅降低 MoviePilot 搜索压力。</li>
           <li>老片，采用“搜索 N 天 -> 取消订阅 -> 复活”</li>
-          <li>仅使用 NULLBR 时，请勿把统一订阅处理任务执行间隔小于8小时，以免封号</li>
         </n-alert>
 
-        <!-- 订阅源配置置顶 -->
-        <n-form-item label="订阅源">
-          <n-space vertical style="width: 100%">
-             <n-checkbox-group v-model:value="selectedSources">
-                <n-space>
-                  <n-checkbox value="mp" label="MoviePilot" />
-                  <n-checkbox value="nullbr" label="NULLBR" />
-                </n-space>
-             </n-checkbox-group>
-             
-             <!-- 仅当选择了两个源时，才显示优先级配置 -->
-             <n-card 
-               v-if="selectedSources.includes('mp') && selectedSources.includes('nullbr')"
-               size="small" 
-               embedded 
-               :bordered="false" 
-               style="background: rgba(128,128,128,0.05); margin-top: 8px;"
-             >
-                <div style="display: flex; align-items: center;">
-                   <span style="margin-right: 12px; font-weight: 500; flex-shrink: 0;">优先模式</span>
-                   <n-radio-group v-model:value="strategyConfig.sub_priority" name="sub_priority_group">
-                      <n-space>
-                         <n-radio value="mp">MP 优先</n-radio>
-                         <n-radio value="nullbr">NULLBR 优先</n-radio>
-                      </n-space>
-                   </n-radio-group>
-                </div>
-
-                <div style="margin-top: 8px; font-size: 12px; color: var(--n-text-color-3);">
-                   <template v-if="strategyConfig.sub_priority === 'mp'">
-                      <b>逻辑:</b> 先提交 MP 订阅 -> 若 N 天后未入库(超时) -> 尝试 NULLBR 下载 -> 成功则取消 MP。
-                   </template>
-                   <template v-else>
-                      <b>逻辑:</b> 先尝试 NULLBR 下载 -> 若成功则<b>跳过</b> MP 订阅 -> 若失败则回退提交 MP 订阅。<br/>
-                   </template>
-                </div>
-             </n-card>
-             <!-- 单选时的提示 -->
-             <div v-else-if="selectedSources.length === 1" style="font-size: 12px; color: gray; margin-top: 4px;">
-                当前模式: 仅使用 {{ selectedSources[0] === 'mp' ? 'MoviePilot' : 'NULLBR' }}
-             </div>
-             <div v-else style="font-size: 12px; color: var(--n-error-color); margin-top: 4px;">
-                请至少选择一个订阅源
-             </div>
-          </n-space>
-        </n-form-item>
-        
         <!-- MP订阅策略分组 -->
         <n-card 
-          v-if="selectedSources.includes('mp')"
           title="MP订阅策略" 
           size="small" 
           embedded 
@@ -373,20 +323,18 @@
       <template #footer>
         <n-space justify="end">
           <n-button @click="showStrategyModal = false">取消</n-button>
-          <n-button type="primary" @click="saveStrategyConfig" :loading="savingStrategy" :disabled="selectedSources.length === 0">保存配置</n-button>
+          <n-button type="primary" @click="saveStrategyConfig" :loading="savingStrategy">保存配置</n-button>
         </n-space>
       </template>
     </n-modal>
-    <NullbrSearchModal ref="nullbrModalRef" />
   </n-layout>
 </template>
 
 <script setup>
 import { ref, onMounted, onBeforeUnmount, h, computed, watch } from 'vue';
 import axios from 'axios';
-import { NLayout, NPageHeader, NDivider, NEmpty, NTag, NButton, NSpace, NIcon, useMessage, useDialog, NTooltip, NCard, NImage, NEllipsis, NSpin, NAlert, NRadioGroup, NRadioButton, NCheckbox, NDropdown, NInput, NSelect, NButtonGroup, NCheckboxGroup, NRadio } from 'naive-ui';
-import NullbrSearchModal from './modals/NullbrSearchModal.vue';
-import { FilmOutline as FilmIcon, TvOutline as TvIcon, CalendarOutline as CalendarIcon, TimeOutline as TimeIcon, ArrowUpOutline as ArrowUpIcon, ArrowDownOutline as ArrowDownIcon, CaretDownOutline as CaretDownIcon, CheckmarkCircleOutline as WantedIcon, HourglassOutline as PendingIcon, BanOutline as IgnoredIcon, DownloadOutline as SubscribedIcon, PersonCircleOutline as SourceIcon, TrashOutline as TrashIcon, SettingsOutline as SettingsIcon, PauseCircleOutline as PausedIcon, ReaderOutline as AuditIcon, CloudDownloadOutline as CloudDownloadIcon, CloseOutline as CloseIcon } from '@vicons/ionicons5';
+import { NLayout, NPageHeader, NDivider, NEmpty, NTag, NButton, NSpace, NIcon, useMessage, useDialog, NTooltip, NCard, NImage, NEllipsis, NSpin, NAlert, NRadioGroup, NRadioButton, NCheckbox, NDropdown, NInput, NSelect, NButtonGroup } from 'naive-ui';
+import { FilmOutline as FilmIcon, TvOutline as TvIcon, CalendarOutline as CalendarIcon, TimeOutline as TimeIcon, ArrowUpOutline as ArrowUpIcon, ArrowDownOutline as ArrowDownIcon, CaretDownOutline as CaretDownIcon, CheckmarkCircleOutline as WantedIcon, HourglassOutline as PendingIcon, BanOutline as IgnoredIcon, DownloadOutline as SubscribedIcon, PersonCircleOutline as SourceIcon, TrashOutline as TrashIcon, SettingsOutline as SettingsIcon, PauseCircleOutline as PausedIcon, ReaderOutline as AuditIcon, CloseOutline as CloseIcon } from '@vicons/ionicons5';
 import { format } from 'date-fns'
 
 // 图标定义
@@ -424,69 +372,43 @@ const strategyConfig = ref({
   movie_pause_days: 7,
   delay_subscription_days: 0,
   timeout_revive_days: 0,
-  enable_nullbr: false,
   enable_mp: true, 
-  sub_priority: 'mp',
 });
-// 新增：用于绑定 Checkbox Group 的数组
-const selectedSources = ref(['mp']);
-
-const nullbrModalRef = ref(null);
-
-const handleNullbrSearch = (item) => {
-  if (nullbrModalRef.value) {
-    nullbrModalRef.value.open(item);
-  }
-};
 
 // 加载配置
 const loadStrategyConfig = async () => {
   try {
     const res = await axios.get('/api/subscription/strategy');
+    const rawConfig = res.data || {};
     
     strategyConfig.value = {
-      movie_protection_days: 180,
-      movie_search_window_days: 1,
-      movie_pause_days: 7,
-      delay_subscription_days: 0,
-      timeout_revive_days: 0,
-      enable_nullbr: false,
+      movie_protection_days: rawConfig.movie_protection_days ?? 180,
+      movie_search_window_days: rawConfig.movie_search_window_days ?? 1,
+      movie_pause_days: rawConfig.movie_pause_days ?? 7,
+      delay_subscription_days: rawConfig.delay_subscription_days ?? 0,
+      timeout_revive_days: rawConfig.timeout_revive_days ?? 0,
       enable_mp: true, 
-      sub_priority: 'mp', 
-      ...res.data 
     };
-
-    // 初始化 checkbox 状态
-    const sources = [];
-    if (strategyConfig.value.enable_mp !== false) sources.push('mp'); // 兼容旧数据，默认有mp
-    if (strategyConfig.value.enable_nullbr) sources.push('nullbr');
-    selectedSources.value = sources;
     
   } catch (e) {
     message.error('加载策略配置失败');
   }
 };
 
-// 监听 selectedSources 变化，自动锁定优先级
-watch(selectedSources, (newVal) => {
-  if (newVal.length === 1) {
-    if (newVal.includes('mp')) {
-      strategyConfig.value.sub_priority = 'mp';
-    } else if (newVal.includes('nullbr')) {
-      strategyConfig.value.sub_priority = 'nullbr';
-    }
-  }
-});
-
 // 保存配置
 const saveStrategyConfig = async () => {
   savingStrategy.value = true;
   try {
-    // 将 checkbox 状态同步回 config 对象
-    strategyConfig.value.enable_mp = selectedSources.value.includes('mp');
-    strategyConfig.value.enable_nullbr = selectedSources.value.includes('nullbr');
+    const payload = {
+      movie_protection_days: strategyConfig.value.movie_protection_days,
+      movie_search_window_days: strategyConfig.value.movie_search_window_days,
+      movie_pause_days: strategyConfig.value.movie_pause_days,
+      delay_subscription_days: strategyConfig.value.delay_subscription_days,
+      timeout_revive_days: strategyConfig.value.timeout_revive_days,
+      enable_mp: true,
+    };
 
-    await axios.post('/api/subscription/strategy', strategyConfig.value);
+    await axios.post('/api/subscription/strategy', payload);
     message.success('策略配置已保存');
     showStrategyModal.value = false;
   } catch (e) {

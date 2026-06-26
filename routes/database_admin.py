@@ -13,7 +13,6 @@ import config_manager
 import task_manager
 import constants
 from database import log_db, maintenance_db, settings_db
-import handler.nullbr as nullbr_handler
 
 # 导入共享模块
 import extensions
@@ -85,27 +84,6 @@ def api_get_stats_subscription():
         mp_total = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_RESUBSCRIBE_DAILY_CAP, 200)
         mp_consumed = max(0, mp_total - mp_available)
 
-        # ★★★ NULLBR 配额获取 ★★★
-        nullbr_cache = nullbr_handler._user_level_cache
-        
-        # 如果缓存中总配额为0，或者从未更新过 (updated_at 为 0)
-        # 则调用一次 API 获取最新信息
-        if nullbr_cache.get('daily_quota', 0) == 0 or nullbr_cache.get('updated_at', 0) == 0:
-            try:
-                # 调用 handler 中已有的 get_user_info()
-                # 该函数内部会自动更新 _user_level_cache
-                nullbr_handler.get_user_info()
-                # 重新获取更新后的缓存引用
-                nullbr_cache = nullbr_handler._user_level_cache
-            except Exception as e:
-                logger.warning(f"首次获取 NULLBR 配额失败，将显示默认值: {e}")
-
-        nullbr_quota = {
-            'available': max(0, nullbr_cache.get('daily_quota', 0) - nullbr_cache.get('daily_used', 0)),
-            'consumed': nullbr_cache.get('daily_used', 0),
-            'total': nullbr_cache.get('daily_quota', 0)
-        }
-
         formatted_data = {
             'watchlist': {
                 'watching': raw.get('watchlist_active', 0),
@@ -128,8 +106,7 @@ def api_get_stats_subscription():
                 'missing_items': raw.get('custom_collections_missing_items', 0) or 0
             },
             'quota': {
-                'mp': {'available': mp_available, 'consumed': mp_consumed},
-                'nullbr': nullbr_quota 
+                'mp': {'available': mp_available, 'consumed': mp_consumed}
             }
         }
         return jsonify({"status": "success", "data": formatted_data})

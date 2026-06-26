@@ -250,7 +250,6 @@ import {
   FilmOutline as DiscoverIcon,
   ArchiveOutline as UnifiedSubIcon,
   PricetagOutline as TagIcon,
-  CloudDownloadOutline as NullbrIcon,
   CompassOutline,
   ReaderOutline,
   LibraryOutline, 
@@ -442,8 +441,7 @@ const menuOptions = computed(() => {
     // --- 管理员专属 ---
     if (authStore.isAdmin) {
         discoveryGroup.children.push(
-            { label: '播放统计', key: 'EmbyStats', icon: renderIcon(EmbyStatsIcon) },
-            { label: 'NULLBR', key: 'Nullbr', icon: renderIcon(NullbrIcon) }
+            { label: '播放统计', key: 'EmbyStats', icon: renderIcon(EmbyStatsIcon) }
         );
     }
   }

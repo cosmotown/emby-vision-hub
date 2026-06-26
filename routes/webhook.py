@@ -29,7 +29,6 @@ from services.cover_generator import CoverGeneratorService
 from database import custom_collection_db, tmdb_collection_db, settings_db, user_db, maintenance_db, media_db, queries_db, watchlist_db
 from database.log_db import LogDBManager
 from handler.tmdb import get_movie_details, get_tv_details
-from handler.nullbr import get_config
 from handler.p115_service import P115Service, SmartOrganizer, notify_cms_scan
 try:
     from p115client import P115Client
@@ -564,8 +563,8 @@ def emby_webhook():
     # ======================================================================
     if mp_event_type == "transfer.complete":
         # 1. 检查配置是否开启了智能整理
-        nb_config = get_config()
-        if not nb_config.get('enable_smart_organize', False):
+        p115_config = settings_db.get_setting('p115_config') or settings_db.get_setting('nullbr_config') or {}
+        if not p115_config.get('enable_smart_organize', False):
             logger.debug("  🚫 智能整理未开启，忽略 MP 通知。")
             return jsonify({"status": "ignored_smart_organize_disabled"}), 200
         else:

@@ -23,7 +23,10 @@ _cms_timer = None
 _cms_lock = threading.Lock()
 
 def get_config():
-    return settings_db.get_setting('nullbr_config') or {}
+    return settings_db.get_setting('p115_config') or settings_db.get_setting('nullbr_config') or {}
+
+def get_sorting_rules():
+    return settings_db.get_setting('p115_sorting_rules') or settings_db.get_setting('nullbr_sorting_rules') or []
 
 class P115Service:
     _instance = None
@@ -39,7 +42,7 @@ class P115Service:
             raise ImportError("未安装 p115client")
 
         # 获取配置
-        config = settings_db.get_setting('nullbr_config') or {}
+        config = get_config()
         cookies = config.get('p115_cookies')
         
         if not cookies:
@@ -74,7 +77,7 @@ class P115Service:
 
     @classmethod
     def get_cookies(cls):
-        config = settings_db.get_setting('nullbr_config') or {}
+        config = get_config()
         return config.get('p115_cookies')
     
 _directory_cid_cache = {} # 全局目录 CID 缓存，key 格式: f"{parent_cid}_{dir_name}"
@@ -93,7 +96,7 @@ class SmartOrganizer:
 
         self.raw_metadata = self._fetch_raw_metadata()
         self.details = self.raw_metadata
-        self.rules = settings_db.get_setting('nullbr_sorting_rules') or []
+        self.rules = get_sorting_rules()
 
     def _fetch_raw_metadata(self):
         """

@@ -49,6 +49,17 @@ CONFIG_OPTION_TELEGRAM_BOT_TOKEN = "telegram_bot_token"
 CONFIG_OPTION_TELEGRAM_CHANNEL_ID = "telegram_channel_id"
 
 # ==============================================================================
+# ✨ 安全配置 (Security)
+# ==============================================================================
+CONFIG_SECTION_SECURITY = "Security"
+CONFIG_OPTION_WEBHOOK_TOKEN = "webhook_token"
+CONFIG_OPTION_IMAGE_PROXY_ALLOWED_HOSTS = "image_proxy_allowed_hosts"
+DEFAULT_IMAGE_PROXY_ALLOWED_HOSTS = [
+    "image.tmdb.org",
+    "media.themoviedb.org",
+]
+
+# ==============================================================================
 # ✨ 反向代理配置 (Reverse Proxy)
 # ==============================================================================
 CONFIG_SECTION_REVERSE_PROXY = "ReverseProxy"

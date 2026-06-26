@@ -12,7 +12,7 @@ import task_manager
 import extensions
 from database import custom_collection_db, media_db, user_db, request_db, settings_db
 import handler.moviepilot as moviepilot
-from extensions import admin_required, processor_ready_required
+from extensions import admin_required, any_login_required, processor_ready_required
 from urllib.parse import urlparse
 
 # --- 蓝图 1：用于所有 /api/... 的路由 ---
@@ -22,6 +22,44 @@ media_api_bp = Blueprint('media_api', __name__, url_prefix='/api')
 media_proxy_bp = Blueprint('media_proxy', __name__)
 
 logger = logging.getLogger(__name__)
+
+def _normalize_allowed_host(value: str) -> str:
+    value = (value or '').strip().lower()
+    if not value:
+        return ''
+    parsed = urlparse(value if '://' in value else f'//{value}')
+    host = parsed.hostname or value
+    return host.strip().lower()
+
+def _configured_image_proxy_hosts():
+    allowed_hosts = set()
+
+    for host in config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_IMAGE_PROXY_ALLOWED_HOSTS, []) or []:
+        normalized = _normalize_allowed_host(host)
+        if normalized:
+            allowed_hosts.add(normalized)
+
+    for key in (
+        constants.CONFIG_OPTION_EMBY_SERVER_URL,
+        constants.CONFIG_OPTION_EMBY_PUBLIC_URL,
+        constants.CONFIG_OPTION_TMDB_API_BASE_URL,
+    ):
+        normalized = _normalize_allowed_host(config_manager.APP_CONFIG.get(key, ''))
+        if normalized:
+            allowed_hosts.add(normalized)
+
+    return allowed_hosts
+
+def _is_allowed_image_proxy_url(external_url: str) -> bool:
+    parsed = urlparse(external_url)
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        return False
+
+    hostname = parsed.hostname.lower()
+    for allowed_host in _configured_image_proxy_hosts():
+        if hostname == allowed_host or hostname.endswith(f'.{allowed_host}'):
+            return True
+    return False
 
 @media_api_bp.route('/search_emby_library', methods=['GET'])
 @processor_ready_required
@@ -104,6 +142,7 @@ def api_update_edited_cast_sa(item_id):
 
 # ▼▼▼ 通用外部图片代理接口 ▼▼▼
 @media_api_bp.route('/image_proxy', methods=['GET'])
+@any_login_required
 def proxy_external_image():
     """
     一个安全的通用外部图片代理。
@@ -112,6 +151,9 @@ def proxy_external_image():
     external_url = request.args.get('url')
     if not external_url:
         return jsonify({"error": "缺少 'url' 参数"}), 400
+    if not _is_allowed_image_proxy_url(external_url):
+        logger.warning(f"拒绝代理未授权的外部图片 URL: {external_url}")
+        return jsonify({"error": "该图片来源不在允许的代理白名单中"}), 403
 
     try:
         # 1. 获取程序配置
@@ -159,6 +201,7 @@ def proxy_external_image():
 
 # 图片代理路由
 @media_proxy_bp.route('/image_proxy/<path:image_path>')
+@any_login_required
 @processor_ready_required
 def proxy_emby_image(image_path):
     """

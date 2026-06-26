@@ -15,6 +15,14 @@ logger = logging.getLogger(__name__)
 # --- 内存存储：灾难恢复令牌 ---
 # 结构: { 'token_string': expiry_timestamp }
 RECOVERY_TOKENS = {}
+RECOVERY_REQUEST_LOG = {}
+RECOVERY_VERIFY_FAILURES = {}
+RECOVERY_REQUEST_COOLDOWN_SECONDS = 60
+RECOVERY_VERIFY_LOCK_SECONDS = 300
+RECOVERY_VERIFY_MAX_FAILURES = 5
+
+def _client_key():
+    return request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown').split(',')[0].strip()
 
 def clean_expired_tokens():
     """清理过期的令牌"""
@@ -119,6 +127,17 @@ def request_recovery_token():
     生成一个 Token 打印到日志，不返回给前端。
     """
     clean_expired_tokens()
+    now = time.time()
+    client_key = _client_key()
+    last_request_at = RECOVERY_REQUEST_LOG.get(client_key, 0)
+    if now - last_request_at < RECOVERY_REQUEST_COOLDOWN_SECONDS:
+        wait_seconds = int(RECOVERY_REQUEST_COOLDOWN_SECONDS - (now - last_request_at))
+        return jsonify({
+            "status": "error",
+            "message": f"请求过于频繁，请 {wait_seconds} 秒后再试。"
+        }), 429
+
+    RECOVERY_REQUEST_LOG[client_key] = now
     
     # 生成 6 位随机字符作为令牌
     token = secrets.token_hex(3).upper() 
@@ -143,16 +162,34 @@ def verify_recovery_token():
     【步骤2】验证令牌。
     如果通过，给予临时 Session 权限进入设置页面。
     """
-    data = request.json
+    data = request.get_json(silent=True) or {}
     token = data.get('token', '').strip().upper()
+    now = time.time()
+    client_key = _client_key()
+    failure_info = RECOVERY_VERIFY_FAILURES.get(client_key, {"count": 0, "last_failed_at": 0})
+
+    if (
+        failure_info.get("count", 0) >= RECOVERY_VERIFY_MAX_FAILURES
+        and now - failure_info.get("last_failed_at", 0) < RECOVERY_VERIFY_LOCK_SECONDS
+    ):
+        wait_seconds = int(RECOVERY_VERIFY_LOCK_SECONDS - (now - failure_info.get("last_failed_at", 0)))
+        return jsonify({
+            "status": "error",
+            "message": f"验证失败次数过多，请 {wait_seconds} 秒后再试。"
+        }), 429
     
     clean_expired_tokens()
     
     if token in RECOVERY_TOKENS:
         del RECOVERY_TOKENS[token] # 一次性使用
+        RECOVERY_VERIFY_FAILURES.pop(client_key, None)
         session['is_setup_mode'] = True # 标记：允许访问 setup 接口
         return jsonify({"status": "ok", "message": "验证成功"}), 200
-    
+
+    RECOVERY_VERIFY_FAILURES[client_key] = {
+        "count": failure_info.get("count", 0) + 1,
+        "last_failed_at": now,
+    }
     return jsonify({"status": "error", "message": "令牌无效或已过期"}), 403
 
 @unified_auth_bp.route('/setup', methods=['POST'])
@@ -168,7 +205,7 @@ def save_emby_config():
     if is_configured and not has_setup_permission:
         return jsonify({"status": "error", "message": "系统已配置，且无重置权限"}), 403
 
-    data = request.json
+    data = request.get_json(silent=True) or {}
     url = data.get('url')
     api_key = data.get('api_key')
 

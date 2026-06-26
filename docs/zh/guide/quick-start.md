@@ -13,7 +13,7 @@
 1. 使用 Docker Compose 启动服务。
 2. 访问 `http://<服务器IP>:5257` 打开管理界面。
 3. 填写 Emby、TMDb、MoviePilot（如需要）等配置并保存。
-4. 在 Emby 配置 Webhook 指向 `http://<服务器IP>:5257/webhook/emby`。
+4. 在「高级」-「安全设置」填写 Webhook Token，并在 Emby 配置 Webhook 指向 `http://<服务器IP>:5257/webhook/emby?token=<Webhook Token>`。
 5. 按需启用任务链、实时监控、反向代理等功能。
 
 如果你需要完整的部署说明，请阅读 [Docker 部署](/zh/guide/docker)。

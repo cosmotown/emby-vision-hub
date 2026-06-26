@@ -4,6 +4,7 @@ import collections
 import threading
 import time
 import random
+import hmac
 from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from typing import Optional, List
@@ -53,6 +54,28 @@ UPDATE_DEBOUNCE_TIME = 15
 STREAM_CHECK_MAX_RETRIES = 60   # 最大重试次数 
 STREAM_CHECK_INTERVAL = 10      # 每次轮询间隔(秒)
 STREAM_CHECK_SEMAPHORE = Semaphore(5) # 限制并发预检的数量，防止大量入库时查挂 Emby
+
+def _is_valid_webhook_token() -> bool:
+    expected_token = str(config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_WEBHOOK_TOKEN) or '').strip()
+    if not expected_token:
+        logger.warning("Webhook 请求被拒绝：尚未配置 webhook_token。")
+        return False
+
+    provided_token = (
+        request.headers.get('X-Webhook-Token')
+        or request.args.get('token')
+        or ''
+    ).strip()
+
+    if not provided_token:
+        logger.warning("Webhook 请求被拒绝：缺少 token。")
+        return False
+
+    if not hmac.compare_digest(provided_token, expected_token):
+        logger.warning("Webhook 请求被拒绝：token 不匹配。")
+        return False
+
+    return True
 
 def _handle_full_processing_flow(processor: 'MediaProcessor', item_id: str, force_full_update: bool, new_episode_ids: Optional[List[str]] = None, is_new_item: bool = True):
     """
@@ -514,7 +537,12 @@ def _wait_for_stream_data_and_enqueue(item_id, item_name, item_type):
 @webhook_bp.route('/webhook/emby', methods=['POST'])
 @extensions.processor_ready_required
 def emby_webhook():
-    data = request.json
+    if not _is_valid_webhook_token():
+        return jsonify({"status": "error", "message": "invalid webhook token"}), 403
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"status": "error", "message": "invalid webhook payload"}), 400
     # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
     # ★★★            魔法日志 - START            ★★★
     # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★

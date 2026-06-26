@@ -5,9 +5,11 @@ Webhook 用于接收 Emby 事件并触发对应处理。
 ## 配置地址
 
 ```
-http://<服务器IP>:5257/webhook/emby
+http://<服务器IP>:5257/webhook/emby?token=<Webhook Token>
 请求内容类型：application/json
 ```
+
+`Webhook Token` 在后台「高级」-「安全设置」中配置。也可以不放在 URL 中，改用请求头 `X-Webhook-Token` 携带同样的值。
 
 ## 推荐事件
 

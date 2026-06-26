@@ -582,6 +582,42 @@
             <!-- ================== 标签页 4: 高级 (核心修改区域) ================== -->
             <n-tab-pane name="advanced" tab="高级">
               <n-grid cols="1 l:2" :x-gap="24" :y-gap="24" responsive="screen">
+
+                <!-- 卡片 0: 安全设置 -->
+                <n-gi>
+                  <n-card :bordered="false" class="dashboard-card">
+                    <template #header><span class="card-title">安全设置</span></template>
+                    <n-form-item-grid-item label="Webhook Token" path="webhook_token">
+                      <n-input
+                        v-model:value="configModel.webhook_token"
+                        type="password"
+                        show-password-on="click"
+                        placeholder="建议填写一串随机密码"
+                      />
+                      <template #feedback>
+                        <n-text depth="3" style="font-size:0.8em;">
+                          配置后，Emby Webhook 地址需追加 ?token=此值，或请求头携带 X-Webhook-Token。
+                        </n-text>
+                      </template>
+                    </n-form-item-grid-item>
+                    <n-form-item-grid-item label="图片代理白名单" path="image_proxy_allowed_hosts">
+                      <n-select
+                        v-model:value="configModel.image_proxy_allowed_hosts"
+                        multiple
+                        filterable
+                        tag
+                        :show-arrow="false"
+                        placeholder="输入域名并回车，例如 image.tmdb.org"
+                        :options="[]"
+                      />
+                      <template #feedback>
+                        <n-text depth="3" style="font-size:0.8em;">
+                          /api/image_proxy 只允许代理这些域名；Emby URL 与 TMDb API Base URL 会自动加入允许列表。
+                        </n-text>
+                      </template>
+                    </n-form-item-grid-item>
+                  </n-card>
+                </n-gi>
                 
                 <!-- 卡片 1: 网络代理 (左上) -->
                 <n-gi>

@@ -7,7 +7,8 @@
 
 ## Webhook 无响应
 
-- 确认 Emby Webhook 地址为 `http://<服务器IP>:5257/webhook/emby`。
+- 确认 Emby Webhook 地址为 `http://<服务器IP>:5257/webhook/emby?token=<Webhook Token>`。
+- 确认后台「高级」-「安全设置」里的 Webhook Token 与 URL 中的 `token` 一致。
 - 检查 Emby 事件类型是否勾选。
 
 ## 反向代理无虚拟库

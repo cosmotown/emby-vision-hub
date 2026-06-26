@@ -156,6 +156,10 @@ DYNAMIC_CONFIG_DEF = {
     # [Telegram]
     constants.CONFIG_OPTION_TELEGRAM_BOT_TOKEN: (constants.CONFIG_SECTION_TELEGRAM, 'password', ""),
     constants.CONFIG_OPTION_TELEGRAM_CHANNEL_ID: (constants.CONFIG_SECTION_TELEGRAM, 'string', ""),
+
+    # [Security]
+    constants.CONFIG_OPTION_WEBHOOK_TOKEN: (constants.CONFIG_SECTION_SECURITY, 'password', ""),
+    constants.CONFIG_OPTION_IMAGE_PROXY_ALLOWED_HOSTS: (constants.CONFIG_SECTION_SECURITY, 'list', constants.DEFAULT_IMAGE_PROXY_ALLOWED_HOSTS),
 }
 
 # --- 全局配置字典 ---

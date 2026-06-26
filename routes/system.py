@@ -53,6 +53,7 @@ def api_handle_trigger_stop_task():
 
 # --- API 端点：获取当前配置 ---
 @system_bp.route('/config', methods=['GET'])
+@admin_required
 def api_get_config():
     try:
         # ★★★ 确保这里正确解包了元组 ★★★
@@ -118,6 +119,7 @@ def api_test_ai_connection():
 
 # --- 代理测试 ---
 @system_bp.route('/proxy/test', methods=['POST'])
+@admin_required
 def test_proxy_connection():
     """
     接收代理 URL，并从配置中读取 TMDB API Key，进行一个完整的连接和认证测试。
@@ -230,6 +232,7 @@ def api_test_telegram_connection():
 
 # --- API 端点：保存配置 ---
 @system_bp.route('/config', methods=['POST'])
+@admin_required
 def api_save_config():
     from web_app import save_config_and_reload
     try:

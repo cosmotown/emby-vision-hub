@@ -7,6 +7,10 @@ on:
         description: Git branch, tag, or SHA to build
         required: true
         default: based-on-6.8.9
+      image_name:
+        description: Docker image name to publish
+        required: true
+        default: cosmotown/emby-toolkit
       image_tag:
         description: Docker image tag to publish
         required: true
@@ -43,6 +47,6 @@ jobs:
           file: ./Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/emby-toolkit:${{ inputs.image_tag }}
+          tags: ${{ inputs.image_name }}:${{ inputs.image_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

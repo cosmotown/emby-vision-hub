@@ -3,6 +3,10 @@ name: Publish Docker Hub Image
 on:
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: Git branch, tag, or SHA to build
+        required: true
+        default: based-on-6.8.9
       image_tag:
         description: Docker image tag to publish
         required: true
@@ -17,6 +21,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

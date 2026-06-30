@@ -2,6 +2,21 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.0.1",
+        "published_at": "2026-07-01T02:10:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.1",
+        "changelog": """## 封面与更新链路修复
+
+### 修复
+- 修复封面生成后台显示成功但 Emby 实际封面不变化的问题：上传给 Emby 的图片内容改为 base64 编码，并补充 Token 请求头。
+- 修正一键更新默认镜像地址为 `tzyzero186/emby-toolkit:latest`，避免误拉原项目镜像。
+
+### 优化
+- 定时更新封面入口移到封面生成页的基础设置区，更容易找到。
+- 更新日志页面改为读取本分支维护的记录，不再显示原项目 10.x 更新内容。
+""",
+    },
+    {
         "version": "v7.0.0",
         "published_at": "2026-07-01T01:20:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.0",

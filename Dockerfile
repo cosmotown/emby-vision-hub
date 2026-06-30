@@ -60,6 +60,7 @@ COPY web_app.py \
      scheduler_manager.py \
      reverse_proxy.py \
      monitor_service.py \
+     release_notes.py \
      ./
 
 COPY handler/ ./handler/

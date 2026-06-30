@@ -2,6 +2,17 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.0.2",
+        "published_at": "2026-07-01T02:35:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.2",
+        "changelog": """## 启动失败热修复
+
+### 修复
+- 修复 `v7.0.1` 镜像启动时报 `ModuleNotFoundError: No module named 'release_notes'` 的问题。
+- 将本分支更新日志文件加入 Docker 镜像构建拷贝列表。
+""",
+    },
+    {
         "version": "v7.0.1",
         "published_at": "2026-07-01T02:10:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.1",

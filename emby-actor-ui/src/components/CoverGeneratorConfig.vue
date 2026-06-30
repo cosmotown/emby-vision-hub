@@ -325,7 +325,23 @@
             </n-tab-pane>
             
             <n-tab-pane name="others-tab" tab="其他设置">
-              <n-grid :cols="2" :x-gap="24">
+              <n-grid :cols="2" :x-gap="24" :y-gap="12" responsive="screen">
+                <n-gi>
+                  <n-form-item label="定时更新媒体库封面">
+                    <n-switch v-model:value="configData.scheduled_refresh_enabled" />
+                    <template #feedback>按固定时间自动执行“生成原生封面”。</template>
+                  </n-form-item>
+                </n-gi>
+                <n-gi>
+                  <n-form-item label="定时更新 CRON">
+                    <n-input
+                      v-model:value="configData.scheduled_refresh_cron"
+                      placeholder="0 4 * * *"
+                      :disabled="!configData.scheduled_refresh_enabled"
+                    />
+                    <template #feedback>默认每天凌晨 4 点，格式为：分 时 日 月 周。</template>
+                  </n-form-item>
+                </n-gi>
                 <n-gi>
                   <n-form-item label="自定义图片目录（可选）">
                     <n-input v-model:value="configData.covers_input" placeholder="/path/to/custom/images" />

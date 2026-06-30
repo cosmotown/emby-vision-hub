@@ -14,6 +14,7 @@ import config_manager # 导入配置管理器以读取配置
 import constants      # 导入常量以获取时区
 import extensions     # 导入 extensions 以获取共享的处理器实例
 import task_manager   # 导入 task_manager 以提交任务
+from database import settings_db
 from tasks.core import get_task_registry
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 HIGH_FREQ_CHAIN_JOB_ID = 'high_freq_task_chain_job'
 LOW_FREQ_CHAIN_JOB_ID = 'low_freq_task_chain_job'
 DAILY_THEME_JOB_ID = 'daily_theme_job'
+COVER_GENERATOR_JOB_ID = 'cover_generator_refresh_job'
 
 
 # --- 友好的CRON日志翻译函数 (保持不变) ---
@@ -219,6 +221,7 @@ class SchedulerManager:
         self.update_high_freq_task_chain_job()
         self.update_low_freq_task_chain_job()
         self.update_daily_theme_job()
+        self.update_cover_generator_job()
 
     def _update_single_task_chain_job(self, job_id: str, job_name: str, task_key: str, enabled_key: str, cron_key: str, sequence_key: str, runtime_key: str):
         """
@@ -351,6 +354,60 @@ class SchedulerManager:
             logger.trace(f"  ➜ 已成功设置'{task_description}'任务，执行计划: 每天 00:05。")
         except ValueError as e:
             logger.error(f"设置'{task_description}'任务失败：CRON表达式 '{cron_str}' 无效。错误: {e}")
+
+    def update_cover_generator_job(self):
+        """根据封面生成器配置，设置固定时间更新媒体库封面任务。"""
+        if not self.scheduler.running:
+            return
+
+        logger.debug("  ➜ 正在更新'定时更新媒体库封面'任务...")
+
+        try:
+            self.scheduler.remove_job(COVER_GENERATOR_JOB_ID)
+        except JobLookupError:
+            pass
+        except Exception as e:
+            logger.error(f"  ⚠️ 尝试移除旧的'定时更新媒体库封面'任务时发生错误: {e}", exc_info=True)
+
+        try:
+            cover_config = settings_db.get_setting('cover_generator_config') or {}
+            is_enabled = bool(cover_config.get("scheduled_refresh_enabled"))
+            cron_str = cover_config.get("scheduled_refresh_cron") or "0 4 * * *"
+
+            if not is_enabled:
+                logger.info("  ➜ '定时更新媒体库封面'未启用，本次不设置定时任务。")
+                return
+
+            registry = get_task_registry()
+            task_info = registry.get('generate-all-covers')
+            if not task_info:
+                logger.error("  ⚠️ 设置'定时更新媒体库封面'失败：在任务注册表中未找到 'generate-all-covers'。")
+                return
+
+            task_function, task_description, processor_type = task_info
+
+            def scheduled_cover_generator_wrapper():
+                logger.info("  ➜ 定时任务触发：定时更新媒体库封面。")
+                task_manager.submit_task(
+                    task_function=task_function,
+                    task_name=task_description,
+                    processor_type=processor_type
+                )
+
+            self.scheduler.add_job(
+                func=scheduled_cover_generator_wrapper,
+                trigger=CronTrigger.from_crontab(cron_str, timezone=str(pytz.timezone(constants.TIMEZONE))),
+                id=COVER_GENERATOR_JOB_ID,
+                name="定时更新媒体库封面",
+                replace_existing=True
+            )
+            friendly_cron_str = _get_next_run_time_str(cron_str)
+            logger.info(f"  ➜ 已成功设置'定时更新媒体库封面'，执行计划: {friendly_cron_str}。")
+
+        except ValueError as e:
+            logger.error(f"  ⚠️ 设置'定时更新媒体库封面'失败：CRON表达式 '{cron_str}' 无效。错误: {e}")
+        except Exception as e:
+            logger.error(f"  ⚠️ 设置'定时更新媒体库封面'时发生未知错误: {e}", exc_info=True)
 
 # 创建一个全局单例，方便在其他地方调用
 scheduler_manager = SchedulerManager()

@@ -24,6 +24,8 @@ def get_default_config():
         # 基础设置
         "enabled": False,
         "transfer_monitor": True,
+        "scheduled_refresh_enabled": False,
+        "scheduled_refresh_cron": "0 4 * * *",
         "exclude_libraries": [], # 现在是勾选框
         "sort_by": "Latest", # 默认改为最新添加
 
@@ -94,6 +96,11 @@ def save_cover_generator_config():
         new_config = request.json
         # ★★★ 核心修改 4：将配置保存到数据库 ★★★
         settings_db.save_setting('cover_generator_config', new_config)
+        try:
+            from scheduler_manager import scheduler_manager
+            scheduler_manager.update_all_scheduled_jobs()
+        except Exception as scheduler_error:
+            logger.warning(f"封面生成器配置已保存，但刷新定时任务失败: {scheduler_error}", exc_info=True)
         
         logger.info("封面生成器配置已保存到数据库。")
         return jsonify({"message": "配置已成功保存！"})

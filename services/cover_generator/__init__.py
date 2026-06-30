@@ -6,9 +6,11 @@ import yaml
 import json
 import random
 import requests
+from io import BytesIO
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 from gevent import spawn_later
+from PIL import Image
 from database import custom_collection_db, queries_db
 import config_manager
 import handler.emby as emby 
@@ -563,7 +565,8 @@ class CoverGeneratorService:
         api_key = config_manager.APP_CONFIG.get('emby_api_key')
         upload_url = f"{base_url.rstrip('/')}/Items/{library_id}/Images/Primary?api_key={api_key}"
         content_type, extension = self.__get_image_upload_type(image_data)
-        headers = {"Content-Type": content_type}
+        upload_data, upload_content_type, upload_extension, converted_for_emby = self.__prepare_emby_upload_image(image_data)
+        headers = {"Content-Type": upload_content_type}
         if self._covers_output:
             try:
                 save_path = Path(self._covers_output) / f"{library['Name']}{extension}"
@@ -571,8 +574,15 @@ class CoverGeneratorService:
                 with open(save_path, "wb") as f:
                     f.write(image_data)
                 logger.info(f"  ➜ 封面已另存到: {save_path}")
+                if converted_for_emby:
+                    emby_save_path = Path(self._covers_output) / f"{library['Name']}.emby{upload_extension}"
+                    with open(emby_save_path, "wb") as f:
+                        f.write(upload_data)
+                    logger.info(f"  ➜ Emby 兼容版封面已另存到: {emby_save_path}")
             except Exception as e:
                 logger.error(f"  ➜ 另存封面失败: {e}")
+        if converted_for_emby:
+            logger.info("  ➜ 检测到 ChillPoster PNG/APNG，已转换为 JPEG 后上传 Emby。")
         try:
             if library_id:
                 UPDATING_IMAGES.add(library_id)
@@ -580,7 +590,7 @@ class CoverGeneratorService:
                 def _clear_flag():
                     UPDATING_IMAGES.discard(library_id)
                 spawn_later(30, _clear_flag)
-            response = requests.post(upload_url, data=image_data, headers=headers, timeout=30)
+            response = requests.post(upload_url, data=upload_data, headers=headers, timeout=30)
             response.raise_for_status()
             logger.debug(f"  ➜ 成功上传封面到媒体库 '{library['Name']}'。")
             return True
@@ -589,6 +599,22 @@ class CoverGeneratorService:
             if e.response is not None:
                 logger.error(f"  ➜ 响应状态: {e.response.status_code}, 响应内容: {e.response.text[:200]}")
             return False
+
+    def __prepare_emby_upload_image(self, image_data: bytes) -> Tuple[bytes, str, str, bool]:
+        content_type, extension = self.__get_image_upload_type(image_data)
+        if self._cover_style == 'chillposter' and content_type == "image/png":
+            try:
+                with Image.open(BytesIO(image_data)) as img:
+                    img.seek(0)
+                    frame = img.convert("RGBA")
+                    background = Image.new("RGB", frame.size, (0, 0, 0))
+                    background.paste(frame, mask=frame.getchannel("A"))
+                    output = BytesIO()
+                    background.save(output, format="JPEG", quality=92)
+                    return output.getvalue(), "image/jpeg", ".jpg", True
+            except Exception as e:
+                logger.warning(f"  ➜ ChillPoster PNG/APNG 转 JPEG 失败，将尝试原图上传: {e}")
+        return image_data, content_type, extension, False
 
     def __get_image_upload_type(self, image_data: bytes) -> Tuple[str, str]:
         if image_data.startswith(b"\x89PNG\r\n\x1a\n"):

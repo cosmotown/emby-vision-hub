@@ -39,7 +39,7 @@
               <n-space align="center">
                 <a :href="release.url" target="_blank" class="version-link">{{ release.version }}</a>
                 <n-tag v-if="index === 0" type="success" size="small" round>最新软件版本</n-tag>
-                <n-tag v-if="release.version === appStore.currentVersion" type="info" size="small" round>当前版本</n-tag>
+                <n-tag v-if="isCurrentRelease(release.version)" type="info" size="small" round>当前版本</n-tag>
               </n-space>
             </template>
             <template #header-extra>
@@ -112,7 +112,7 @@ import { useAppStore } from '../stores/app';
 const dialog = useDialog();
 const appStore = useAppStore();
 
-const githubRepoOwner = 'hbq0405';
+const githubRepoOwner = 'cosmotown';
 const githubRepoName = 'emby-toolkit';
 const githubRepo = computed(() => `${githubRepoOwner}/${githubRepoName}`);
 
@@ -186,6 +186,12 @@ const fetchData = async () => {
 const renderMarkdown = (markdownText) => {
   if (!markdownText) return '';
   return marked.parse(markdownText, { gfm: true, breaks: true });
+};
+
+const normalizeVersion = (version) => (version || '').replace(/^v/i, '').trim();
+
+const isCurrentRelease = (releaseVersion) => {
+  return normalizeVersion(releaseVersion) === normalizeVersion(appStore.currentVersion);
 };
 
 const formatReleaseDate = (dateString) => {

@@ -160,6 +160,9 @@ DYNAMIC_CONFIG_DEF = {
     # [Security]
     constants.CONFIG_OPTION_WEBHOOK_TOKEN: (constants.CONFIG_SECTION_SECURITY, 'password', ""),
     constants.CONFIG_OPTION_IMAGE_PROXY_ALLOWED_HOSTS: (constants.CONFIG_SECTION_SECURITY, 'list', constants.DEFAULT_IMAGE_PROXY_ALLOWED_HOSTS),
+
+    # [System]
+    constants.CONFIG_OPTION_DOCKER_IMAGE_NAME: ("System", 'string', constants.DEFAULT_DOCKER_IMAGE_NAME),
 }
 
 # --- 全局配置字典 ---
@@ -302,6 +305,16 @@ def save_config(new_config: Dict[str, Any]):
     except Exception as e:
         logger.error(f"  ➜ 保存动态配置到数据库时失败: {e}", exc_info=True)
         raise
+
+def get_docker_image_name() -> str:
+    configured_image = APP_CONFIG.get(constants.CONFIG_OPTION_DOCKER_IMAGE_NAME)
+    if configured_image == constants.LEGACY_UPSTREAM_DOCKER_IMAGE_NAME:
+        configured_image = ""
+    return (
+        configured_image
+        or os.environ.get(constants.ENV_VAR_DOCKER_IMAGE_NAME)
+        or constants.DEFAULT_DOCKER_IMAGE_NAME
+    )
 
 # ★★★ 保存自定义主题 ★★★
 def save_custom_theme(theme_data: dict):

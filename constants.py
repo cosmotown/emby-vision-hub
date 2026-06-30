@@ -5,8 +5,12 @@ import os
 # ✨ 应用基础信息 (Application Basics)
 # ==============================================================================
 APP_VERSION = "7.0.0"  # 更新版本号
-GITHUB_REPO_OWNER = "hbq0405"  # 您的 GitHub 用户名
+GITHUB_REPO_OWNER = "cosmotown"  # 您的 GitHub 用户名
 GITHUB_REPO_NAME = "emby-toolkit" # 您的 GitHub 仓库名
+DEFAULT_DOCKER_IMAGE_NAME = "cosmotown/emby-toolkit:latest"
+LEGACY_UPSTREAM_DOCKER_IMAGE_NAME = "hbq0405/emby-toolkit:latest"
+ENV_VAR_DOCKER_IMAGE_NAME = "DOCKER_IMAGE_NAME"
+CONFIG_OPTION_DOCKER_IMAGE_NAME = "docker_image_name"
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "").lower() in ("1", "true", "yes", "on")
 WEB_APP_PORT = 5257    # Web UI 监听的端口
 CONFIG_FILE_NAME = "config.ini" # 主配置文件名

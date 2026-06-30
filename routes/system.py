@@ -17,8 +17,8 @@ from extensions import admin_required, task_lock_required
 from tasks.system_update import _update_process_generator
 import constants
 import utils
+from release_notes import CUSTOM_RELEASES
 from database import settings_db
-import handler.github as github
 # 1. 创建蓝图
 system_bp = Blueprint('system', __name__, url_prefix='/api')
 logger = logging.getLogger(__name__)
@@ -349,30 +349,12 @@ def api_delete_custom_theme():
 @system_bp.route('/system/about_info', methods=['GET'])
 def get_about_info():
     """
-    【V2 - 支持认证版】获取关于页面的所有信息，包括当前版本和 GitHub releases。
-    会从配置中读取 GitHub Token 用于认证，以提高 API 速率限制。
+    获取关于页面的版本信息和本分支维护的更新记录。
     """
     try:
-        # ★★★ 1. 从全局配置中获取 GitHub Token ★★★
-        github_token = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_GITHUB_TOKEN)
-
-        proxies = config_manager.get_proxies_for_requests()
-        # ★★★ 2. 将 Token 传递给 get_github_releases 函数 ★★★
-        releases = github.get_github_releases(
-            owner=constants.GITHUB_REPO_OWNER,
-            repo=constants.GITHUB_REPO_NAME,
-            token=github_token,  # <--- 将令牌作为参数传入
-            proxies=proxies
-        )
-
-        if releases is None:
-            # 即使获取失败，也返回一个正常的结构，只是 releases 列表为空
-            releases = []
-            logger.warning("API /system/about_info: 从 GitHub 获取 releases 失败，将返回空列表。")
-
         response_data = {
             "current_version": constants.APP_VERSION,
-            "releases": releases
+            "releases": CUSTOM_RELEASES
         }
         return jsonify(response_data)
 
@@ -395,7 +377,7 @@ def stream_update_progress():
             yield f"data: {json.dumps(data)}\n\n"
 
         container_name = config_manager.APP_CONFIG.get('container_name', 'emby-toolkit')
-        image_name_tag = config_manager.APP_CONFIG.get('docker_image_name', 'hbq0405/emby-toolkit:latest')
+        image_name_tag = config_manager.get_docker_image_name()
 
         # 调用共享的生成器
         generator = _update_process_generator(container_name, image_name_tag)

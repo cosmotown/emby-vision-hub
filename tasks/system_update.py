@@ -103,7 +103,7 @@ def task_check_and_update_container(processor):
     此函数适配 task_manager 的日志和进度更新方式。
     """
     container_name = processor.config.get('container_name', 'emby-toolkit')
-    image_name_tag = processor.config.get('docker_image_name', 'hbq0405/emby-toolkit:latest')
+    image_name_tag = config_manager.get_docker_image_name()
     logger.trace(f"--- 开始执行系统更新检查 (容器: {container_name}) ---")
     task_manager.update_status_from_thread(0, "准备检查更新...")
 

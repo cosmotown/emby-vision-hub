@@ -1,12 +1,13 @@
 # constants.py
+import os
 
 # ==============================================================================
 # ✨ 应用基础信息 (Application Basics)
 # ==============================================================================
-APP_VERSION = "6.8.9"  # 更新版本号
+APP_VERSION = "7.0.0"  # 更新版本号
 GITHUB_REPO_OWNER = "hbq0405"  # 您的 GitHub 用户名
 GITHUB_REPO_NAME = "emby-toolkit" # 您的 GitHub 仓库名
-DEBUG_MODE = True     # 开发模式开关，部署时应设为 False
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "").lower() in ("1", "true", "yes", "on")
 WEB_APP_PORT = 5257    # Web UI 监听的端口
 CONFIG_FILE_NAME = "config.ini" # 主配置文件名
 TIMEZONE = "Asia/Shanghai" # 应用使用的时区，用于计划任务等

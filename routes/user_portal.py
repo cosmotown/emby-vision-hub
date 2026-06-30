@@ -477,7 +477,10 @@ def get_dashboard_stats():
     days = request.args.get('days', 30, type=int)
     config = config_manager.APP_CONFIG
     
-    # 2. 从 Emby 获取全站原始流水
+    emby_user_id = session.get('emby_user_id')
+    is_admin = session.get('emby_is_admin', False)
+
+    # 2. 从 Emby 获取原始流水。普通用户只看自己，管理员才看全站。
     endpoint = "/user_usage_stats/UserPlaylist"
     base_url = config['emby_server_url']
     api_url = f"{base_url.rstrip('/')}/emby{endpoint}" if "/emby" not in base_url else f"{base_url.rstrip('/')}{endpoint}"
@@ -485,7 +488,7 @@ def get_dashboard_stats():
     params = {
         "api_key": config['emby_api_key'],
         "days": days,
-        "user_id": "", # 全站
+        "user_id": "" if is_admin else emby_user_id,
         "include_stats": "true",
         "limit": 100000 
     }

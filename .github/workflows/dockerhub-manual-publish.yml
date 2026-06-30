@@ -10,7 +10,12 @@ on:
       image_tag:
         description: Docker image tag to publish
         required: true
-        default: 6.8.9-security
+        default: 7.0.0
+      publish_latest:
+        description: Also publish the latest tag
+        required: true
+        type: boolean
+        default: true
 
 jobs:
   build-and-push:
@@ -36,6 +41,15 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Prepare Docker tags
+        id: docker_tags
+        run: |
+          TAGS="${{ secrets.DOCKERHUB_USERNAME }}/emby-toolkit:${{ inputs.image_tag }}"
+          if [ "${{ inputs.publish_latest }}" = "true" ]; then
+            TAGS="$TAGS,${{ secrets.DOCKERHUB_USERNAME }}/emby-toolkit:latest"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
@@ -43,6 +57,6 @@ jobs:
           file: ./Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/emby-toolkit:${{ inputs.image_tag }}
+          tags: ${{ steps.docker_tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

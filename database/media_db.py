@@ -972,7 +972,19 @@ def get_known_filenames_by_tmdb_id(tmdb_id: str) -> set:
         return set()
 
 # 根据文件名反查媒体元数据（多版本精确版）    
-def get_media_info_by_filename(filename: str) -> Optional[Dict[str, Any]]:
+def _normalize_asset_path(path: str) -> str:
+    return os.path.normpath(path or "").replace("\\", "/").lower()
+
+def _path_suffixes_for_match(path: str) -> List[str]:
+    normalized = _normalize_asset_path(path)
+    parts = [part for part in normalized.split("/") if part]
+    suffixes = []
+    for depth in (4, 3, 2, 1):
+        if len(parts) >= depth:
+            suffixes.append("/".join(parts[-depth:]))
+    return suffixes
+
+def get_media_info_by_filename(filename: str, file_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     【监控专用 - 多版本精确版】
     根据文件名反查媒体元数据。
@@ -1003,11 +1015,11 @@ def get_media_info_by_filename(filename: str) -> Optional[Dict[str, Any]]:
             m.title, 
             m.parent_series_tmdb_id,
             m.emby_item_ids_json,
-            elem->>'emby_item_id' as target_emby_id
+            elem->>'emby_item_id' as target_emby_id,
+            elem->>'path' as asset_path
         FROM media_metadata m,
              jsonb_array_elements(m.asset_details_json) as elem
         WHERE elem->>'path' LIKE %s
-        LIMIT 1
     """
     
     try:
@@ -1015,10 +1027,25 @@ def get_media_info_by_filename(filename: str) -> Optional[Dict[str, Any]]:
             with conn.cursor() as cursor:
                 # 使用 %filename 进行后缀匹配，适配 Docker 路径映射差异
                 cursor.execute(sql, (f"%{filename}",))
-                row = cursor.fetchone()
-                
-                if row:
-                    return dict(row)
+                rows = [dict(row) for row in cursor.fetchall()]
+
+                if file_path and rows:
+                    target_suffixes = _path_suffixes_for_match(file_path)
+                    for suffix in target_suffixes:
+                        matches = [
+                            row for row in rows
+                            if _normalize_asset_path(row.get('asset_path', '')).endswith(suffix)
+                        ]
+                        if len(matches) == 1:
+                            return matches[0]
+                        if len(matches) > 1:
+                            logger.warning(f"DB: 文件路径 '{file_path}' 命中多条媒体记录，已回退到文件名匹配。")
+                            break
+
+                if rows:
+                    if len(rows) > 1:
+                        logger.warning(f"DB: 文件名 '{filename}' 命中 {len(rows)} 条媒体记录，使用第一条结果。建议检查是否存在跨库同名文件。")
+                    return rows[0]
                 return None
     except Exception as e:
         logger.error(f"DB: 根据文件名反查精确媒体信息失败 ({filename}): {e}")

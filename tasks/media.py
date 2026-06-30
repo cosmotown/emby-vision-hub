@@ -1632,7 +1632,7 @@ def task_scan_monitor_folders(processor):
         logger.info("  ➜ 实时监控未启用或未配置路径，跳过扫描。")
         return
 
-    valid_exts = set(ext.lower() for ext in monitor_extensions)
+    valid_exts = set(utils.normalize_monitor_extensions(monitor_extensions))
 
     # 2. 获取已知 TMDb ID (白名单)
     known_tmdb_ids = set()

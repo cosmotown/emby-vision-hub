@@ -1,0 +1,33 @@
+{
+    "name": "斜线分割默认",
+    "engine": "斜线分割",
+    "config": {
+        "engine": "斜线分割",
+        "badge_style": "box",
+        "badge_font": "剑豪体.ttf",
+        "badge_size": "90",
+        "badge_bg_color": "#000000",
+        "badge_text_color": "#ffffff",
+        "badge_opacity": "0",
+        "title": "韩国电影",
+        "subtitle": "Korean Movies",
+        "font_title": "剑豪体.ttf",
+        "font_subtitle": "剑豪体.ttf",
+        "split_top": 55,
+        "split_bottom": 40,
+        "shadow_feather": 30,
+        "title_size": 160,
+        "title_color": "#FFFFFF",
+        "title_x": 25,
+        "title_y": 40,
+        "title_width_pct": 40,
+        "subtitle_size": 60,
+        "subtitle_color": "#FFFFFF",
+        "sub_x": 25,
+        "sub_y": 60,
+        "sub_width_pct": 40,
+        "bg_blur": 50,
+        "color_ratio": 0.9,
+        "grain_val": 0.05
+    }
+}

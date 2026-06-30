@@ -16,6 +16,7 @@ from extensions import UPDATING_IMAGES
 from .styles.style_single_1 import create_style_single_1
 from .styles.style_single_2 import create_style_single_2
 from .styles.style_multi_1 import create_style_multi_1
+from .styles.style_chillposter import create_chillposter_cover, get_chillposter_asset_counts, get_chillposter_required_count
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class CoverGeneratorService:
         self._covers_input = self.config.get("covers_input")
         self._title_config_str = self.config.get("title_config", "")
         self._cover_style = self.config.get("cover_style", "single_1")
+        self._chillposter_template = self.config.get("chillposter_template", "preset_1769062617890")
         self._multi_1_blur = self.config.get("multi_1_blur", False)
         self._multi_1_use_primary = self.config.get("multi_1_use_primary", True)
         self._single_use_primary = self.config.get("single_use_primary", False)
@@ -104,7 +106,10 @@ class CoverGeneratorService:
                 random.shuffle(candidates)
             
             # 限制数量
-            limit = 1 if self._cover_style.startswith('single') else 9
+            if self._cover_style == 'chillposter':
+                limit = get_chillposter_required_count(self._chillposter_template)
+            else:
+                limit = 1 if self._cover_style.startswith('single') else 9
             candidates = candidates[:limit]
             
             # 提取纯 ID 列表
@@ -185,11 +190,35 @@ class CoverGeneratorService:
         return None
 
     def __generate_from_server(self, server_id: str, library: Dict[str, Any], title: Tuple[str, str], item_count: Optional[int] = None, content_types: Optional[List[str]] = None, custom_collection_data: Optional[Dict] = None) -> bytes:
-        required_items_count = 1 if self._cover_style.startswith('single') else 9
+        if self._cover_style == 'chillposter':
+            required_items_count = get_chillposter_required_count(self._chillposter_template)
+        else:
+            required_items_count = 1 if self._cover_style.startswith('single') else 9
         items = self.__get_valid_items_from_library(server_id, library, required_items_count, content_types, custom_collection_data)
         if not items:
             logger.warning(f"  ➜ 在媒体库 '{library['Name']}' 中找不到任何带有可用图片的媒体项。")
             return None
+        if self._cover_style == 'chillposter':
+            poster_paths = []
+            backdrop_paths = []
+            poster_limit, backdrop_limit = get_chillposter_asset_counts(self._chillposter_template)
+            for item in items:
+                if len(poster_paths) < poster_limit:
+                    primary_url = self.__get_primary_image_url(item)
+                    if primary_url:
+                        path = self.__download_image(server_id, primary_url, library['Name'], len(poster_paths) + 1, prefix="chillposter_poster_")
+                        if path:
+                            poster_paths.append(path)
+                if len(backdrop_paths) < backdrop_limit:
+                    backdrop_url = self.__get_backdrop_image_url(item)
+                    if backdrop_url:
+                        path = self.__download_image(server_id, backdrop_url, library['Name'], len(backdrop_paths) + 1, prefix="chillposter_backdrop_")
+                        if path:
+                            backdrop_paths.append(path)
+            if not poster_paths and not backdrop_paths:
+                logger.warning(f"  ➜ 为 ChillPoster 模板下载图片失败。")
+                return None
+            return self.__generate_image_from_path(library['Name'], title, poster_paths or backdrop_paths, item_count, backdrop_paths=backdrop_paths)
         if self._cover_style.startswith('single'):
             image_url = self.__get_image_url(items[0])
             if not image_url: return None
@@ -422,33 +451,42 @@ class CoverGeneratorService:
             return []
 
     def __get_image_url(self, item: Dict[str, Any]) -> str:
-        item_id = item.get("Id")
-        if not item_id: return None
-        primary_url, backdrop_url = None, None
-        primary_tag_in_dict = item.get("ImageTags", {}).get("Primary")
-        if primary_tag_in_dict:
-            primary_url = f'/emby/Items/{item_id}/Images/Primary?tag={primary_tag_in_dict}'
-        else:
-            referenced_item_id = item.get("PrimaryImageItemId")
-            referenced_tag = item.get("PrimaryImageTag")
-            if referenced_item_id and referenced_tag:
-                primary_url = f'/emby/Items/{referenced_item_id}/Images/Primary?tag={referenced_tag}'
-        backdrop_tags = item.get("BackdropImageTags")
-        if backdrop_tags:
-            backdrop_url = f'/emby/Items/{item_id}/Images/Backdrop/0?tag={backdrop_tags[0]}'
-        
+        primary_url = self.__get_primary_image_url(item)
+        backdrop_url = self.__get_backdrop_image_url(item)
         should_use_primary = (self._cover_style.startswith('single') and self._single_use_primary) or \
-                             (self._cover_style.startswith('multi') and self._multi_1_use_primary)
+                             (self._cover_style.startswith('multi') and self._multi_1_use_primary) or \
+                             self._cover_style == 'chillposter'
 
         if should_use_primary:
             return primary_url or backdrop_url
         else:
             return backdrop_url or primary_url
 
-    def __download_image(self, server_id: str, api_path: str, library_name: str, count: int) -> Path:
+    def __get_primary_image_url(self, item: Dict[str, Any]) -> str:
+        item_id = item.get("Id")
+        if not item_id: return None
+        primary_tag_in_dict = item.get("ImageTags", {}).get("Primary")
+        if primary_tag_in_dict:
+            return f'/emby/Items/{item_id}/Images/Primary?tag={primary_tag_in_dict}'
+        else:
+            referenced_item_id = item.get("PrimaryImageItemId")
+            referenced_tag = item.get("PrimaryImageTag")
+            if referenced_item_id and referenced_tag:
+                return f'/emby/Items/{referenced_item_id}/Images/Primary?tag={referenced_tag}'
+        return None
+
+    def __get_backdrop_image_url(self, item: Dict[str, Any]) -> str:
+        item_id = item.get("Id")
+        if not item_id: return None
+        backdrop_tags = item.get("BackdropImageTags")
+        if backdrop_tags:
+            return f'/emby/Items/{item_id}/Images/Backdrop/0?tag={backdrop_tags[0]}'
+        return None
+
+    def __download_image(self, server_id: str, api_path: str, library_name: str, count: int, prefix: str = "") -> Path:
         subdir = self.covers_path / library_name
         subdir.mkdir(parents=True, exist_ok=True)
-        filepath = subdir / f"{count}.jpg"
+        filepath = subdir / f"{prefix}{count}.jpg"
         try:
             base_url = config_manager.APP_CONFIG.get('emby_server_url')
             api_key = config_manager.APP_CONFIG.get('emby_api_key')
@@ -471,8 +509,16 @@ class CoverGeneratorService:
             logger.error(f"  ➜ 下载图片失败 ({api_path}): {e}", exc_info=True)
         return None
 
-    def __generate_image_from_path(self, library_name: str, title: Tuple[str, str], image_paths: List[str], item_count: Optional[int] = None) -> bytes:
+    def __generate_image_from_path(self, library_name: str, title: Tuple[str, str], image_paths: List[str], item_count: Optional[int] = None, backdrop_paths: Optional[List[str]] = None) -> bytes:
         logger.trace(f"  ➜ 正在为 '{library_name}' 从本地路径生成封面...")
+        if self._cover_style == 'chillposter':
+            return create_chillposter_cover(
+                poster_paths=[str(path) for path in image_paths],
+                backdrop_paths=[str(path) for path in (backdrop_paths or [])],
+                title=title,
+                item_count=item_count,
+                config=self.config,
+            )
         zh_font_size = self.config.get("zh_font_size", 1)
         en_font_size = self.config.get("en_font_size", 1)
         blur_size = self.config.get("blur_size", 50)
@@ -516,10 +562,11 @@ class CoverGeneratorService:
         base_url = config_manager.APP_CONFIG.get('emby_server_url')
         api_key = config_manager.APP_CONFIG.get('emby_api_key')
         upload_url = f"{base_url.rstrip('/')}/Items/{library_id}/Images/Primary?api_key={api_key}"
-        headers = {"Content-Type": "image/jpeg"}
+        content_type, extension = self.__get_image_upload_type(image_data)
+        headers = {"Content-Type": content_type}
         if self._covers_output:
             try:
-                save_path = Path(self._covers_output) / f"{library['Name']}.jpg"
+                save_path = Path(self._covers_output) / f"{library['Name']}{extension}"
                 save_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(save_path, "wb") as f:
                     f.write(image_data)
@@ -542,6 +589,11 @@ class CoverGeneratorService:
             if e.response is not None:
                 logger.error(f"  ➜ 响应状态: {e.response.status_code}, 响应内容: {e.response.text[:200]}")
             return False
+
+    def __get_image_upload_type(self, image_data: bytes) -> Tuple[str, str]:
+        if image_data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png", ".png"
+        return "image/jpeg", ".jpg"
 
     def __get_library_title_from_yaml(self, library_name: str) -> Tuple[str, str]:
         zh_title, en_title = library_name, ''

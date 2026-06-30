@@ -1,7 +1,7 @@
 # utils.py (最终智能匹配版)
 
 import re
-from typing import Optional, Tuple, Any
+from typing import Iterable, List, Optional, Tuple, Any
 from urllib.parse import quote_plus
 import unicodedata
 import logging
@@ -15,6 +15,22 @@ except ImportError:
     def pinyin(*args, **kwargs):
         # 如果库不存在，这个模拟函数将导致中文名无法转换为拼音进行匹配
         return []
+
+def normalize_monitor_extensions(extensions: Iterable[str]) -> List[str]:
+    """统一监控扩展名格式，允许用户输入 mp4、.mp4 或 *.mp4。"""
+    normalized = []
+    for ext in extensions or []:
+        if not ext:
+            continue
+
+        clean_ext = str(ext).strip().lower().replace('*', '')
+        if not clean_ext:
+            continue
+        if not clean_ext.startswith('.'):
+            clean_ext = '.' + clean_ext
+        if clean_ext not in normalized:
+            normalized.append(clean_ext)
+    return normalized
 
 def check_stream_validity(width: Any, height: Any, codec: Any) -> Tuple[bool, str]:
     """

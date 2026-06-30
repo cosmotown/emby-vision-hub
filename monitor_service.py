@@ -13,6 +13,7 @@ from gevent import spawn_later
 import constants
 import config_manager
 import handler.emby as emby
+import utils
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -35,21 +36,8 @@ class MediaFileHandler(FileSystemEventHandler):
     文件系统事件处理器
     """
     def __init__(self, extensions: List[str], exclude_dirs: List[str] = None):
-        # ★★★ 防呆处理：标准化扩展名 ★★★
-        # 1. 去除空格、转小写
-        # 2. 去除可能误输入的通配符 * (例如 *.mp4 -> .mp4)
-        # 3. 补齐开头的 . (例如 mp4 -> .mp4)
-        self.extensions = []
-        for ext in extensions:
-            if not ext: continue
-            
-            clean_ext = ext.strip().lower().replace('*', '')
-            
-            if clean_ext:
-                if not clean_ext.startswith('.'):
-                    clean_ext = '.' + clean_ext
-                self.extensions.append(clean_ext)
-        
+        self.extensions = utils.normalize_monitor_extensions(extensions)
+
         # 记录一下最终生效的监控后缀，方便调试
         logger.trace(f"  [实时监控] 已加载监控后缀: {self.extensions}")
 

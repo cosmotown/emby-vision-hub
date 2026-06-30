@@ -1,7 +1,7 @@
 # routes/media_cleanup.py
 
 from flask import Blueprint, jsonify, request
-from extensions import task_lock_required, processor_ready_required
+from extensions import admin_required, task_lock_required, processor_ready_required
 
 import task_manager
 from tasks.cleanup import task_execute_cleanup, task_scan_for_cleanup_issues
@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 media_cleanup_bp = Blueprint('media_cleanup_bp', __name__)
 
 @media_cleanup_bp.route('/api/cleanup/tasks', methods=['GET'])
+@admin_required
 def get_cleanup_tasks():
     """
     【V2 - 瘦身关联版】
@@ -49,6 +50,7 @@ def get_cleanup_tasks():
         return jsonify({"error": f"获取清理任务失败: {e}"}), 500
 
 @media_cleanup_bp.route('/api/cleanup/execute', methods=['POST'])
+@admin_required
 @task_lock_required
 @processor_ready_required
 def execute_cleanup_tasks():
@@ -65,6 +67,7 @@ def execute_cleanup_tasks():
     return jsonify({"message": "清理任务已提交到后台执行。"}), 202
 
 @media_cleanup_bp.route('/api/cleanup/ignore', methods=['POST'])
+@admin_required
 def ignore_cleanup_tasks():
     data = request.get_json()
     task_ids = data.get('task_ids')
@@ -78,6 +81,7 @@ def ignore_cleanup_tasks():
         return jsonify({"error": f"忽略任务时失败: {e}"}), 500
 
 @media_cleanup_bp.route('/api/cleanup/delete', methods=['POST'])
+@admin_required
 def delete_cleanup_tasks():
     data = request.get_json()
     task_ids = data.get('task_ids')
@@ -91,6 +95,7 @@ def delete_cleanup_tasks():
         return jsonify({"error": f"删除任务时失败: {e}"}), 500
 
 @media_cleanup_bp.route('/api/cleanup/clear_all', methods=['POST'])
+@admin_required
 @task_lock_required
 @processor_ready_required
 def clear_all_cleanup_tasks():
@@ -111,6 +116,7 @@ def clear_all_cleanup_tasks():
         return jsonify({"error": f"一键清理失败: {e}"}), 500
     
 @media_cleanup_bp.route('/api/cleanup/settings', methods=['GET'])
+@admin_required
 def get_cleanup_settings():
     """获取所有媒体去重设置（包括规则和指定的媒体库）。"""
     try:
@@ -237,6 +243,7 @@ def get_cleanup_settings():
         return jsonify({"error": f"获取清理设置失败: {e}"}), 500
 
 @media_cleanup_bp.route('/api/cleanup/settings', methods=['POST'])
+@admin_required
 def save_cleanup_settings():
     """保存新的媒体去重设置（包括规则和指定的媒体库）。"""
     data = request.get_json()
@@ -269,6 +276,7 @@ def save_cleanup_settings():
 # ★★★ 核心修改 2/3: 新增一个触发扫描的路由 ★★★
 # 这个路由会调用更新后的 task_scan_for_cleanup_issues 任务
 @media_cleanup_bp.route('/api/cleanup/scan', methods=['POST'])
+@admin_required
 @task_lock_required
 @processor_ready_required
 def trigger_cleanup_scan():

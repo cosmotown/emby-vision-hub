@@ -138,6 +138,25 @@
                     </n-gi>
                   </n-grid>
                 </n-radio-group>
+                <div v-if="configData.cover_style === 'chillposter'" style="margin-top: 20px;">
+                  <n-form-item label="ChillPoster 模板">
+                    <n-select
+                      v-model:value="configData.chillposter_template"
+                      :options="chillposterTemplateOptions"
+                      placeholder="选择模板"
+                    />
+                  </n-form-item>
+                  <n-form-item v-if="selectedChillPosterTemplate?.dynamic" label="动态封面宽度">
+                    <n-input-number
+                      v-model:value="configData.chillposter_dynamic_width"
+                      :min="320"
+                      :max="1280"
+                      :step="160"
+                      placeholder="960"
+                    />
+                    <template #feedback>动态 APNG 会保留动画，宽度越大生成和上传越慢，最大 1280。</template>
+                  </n-form-item>
+                </div>
               </n-spin>
             </n-tab-pane>
 
@@ -327,7 +346,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, watch } from 'vue';
+import { ref, computed, onMounted, watch } from 'vue';
 import axios from 'axios';
 import { 
   useMessage, NLayout, NPageHeader, NButton, NIcon, NCard, NGrid, NGi, 
@@ -349,12 +368,14 @@ const stylePreviews = ref({
   single_1: single_1,
   single_2: single_2,
   multi_1: multi_1,
+  chillposter: '',
 });
 
 const styles = [
   { title: "单图 1", value: "single_1" },
   { title: "单图 2", value: "single_2" },
-  { title: "多图 1", value: "multi_1" }
+  { title: "多图 1", value: "multi_1" },
+  { title: "ChillPoster 模板", value: "chillposter" }
 ];
 
 const message = useMessage();
@@ -363,6 +384,11 @@ const isSaving = ref(false);
 const isGenerating = ref(false);
 const configData = ref({});
 const ratingLimitOptions = ref([]);
+const chillposterTemplates = ref([]);
+const chillposterTemplateOptions = ref([]);
+const selectedChillPosterTemplate = computed(() => (
+  chillposterTemplates.value.find(item => item.id === configData.value.chillposter_template)
+));
 // ★ 新增：用于封面标题UI的结构化数据
 const titleConfigs = ref([]);
 
@@ -453,6 +479,32 @@ const fetchLibraryOptions = async () => {
     libraryOptions.value = response.data;
   } catch (error) {
     message.error('获取媒体库列表失败，请检查后端。');
+  }
+};
+
+const setChillPosterPreview = () => {
+  const selected = chillposterTemplates.value.find(
+    item => item.id === configData.value.chillposter_template
+  ) || chillposterTemplates.value[0];
+  if (selected) {
+    stylePreviews.value.chillposter = selected.preview;
+    if (!configData.value.chillposter_template) {
+      configData.value.chillposter_template = selected.id;
+    }
+  }
+};
+
+const fetchChillPosterTemplates = async () => {
+  try {
+    const response = await axios.get('/api/config/cover_generator/chillposter/templates');
+    chillposterTemplates.value = response.data || [];
+    chillposterTemplateOptions.value = chillposterTemplates.value.map(item => ({
+      label: `${item.name}${item.engine ? `（${item.engine}）` : ''}`,
+      value: item.id
+    }));
+    setChillPosterPreview();
+  } catch (error) {
+    message.error('加载 ChillPoster 模板失败。');
   }
 };
 
@@ -551,6 +603,7 @@ async function updateAllPreviews() {
     stylePreviews.value.single_1 = single_1;
     stylePreviews.value.single_2 = single_2;
     stylePreviews.value.multi_1 = multi_1;
+    setChillPosterPreview();
     isPreviewLoading.value = false;
     return;
   }
@@ -575,6 +628,7 @@ async function updateAllPreviews() {
     stylePreviews.value.single_1 = results[0].data.image;
     stylePreviews.value.single_2 = results[1].data.image;
     stylePreviews.value.multi_1 = results[2].data.image;
+    setChillPosterPreview();
 
   } catch (error) {
     message.error("实时预览失败");
@@ -595,10 +649,18 @@ watch(
   { deep: true } // 建议对复杂对象监听开启deep
 );
 
+watch(
+  () => configData.value.chillposter_template,
+  () => {
+    setChillPosterPreview();
+  }
+);
+
 onMounted(() => {
   fetchConfig();
   fetchLibraryOptions();
   fetchRatingOptions();
+  fetchChillPosterTemplates();
 });
 </script>
 

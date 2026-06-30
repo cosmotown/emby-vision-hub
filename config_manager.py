@@ -50,7 +50,7 @@ BOOTSTRAP_CONFIG_DEF = {
     constants.CONFIG_OPTION_DB_PASSWORD: (constants.CONFIG_SECTION_DATABASE, 'string', 'your_password'),
     constants.CONFIG_OPTION_DB_NAME: (constants.CONFIG_SECTION_DATABASE, 'string', 'emby_toolkit'),
     # [Authentication]
-    constants.CONFIG_OPTION_AUTH_ENABLED: (constants.CONFIG_SECTION_AUTH, 'boolean', False),
+    constants.CONFIG_OPTION_AUTH_ENABLED: (constants.CONFIG_SECTION_AUTH, 'boolean', True),
     constants.CONFIG_OPTION_AUTH_USERNAME: (constants.CONFIG_SECTION_AUTH, 'string', constants.DEFAULT_USERNAME),
 }
 

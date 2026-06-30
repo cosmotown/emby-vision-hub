@@ -132,6 +132,22 @@ class MediaProcessor:
         self._last_lib_map_update = 0
         logger.trace("核心处理器初始化完成。")
 
+    def _get_valid_local_data_path(self, context: str) -> Optional[str]:
+        path = (self.local_data_path or "").strip()
+        if not path:
+            logger.error(f"  ➜ {context} 失败：未在配置中设置“本地数据源路径”。")
+            return None
+        if not os.path.isabs(path):
+            logger.error(f"  ➜ {context} 失败：本地数据源路径必须是绝对路径，当前为: {path}")
+            return None
+        if not os.path.isdir(path):
+            logger.error(f"  ➜ {context} 失败：本地数据源路径不存在或不是目录: {path}")
+            return None
+        if not os.access(path, os.W_OK):
+            logger.error(f"  ➜ {context} 失败：本地数据源路径不可写: {path}")
+            return None
+        return path
+
     # --- [优化版] 实时监控文件逻辑 (增加缓存跳过 & 支持批量延迟刷新) ---
     def process_file_actively(self, file_path: str, skip_refresh: bool = False) -> Optional[str]:
         """
@@ -245,9 +261,13 @@ class MediaProcessor:
             # =========================================================
             should_skip_full_processing = False
             
+            local_data_path = self._get_valid_local_data_path("[实时监控]")
+            if not local_data_path:
+                return None
+
             # 1. 路径准备
             cache_folder_name = "tmdb-movies2" if item_type == "Movie" else "tmdb-tv"
-            base_override_dir = os.path.join(self.local_data_path, "override", cache_folder_name, str(tmdb_id))
+            base_override_dir = os.path.join(local_data_path, "override", cache_folder_name, str(tmdb_id))
             main_json_filename = "all.json" if item_type == "Movie" else "series.json"
             main_json_path = os.path.join(base_override_dir, main_json_filename)
             file_exists = os.path.exists(main_json_path)
@@ -730,13 +750,13 @@ class MediaProcessor:
             logger.warning(f"  ⚠️ [实时监控] 未收集到有效的刷新目录，任务结束。")
 
     # --- 内部私有方法：单文件数据库清理逻辑 ---
-    def _cleanup_local_db_for_deleted_file(self, filename: str) -> bool:
+    def _cleanup_local_db_for_deleted_file(self, filename: str, file_path: Optional[str] = None) -> bool:
         """
         根据文件名执行本地数据库的清理工作（不含 Emby 刷新）。
         返回 True 表示执行了清理，False 表示未找到记录。
         """
         # 1. 精确反查 (获取 target_emby_id)
-        media_info = media_db.get_media_info_by_filename(filename)
+        media_info = media_db.get_media_info_by_filename(filename, file_path=file_path)
         
         if media_info:
             tmdb_id = media_info.get('tmdb_id')
@@ -820,7 +840,7 @@ class MediaProcessor:
             logger.info(f"  🗑️ [文件删除] 检测到文件移除: {filename}")
             
             # 1. 执行数据库清理
-            cleaned = self._cleanup_local_db_for_deleted_file(filename)
+            cleaned = self._cleanup_local_db_for_deleted_file(filename, file_path=file_path)
             
             # 2. 刷新向量缓存 (如果有清理动作且开启了推荐)
             if cleaned and config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_PROXY_ENABLED) and config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_AI_VECTOR):
@@ -856,7 +876,7 @@ class MediaProcessor:
                 folder_path = os.path.dirname(file_path)
                 folders_to_check.add(folder_path)
                 
-                if self._cleanup_local_db_for_deleted_file(filename):
+                if self._cleanup_local_db_for_deleted_file(filename, file_path=file_path):
                     cleaned_count += 1
             except Exception as e:
                 logger.error(f"  🚫 [批量删除] 处理文件 '{file_path}' 时出错: {e}")
@@ -1873,8 +1893,7 @@ class MediaProcessor:
         if not tmdb_id:
             logger.error(f"  ➜ '{item_name_for_log}' 缺少 TMDb ID，无法处理。")
             return False
-        if not self.local_data_path:
-            logger.error(f"  ➜ '{item_name_for_log}' 处理失败：未在配置中设置“本地数据源路径”。")
+        if not self._get_valid_local_data_path(f"'{item_name_for_log}' 处理"):
             return False
         
         try:
@@ -3594,8 +3613,11 @@ class MediaProcessor:
         item_type = item_details.get("Type")
         item_name_for_log = item_details.get("Name", f"未知项目(ID:{item_id})")
         
-        if not all([item_id, item_type, self.local_data_path]):
-            logger.error(f"  ➜ 跳过 '{item_name_for_log}'，因为缺少ID、类型或未配置本地数据路径。")
+        if not all([item_id, item_type]):
+            logger.error(f"  ➜ 跳过 '{item_name_for_log}'，因为缺少ID或类型。")
+            return False
+        local_data_path = self._get_valid_local_data_path(f"'{item_name_for_log}' 图片备份")
+        if not local_data_path:
             return False
 
         try:
@@ -3607,7 +3629,7 @@ class MediaProcessor:
                 return False
             
             cache_folder_name = "tmdb-movies2" if item_type == "Movie" else "tmdb-tv"
-            base_override_dir = os.path.join(self.local_data_path, "override", cache_folder_name, tmdb_id)
+            base_override_dir = os.path.join(local_data_path, "override", cache_folder_name, tmdb_id)
             image_override_dir = os.path.join(base_override_dir, "images")
             os.makedirs(image_override_dir, exist_ok=True)
 
@@ -4598,15 +4620,18 @@ class MediaProcessor:
         tmdb_id = item_details.get("ProviderIds", {}).get("Tmdb")
         log_prefix = "[覆盖缓存-元数据持久化]"
 
-        if not all([item_id, item_type, tmdb_id, self.local_data_path]):
-            logger.warning(f"  ➜ {log_prefix} 跳过 '{item_name_for_log}'，缺少关键ID或路径配置。")
+        if not all([item_id, item_type, tmdb_id]):
+            logger.warning(f"  ➜ {log_prefix} 跳过 '{item_name_for_log}'，缺少关键ID。")
+            return
+        local_data_path = self._get_valid_local_data_path(f"{log_prefix} '{item_name_for_log}'")
+        if not local_data_path:
             return
 
         logger.info(f"  ➜ {log_prefix} 开始为 '{item_name_for_log}' 更新覆盖缓存文件...")
 
         # --- 定位主文件 ---
         cache_folder_name = "tmdb-movies2" if item_type == "Movie" else "tmdb-tv"
-        target_override_dir = os.path.join(self.local_data_path, "override", cache_folder_name, tmdb_id)
+        target_override_dir = os.path.join(local_data_path, "override", cache_folder_name, tmdb_id)
         main_json_filename = "all.json" if item_type == "Movie" else "series.json"
         main_json_path = os.path.join(target_override_dir, main_json_filename)
 

@@ -62,6 +62,7 @@ def _is_allowed_image_proxy_url(external_url: str) -> bool:
     return False
 
 @media_api_bp.route('/search_emby_library', methods=['GET'])
+@any_login_required
 @processor_ready_required
 def api_search_emby_library():
     query = request.args.get('query', '')

@@ -6,6 +6,7 @@ import yaml
 import json
 import random
 import requests
+import base64
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
@@ -566,7 +567,10 @@ class CoverGeneratorService:
         upload_url = f"{base_url.rstrip('/')}/Items/{library_id}/Images/Primary?api_key={api_key}"
         content_type, extension = self.__get_image_upload_type(image_data)
         upload_data, upload_content_type, upload_extension, converted_for_emby = self.__prepare_emby_upload_image(image_data)
-        headers = {"Content-Type": upload_content_type}
+        headers = {
+            "Content-Type": upload_content_type,
+            "X-Emby-Token": api_key or "",
+        }
         if self._covers_output:
             try:
                 save_path = Path(self._covers_output) / f"{library['Name']}{extension}"
@@ -590,7 +594,9 @@ class CoverGeneratorService:
                 def _clear_flag():
                     UPDATING_IMAGES.discard(library_id)
                 spawn_later(30, _clear_flag)
-            response = requests.post(upload_url, data=upload_data, headers=headers, timeout=30)
+            encoded_image = base64.b64encode(upload_data).decode("ascii")
+            logger.info(f"  ➜ 正在上传 Emby 封面: {upload_content_type}, {len(upload_data)} bytes。")
+            response = requests.post(upload_url, data=encoded_image, headers=headers, timeout=30)
             response.raise_for_status()
             logger.debug(f"  ➜ 成功上传封面到媒体库 '{library['Name']}'。")
             return True

@@ -2,6 +2,17 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.0.4",
+        "published_at": "2026-07-01T18:45:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.4",
+        "changelog": """## ChillPoster 标题热修复
+
+### 修复
+- 修复 ChillPoster 模板在英文标题为空时继续显示模板默认 `Western Movies` 的问题。
+- ChillPoster 现在只使用封面标题配置传入的中文/英文标题；英文标题为空时保持为空，不再回退模板默认值。
+""",
+    },
+    {
         "version": "v7.0.3",
         "published_at": "2026-07-01T06:05:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.3",

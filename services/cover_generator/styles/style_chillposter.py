@@ -96,8 +96,9 @@ def create_chillposter_cover(
 
     template_id = config.get("chillposter_template") or DEFAULT_TEMPLATE_ID
     _, render_config = _load_template(template_id)
-    render_config["title"] = title[0] or render_config.get("title") or ""
-    render_config["subtitle"] = title[1] or render_config.get("subtitle") or ""
+    title_zh, title_en = title
+    render_config["title"] = title_zh or ""
+    render_config["subtitle"] = title_en or ""
 
     if render_config.get("enable_animation"):
         try:

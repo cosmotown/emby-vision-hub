@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import config_manager
 from services.cover_generator.chillposter.engine import MAX_DYNAMIC_WIDTH, PosterEngine
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,29 @@ def _get_engine() -> PosterEngine:
     if _ENGINE is None:
         _ENGINE = PosterEngine(fonts_dir=str(REPO_FONTS_DIR), layouts_dir=str(LAYOUTS_DIR))
     return _ENGINE
+
+
+def _resolve_font_config(requested_name: str, config: Dict[str, Any], local_key: str, fallback_name: str) -> str:
+    if requested_name:
+        requested_path = Path(requested_name)
+        if requested_path.is_absolute() and requested_path.exists():
+            return requested_name
+        if (REPO_FONTS_DIR / requested_name).exists():
+            return requested_name
+
+    local_path = config.get(local_key)
+    if local_path and Path(local_path).exists():
+        return str(Path(local_path))
+
+    persistent_font = Path(config_manager.PERSISTENT_DATA_PATH) / "cover_generator" / "fonts" / fallback_name
+    if persistent_font.exists():
+        return str(persistent_font)
+
+    repo_font = REPO_FONTS_DIR / fallback_name
+    if repo_font.exists():
+        return fallback_name
+
+    return fallback_name
 
 
 def _file_to_data_url(path: str) -> str:
@@ -99,6 +123,9 @@ def create_chillposter_cover(
     title_zh, title_en = title
     render_config["title"] = title_zh or ""
     render_config["subtitle"] = title_en or ""
+    render_config["font_title"] = _resolve_font_config(render_config.get("font_title"), config, "zh_font_path_local", "zh_font.ttf")
+    render_config["font_subtitle"] = _resolve_font_config(render_config.get("font_subtitle"), config, "en_font_path_local", "en_font.ttf")
+    render_config["badge_font"] = _resolve_font_config(render_config.get("badge_font"), config, "zh_font_path_local", "zh_font.ttf")
 
     if render_config.get("enable_animation"):
         try:

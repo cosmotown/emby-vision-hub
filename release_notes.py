@@ -2,6 +2,20 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.0.5",
+        "published_at": "2026-07-01T19:20:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.5",
+        "changelog": """## ChillPoster 字体修复
+
+### 修复
+- 补齐 ChillPoster 原镜像内置字体，修复模板标题显示为方块的问题。
+- ChillPoster 现在优先使用模板指定字体；模板字体不存在时再回退到用户本地字体或 toolkit 默认字体。
+
+### 说明
+- 本版未加入模板编辑器，只先修复现有模板生成效果。
+""",
+    },
+    {
         "version": "v7.0.4",
         "published_at": "2026-07-01T18:45:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.4",

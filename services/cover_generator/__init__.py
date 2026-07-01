@@ -7,9 +7,10 @@ import json
 import random
 import requests
 import base64
+import binascii
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Union
 from gevent import spawn_later
 from PIL import Image
 from database import custom_collection_db, queries_db
@@ -63,7 +64,7 @@ class CoverGeneratorService:
             logger.error(f"  ➜ 上传封面到媒体库 '{library['Name']}' 失败。")
         return success
 
-    def __generate_image_data(self, server_id: str, library: Dict[str, Any], item_count: Optional[int] = None, content_types: Optional[List[str]] = None, custom_collection_data: Optional[Dict] = None) -> bytes:
+    def __generate_image_data(self, server_id: str, library: Dict[str, Any], item_count: Optional[int] = None, content_types: Optional[List[str]] = None, custom_collection_data: Optional[Dict] = None) -> Union[bytes, str, None]:
         library_name = library['Name']
         title = self.__get_library_title_from_yaml(library_name)
         custom_image_paths = self.__check_custom_image(library_name)
@@ -192,7 +193,7 @@ class CoverGeneratorService:
             logger.warning(f"  ➜ 下载外部图片失败 {url}: {e}")
         return None
 
-    def __generate_from_server(self, server_id: str, library: Dict[str, Any], title: Tuple[str, str], item_count: Optional[int] = None, content_types: Optional[List[str]] = None, custom_collection_data: Optional[Dict] = None) -> bytes:
+    def __generate_from_server(self, server_id: str, library: Dict[str, Any], title: Tuple[str, str], item_count: Optional[int] = None, content_types: Optional[List[str]] = None, custom_collection_data: Optional[Dict] = None) -> Union[bytes, str, None]:
         if self._cover_style == 'chillposter':
             required_items_count = get_chillposter_required_count(self._chillposter_template)
         else:
@@ -512,7 +513,7 @@ class CoverGeneratorService:
             logger.error(f"  ➜ 下载图片失败 ({api_path}): {e}", exc_info=True)
         return None
 
-    def __generate_image_from_path(self, library_name: str, title: Tuple[str, str], image_paths: List[str], item_count: Optional[int] = None, backdrop_paths: Optional[List[str]] = None) -> bytes:
+    def __generate_image_from_path(self, library_name: str, title: Tuple[str, str], image_paths: List[str], item_count: Optional[int] = None, backdrop_paths: Optional[List[str]] = None) -> Union[bytes, str, None]:
         logger.trace(f"  ➜ 正在为 '{library_name}' 从本地路径生成封面...")
         if self._cover_style == 'chillposter':
             return create_chillposter_cover(
@@ -560,13 +561,17 @@ class CoverGeneratorService:
                                       item_count=item_count, config=self.config)
         return None
 
-    def __set_library_image(self, server_id: str, library: Dict[str, Any], image_data: bytes) -> bool:
+    def __set_library_image(self, server_id: str, library: Dict[str, Any], image_data: Union[bytes, str]) -> bool:
         library_id = library.get("Id") or library.get("ItemId")
         base_url = config_manager.APP_CONFIG.get('emby_server_url')
         api_key = config_manager.APP_CONFIG.get('emby_api_key')
         upload_url = f"{base_url.rstrip('/')}/Items/{library_id}/Images/Primary?api_key={api_key}"
-        content_type, extension = self.__get_image_upload_type(image_data)
-        upload_data, upload_content_type, upload_extension, converted_for_emby = self.__prepare_emby_upload_image(image_data)
+        raw_image_data = self.__normalize_image_data(image_data)
+        if not raw_image_data:
+            logger.error(f"  ➜ 媒体库 '{library['Name']}' 的封面数据格式无效，无法上传。")
+            return False
+        content_type, extension = self.__get_image_upload_type(raw_image_data)
+        upload_data, upload_content_type, upload_extension, converted_for_emby = self.__prepare_emby_upload_image(raw_image_data)
         headers = {
             "Content-Type": upload_content_type,
             "X-Emby-Token": api_key or "",
@@ -576,7 +581,7 @@ class CoverGeneratorService:
                 save_path = Path(self._covers_output) / f"{library['Name']}{extension}"
                 save_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(save_path, "wb") as f:
-                    f.write(image_data)
+                    f.write(raw_image_data)
                 logger.info(f"  ➜ 封面已另存到: {save_path}")
                 if converted_for_emby:
                     emby_save_path = Path(self._covers_output) / f"{library['Name']}.emby{upload_extension}"
@@ -605,6 +610,24 @@ class CoverGeneratorService:
             if e.response is not None:
                 logger.error(f"  ➜ 响应状态: {e.response.status_code}, 响应内容: {e.response.text[:200]}")
             return False
+
+    def __normalize_image_data(self, image_data: Union[bytes, str]) -> Optional[bytes]:
+        if isinstance(image_data, bytes):
+            return image_data
+        if not isinstance(image_data, str):
+            return None
+
+        normalized = image_data.strip()
+        if not normalized:
+            return None
+        if "," in normalized and normalized.lower().startswith("data:image/"):
+            normalized = normalized.split(",", 1)[1]
+
+        try:
+            return base64.b64decode(normalized, validate=True)
+        except (binascii.Error, ValueError) as e:
+            logger.error(f"  ➜ 解码模板输出的 base64 封面失败: {e}")
+            return None
 
     def __prepare_emby_upload_image(self, image_data: bytes) -> Tuple[bytes, str, str, bool]:
         content_type, extension = self.__get_image_upload_type(image_data)
@@ -636,7 +659,10 @@ class CoverGeneratorService:
             if isinstance(title_config, dict) and library_name in title_config:
                 titles = title_config[library_name]
                 if isinstance(titles, list) and len(titles) >= 2:
-                    zh_title, en_title = titles[0], titles[1]
+                    zh_title = str(titles[0]).strip() if titles[0] is not None else ''
+                    en_title = str(titles[1]).strip() if titles[1] is not None else ''
+                    if not zh_title:
+                        zh_title = library_name
         except yaml.YAMLError as e:
             logger.error(f"  ➜ 解析标题配置失败: {e}")
         return zh_title, en_title

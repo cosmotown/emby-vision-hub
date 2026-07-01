@@ -2,6 +2,21 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.0.3",
+        "published_at": "2026-07-01T06:05:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.3",
+        "changelog": """## 封面生成热修复
+
+### 修复
+- 修复 `v7.0.2` 中原生单图、多图封面生成后后台显示成功但 Emby 实际封面不更新的问题。
+- 统一封面上传前的数据处理，兼容原生模板返回的 base64 图片和 ChillPoster 返回的图片 bytes。
+- 修复 ChillPoster 模板在标题配置为空时显示模板默认标题的问题，现在会回退显示媒体库名称。
+
+### 说明
+- 自建合集封面继续复用同一套封面生成配置，但需要通过自建合集页面的“生成所有封面”或刷新自建合集任务触发。
+""",
+    },
+    {
         "version": "v7.0.2",
         "published_at": "2026-07-01T02:35:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.2",

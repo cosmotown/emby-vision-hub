@@ -8,11 +8,12 @@ import random
 import requests
 import base64
 import binascii
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional, Union
-from gevent import spawn_later
-from PIL import Image
+from gevent import spawn_later, sleep as gevent_sleep
+from PIL import Image, ImageSequence
 from database import custom_collection_db, queries_db
 import config_manager
 import handler.emby as emby 
@@ -570,12 +571,8 @@ class CoverGeneratorService:
         if not raw_image_data:
             logger.error(f"  ➜ 媒体库 '{library['Name']}' 的封面数据格式无效，无法上传。")
             return False
-        content_type, extension = self.__get_image_upload_type(raw_image_data)
-        upload_data, upload_content_type, upload_extension, converted_for_emby = self.__prepare_emby_upload_image(raw_image_data)
-        headers = {
-            "Content-Type": upload_content_type,
-            "X-Emby-Token": api_key or "",
-        }
+        _content_type, extension = self.__get_image_upload_type(raw_image_data)
+        upload_candidates = self.__build_emby_upload_candidates(raw_image_data)
         if self._covers_output:
             try:
                 save_path = Path(self._covers_output) / f"{library['Name']}{extension}"
@@ -583,15 +580,18 @@ class CoverGeneratorService:
                 with open(save_path, "wb") as f:
                     f.write(raw_image_data)
                 logger.info(f"  ➜ 封面已另存到: {save_path}")
-                if converted_for_emby:
-                    emby_save_path = Path(self._covers_output) / f"{library['Name']}.emby{upload_extension}"
+                for candidate in upload_candidates[1:]:
+                    emby_save_path = Path(self._covers_output) / f"{library['Name']}.{candidate['name']}{candidate['extension']}"
                     with open(emby_save_path, "wb") as f:
-                        f.write(upload_data)
-                    logger.info(f"  ➜ Emby 兼容版封面已另存到: {emby_save_path}")
+                        f.write(candidate["data"])
+                    logger.info(f"  ➜ Emby 备用封面已另存到: {emby_save_path}")
             except Exception as e:
                 logger.error(f"  ➜ 另存封面失败: {e}")
-        if converted_for_emby:
-            logger.info("  ➜ 检测到 ChillPoster PNG/APNG，已转换为 JPEG 后上传 Emby。")
+
+        if self.__is_animated_image(raw_image_data):
+            logger.info("  ➜ 检测到动态封面，将先尝试保留动画；若 Emby 不接受，再自动降级。")
+
+        before_tag = self.__get_primary_image_tag(library_id)
         try:
             if library_id:
                 UPDATING_IMAGES.add(library_id)
@@ -599,12 +599,22 @@ class CoverGeneratorService:
                 def _clear_flag():
                     UPDATING_IMAGES.discard(library_id)
                 spawn_later(30, _clear_flag)
-            encoded_image = base64.b64encode(upload_data).decode("ascii")
-            logger.info(f"  ➜ 正在上传 Emby 封面: {upload_content_type}, {len(upload_data)} bytes。")
-            response = requests.post(upload_url, data=encoded_image, headers=headers, timeout=30)
-            response.raise_for_status()
-            logger.debug(f"  ➜ 成功上传封面到媒体库 '{library['Name']}'。")
-            return True
+            for index, candidate in enumerate(upload_candidates):
+                if index > 0:
+                    logger.warning(
+                        "  ➜ Emby 未确认上一种封面格式可用，改用备用格式: %s。",
+                        candidate["label"],
+                    )
+                if not self.__upload_primary_image(upload_url, api_key, library, candidate):
+                    continue
+                gevent_sleep(0.8)
+                if self.__verify_primary_image_upload(library_id, before_tag, candidate):
+                    self.__refresh_emby_image_cache(library_id)
+                    return True
+                before_tag = self.__get_primary_image_tag(library_id)
+
+            logger.error(f"  ➜ Emby 未能确认媒体库 '{library['Name']}' 的封面已生效。")
+            return False
         except requests.exceptions.RequestException as e:
             logger.error(f"  ➜ 上传封面到媒体库 '{library['Name']}' 时发生网络错误: {e}")
             if e.response is not None:
@@ -629,26 +639,215 @@ class CoverGeneratorService:
             logger.error(f"  ➜ 解码模板输出的 base64 封面失败: {e}")
             return None
 
-    def __prepare_emby_upload_image(self, image_data: bytes) -> Tuple[bytes, str, str, bool]:
+    def __build_emby_upload_candidates(self, image_data: bytes) -> List[Dict[str, Any]]:
         content_type, extension = self.__get_image_upload_type(image_data)
-        if self._cover_style == 'chillposter' and content_type == "image/png":
-            try:
-                with Image.open(BytesIO(image_data)) as img:
-                    img.seek(0)
-                    frame = img.convert("RGBA")
-                    background = Image.new("RGB", frame.size, (0, 0, 0))
-                    background.paste(frame, mask=frame.getchannel("A"))
-                    output = BytesIO()
-                    background.save(output, format="JPEG", quality=92)
-                    return output.getvalue(), "image/jpeg", ".jpg", True
-            except Exception as e:
-                logger.warning(f"  ➜ ChillPoster PNG/APNG 转 JPEG 失败，将尝试原图上传: {e}")
-        return image_data, content_type, extension, False
+        candidates = [{
+            "name": "original",
+            "label": f"原始格式 {content_type}",
+            "data": image_data,
+            "content_type": content_type,
+            "extension": extension,
+            "expect_animation": self.__is_animated_image(image_data),
+        }]
+
+        if candidates[0]["expect_animation"]:
+            gif_data = self.__convert_animated_image_to_gif(image_data)
+            if gif_data:
+                candidates.append({
+                    "name": "animated-gif",
+                    "label": "动态 GIF",
+                    "data": gif_data,
+                    "content_type": "image/gif",
+                    "extension": ".gif",
+                    "expect_animation": True,
+                })
+
+        jpeg_data = self.__convert_image_to_jpeg(image_data)
+        if jpeg_data and (content_type != "image/jpeg" or candidates[0]["expect_animation"]):
+            candidates.append({
+                "name": "static-jpeg",
+                "label": "静态 JPEG 兼容版",
+                "data": jpeg_data,
+                "content_type": "image/jpeg",
+                "extension": ".jpg",
+                "expect_animation": False,
+            })
+
+        return candidates
 
     def __get_image_upload_type(self, image_data: bytes) -> Tuple[str, str]:
         if image_data.startswith(b"\x89PNG\r\n\x1a\n"):
             return "image/png", ".png"
+        if image_data.startswith(b"GIF87a") or image_data.startswith(b"GIF89a"):
+            return "image/gif", ".gif"
+        if image_data.startswith(b"RIFF") and image_data[8:12] == b"WEBP":
+            return "image/webp", ".webp"
         return "image/jpeg", ".jpg"
+
+    def __is_animated_image(self, image_data: bytes) -> bool:
+        try:
+            with Image.open(BytesIO(image_data)) as img:
+                return bool(getattr(img, "is_animated", False)) or int(getattr(img, "n_frames", 1) or 1) > 1
+        except Exception:
+            return False
+
+    def __convert_image_to_jpeg(self, image_data: bytes) -> Optional[bytes]:
+        try:
+            with Image.open(BytesIO(image_data)) as img:
+                img.seek(0)
+                frame = img.convert("RGBA")
+                background = Image.new("RGB", frame.size, (0, 0, 0))
+                alpha = frame.getchannel("A")
+                background.paste(frame, mask=alpha)
+                output = BytesIO()
+                background.save(output, format="JPEG", quality=92)
+                return output.getvalue()
+        except Exception as e:
+            logger.warning(f"  ➜ 图片转 JPEG 兼容版失败: {e}")
+            return None
+
+    def __convert_animated_image_to_gif(self, image_data: bytes) -> Optional[bytes]:
+        try:
+            with Image.open(BytesIO(image_data)) as img:
+                frames = []
+                durations = []
+                for frame in ImageSequence.Iterator(img):
+                    rgba = frame.convert("RGBA")
+                    background = Image.new("RGBA", rgba.size, (0, 0, 0, 255))
+                    background.alpha_composite(rgba)
+                    frames.append(background.convert("P", palette=Image.ADAPTIVE))
+                    durations.append(frame.info.get("duration", img.info.get("duration", 80)) or 80)
+                if len(frames) <= 1:
+                    return None
+                output = BytesIO()
+                frames[0].save(
+                    output,
+                    format="GIF",
+                    save_all=True,
+                    append_images=frames[1:],
+                    duration=durations,
+                    loop=0,
+                    optimize=False,
+                )
+                return output.getvalue()
+        except Exception as e:
+            logger.warning(f"  ➜ 动态封面转 GIF 失败: {e}")
+            return None
+
+    def __upload_primary_image(self, upload_url: str, api_key: str, library: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
+        headers = {
+            "Content-Type": candidate["content_type"],
+            "X-Emby-Token": api_key or "",
+        }
+        try:
+            encoded_image = base64.b64encode(candidate["data"]).decode("ascii")
+            logger.info(
+                "  ➜ 正在上传 Emby 封面: %s, %s bytes (%s)。",
+                candidate["content_type"],
+                len(candidate["data"]),
+                candidate["label"],
+            )
+            response = requests.post(upload_url, data=encoded_image, headers=headers, timeout=60)
+            response.raise_for_status()
+            logger.debug(f"  ➜ 已提交封面到媒体库 '{library['Name']}'。")
+            return True
+        except requests.exceptions.RequestException as e:
+            logger.error(f"  ➜ 上传封面到媒体库 '{library['Name']}' 时发生网络错误: {e}")
+            if e.response is not None:
+                logger.error(f"  ➜ 响应状态: {e.response.status_code}, 响应内容: {e.response.text[:200]}")
+            return False
+
+    def __get_primary_image_tag(self, item_id: str) -> Optional[str]:
+        base_url = config_manager.APP_CONFIG.get('emby_server_url')
+        api_key = config_manager.APP_CONFIG.get('emby_api_key')
+        user_id = config_manager.APP_CONFIG.get('emby_user_id')
+        if not all([item_id, base_url, api_key, user_id]):
+            return None
+        try:
+            item = emby.get_emby_item_details(
+                item_id,
+                base_url,
+                api_key,
+                user_id,
+                fields="ImageTags,Name,Type",
+                silent_404=True,
+            )
+            image_tags = item.get("ImageTags") if isinstance(item, dict) else None
+            if isinstance(image_tags, dict):
+                return image_tags.get("Primary")
+        except Exception as e:
+            logger.warning(f"  ➜ 读取 Emby 当前封面 Tag 失败 (ItemID: {item_id}): {e}")
+        return None
+
+    def __download_current_primary_image(self, item_id: str) -> Optional[bytes]:
+        base_url = config_manager.APP_CONFIG.get('emby_server_url')
+        api_key = config_manager.APP_CONFIG.get('emby_api_key')
+        if not all([item_id, base_url, api_key]):
+            return None
+        url = f"{base_url.rstrip('/')}/Items/{item_id}/Images/Primary"
+        params = {
+            "api_key": api_key,
+            "_": str(int(time.time() * 1000)),
+        }
+        headers = {
+            "X-Emby-Token": api_key or "",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=30)
+            response.raise_for_status()
+            return response.content
+        except Exception as e:
+            logger.warning(f"  ➜ 下载 Emby 当前封面用于校验失败 (ItemID: {item_id}): {e}")
+            return None
+
+    def __verify_primary_image_upload(self, item_id: str, before_tag: Optional[str], candidate: Dict[str, Any]) -> bool:
+        after_tag = self.__get_primary_image_tag(item_id)
+        tag_changed = bool(after_tag and after_tag != before_tag)
+        if tag_changed:
+            logger.info(f"  ➜ Emby 封面 Tag 已更新: {before_tag or '-'} -> {after_tag}")
+        elif after_tag:
+            logger.warning(f"  ➜ Emby 封面 Tag 未变化，继续通过图片内容校验: {after_tag}")
+        else:
+            logger.warning("  ➜ 未能读取 Emby 封面 Tag，继续通过图片内容校验。")
+
+        current_image = self.__download_current_primary_image(item_id)
+        if candidate.get("expect_animation"):
+            if current_image and self.__is_animated_image(current_image):
+                logger.info("  ✅ Emby 当前封面已确认保留动画帧。")
+                return True
+            logger.warning("  ➜ Emby 未确认当前封面保留动画帧。")
+            return False
+
+        if current_image and (tag_changed or not before_tag):
+            logger.info("  ✅ Emby 当前封面已可读取，上传生效。")
+            return True
+
+        return tag_changed
+
+    def __refresh_emby_image_cache(self, item_id: str) -> None:
+        base_url = config_manager.APP_CONFIG.get('emby_server_url')
+        api_key = config_manager.APP_CONFIG.get('emby_api_key')
+        if not all([item_id, base_url, api_key]):
+            return
+        refresh_url = f"{base_url.rstrip('/')}/Items/{item_id}/Refresh"
+        params = {
+            "api_key": api_key,
+            "Recursive": "false",
+            "ImageRefreshMode": "Default",
+            "MetadataRefreshMode": "Default",
+            "ReplaceAllMetadata": "false",
+            "ReplaceAllImages": "false",
+        }
+        try:
+            response = requests.post(refresh_url, params=params, timeout=15)
+            if response.status_code in (200, 204):
+                logger.debug(f"  ➜ 已请求 Emby 刷新封面缓存 (ItemID: {item_id})。")
+            else:
+                logger.warning(f"  ➜ Emby 封面缓存刷新返回异常状态: {response.status_code}")
+        except Exception as e:
+            logger.warning(f"  ➜ Emby 封面缓存刷新失败 (ItemID: {item_id}): {e}")
 
     def __get_library_title_from_yaml(self, library_name: str) -> Tuple[str, str]:
         zh_title, en_title = library_name, ''

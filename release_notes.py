@@ -2,6 +2,22 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.0.6",
+        "published_at": "2026-07-08T22:30:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.6",
+        "changelog": """## 封面上传闭环修复
+
+### 修复
+- 动态 ChillPoster 封面不再提前强制压成静态 JPEG；上传时会先尝试保留 APNG 动画。
+- 如果 Emby 未确认 APNG 动画可用，会自动尝试动态 GIF，最后才降级为静态 JPEG 兼容版。
+- 封面上传后会回读 Emby 当前 Primary 图片 Tag 和图片内容，避免后台显示成功但实际未生效。
+
+### 优化
+- 上传成功后轻量请求 Emby 刷新当前项目图片缓存，减少页面继续显示旧图的概率。
+- 日志会记录上传格式、Tag 变化和动态帧校验结果，后续排查封面问题不用再猜。
+""",
+    },
+    {
         "version": "v7.0.5",
         "published_at": "2026-07-01T19:20:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.5",

@@ -2,6 +2,22 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.0.7",
+        "published_at": "2026-07-08T23:05:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.7",
+        "changelog": """## 动态封面生成热修复
+
+### 修复
+- 修复 `v7.0.6` 动态 ChillPoster 生成后可能卡死的问题。
+- 移除后台 APNG 转 GIF 备用流程，避免大动态图二次转码拖死任务。
+- 动态封面校验不再下载整张当前封面，只通过 Emby 图片 Tag 判断是否替换成功。
+
+### 调整
+- 动态封面现在只尝试 APNG 原样上传；Emby 未确认替换时直接降级静态 JPEG。
+- 动态是否播放以 Emby 前端实际显示为准，后台不再做昂贵的多帧回读校验。
+""",
+    },
+    {
         "version": "v7.0.6",
         "published_at": "2026-07-08T22:30:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.6",

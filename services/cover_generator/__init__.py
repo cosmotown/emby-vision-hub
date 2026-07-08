@@ -13,7 +13,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional, Union
 from gevent import spawn_later, sleep as gevent_sleep
-from PIL import Image, ImageSequence
+from PIL import Image
 from database import custom_collection_db, queries_db
 import config_manager
 import handler.emby as emby 
@@ -589,7 +589,7 @@ class CoverGeneratorService:
                 logger.error(f"  ➜ 另存封面失败: {e}")
 
         if self.__is_animated_image(raw_image_data):
-            logger.info("  ➜ 检测到动态封面，将先尝试保留动画；若 Emby 不接受，再自动降级。")
+            logger.info("  ➜ 检测到动态封面，将尝试原样上传；若 Emby 未确认生效，再降级为静态 JPEG。")
 
         before_tag = self.__get_primary_image_tag(library_id)
         try:
@@ -650,18 +650,6 @@ class CoverGeneratorService:
             "expect_animation": self.__is_animated_image(image_data),
         }]
 
-        if candidates[0]["expect_animation"]:
-            gif_data = self.__convert_animated_image_to_gif(image_data)
-            if gif_data:
-                candidates.append({
-                    "name": "animated-gif",
-                    "label": "动态 GIF",
-                    "data": gif_data,
-                    "content_type": "image/gif",
-                    "extension": ".gif",
-                    "expect_animation": True,
-                })
-
         jpeg_data = self.__convert_image_to_jpeg(image_data)
         if jpeg_data and (content_type != "image/jpeg" or candidates[0]["expect_animation"]):
             candidates.append({
@@ -704,34 +692,6 @@ class CoverGeneratorService:
                 return output.getvalue()
         except Exception as e:
             logger.warning(f"  ➜ 图片转 JPEG 兼容版失败: {e}")
-            return None
-
-    def __convert_animated_image_to_gif(self, image_data: bytes) -> Optional[bytes]:
-        try:
-            with Image.open(BytesIO(image_data)) as img:
-                frames = []
-                durations = []
-                for frame in ImageSequence.Iterator(img):
-                    rgba = frame.convert("RGBA")
-                    background = Image.new("RGBA", rgba.size, (0, 0, 0, 255))
-                    background.alpha_composite(rgba)
-                    frames.append(background.convert("P", palette=Image.ADAPTIVE))
-                    durations.append(frame.info.get("duration", img.info.get("duration", 80)) or 80)
-                if len(frames) <= 1:
-                    return None
-                output = BytesIO()
-                frames[0].save(
-                    output,
-                    format="GIF",
-                    save_all=True,
-                    append_images=frames[1:],
-                    duration=durations,
-                    loop=0,
-                    optimize=False,
-                )
-                return output.getvalue()
-        except Exception as e:
-            logger.warning(f"  ➜ 动态封面转 GIF 失败: {e}")
             return None
 
     def __upload_primary_image(self, upload_url: str, api_key: str, library: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
@@ -812,14 +772,14 @@ class CoverGeneratorService:
         else:
             logger.warning("  ➜ 未能读取 Emby 封面 Tag，继续通过图片内容校验。")
 
-        current_image = self.__download_current_primary_image(item_id)
         if candidate.get("expect_animation"):
-            if current_image and self.__is_animated_image(current_image):
-                logger.info("  ✅ Emby 当前封面已确认保留动画帧。")
+            if tag_changed:
+                logger.info("  ✅ Emby 已确认接受动态封面更新；是否播放动画请以前端实际显示为准。")
                 return True
-            logger.warning("  ➜ Emby 未确认当前封面保留动画帧。")
+            logger.warning("  ➜ Emby 未确认动态封面已替换，准备降级为静态 JPEG。")
             return False
 
+        current_image = self.__download_current_primary_image(item_id)
         if current_image and (tag_changed or not before_tag):
             logger.info("  ✅ Emby 当前封面已可读取，上传生效。")
             return True

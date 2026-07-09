@@ -2,6 +2,22 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.0.11",
+        "published_at": "2026-07-09T20:45:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.11",
+        "changelog": """## 新增动态 ChillPoster 模板
+
+### 新增
+- 新增 `聚焦C佬动态` 模板：海报按焦点层级连续轮播，C 位海报会自然切换。
+- 新增 `扇形展开动态` 模板：海报沿扇形轨道移动，角度、缩放、旋转同步变化。
+
+### 优化
+- 两个新动态模板继续走独立渲染进程，避免动态封面生成拖慢 Toolkit Web 页面。
+- 保留原 `聚焦默认` 和 `扇形展开默认` 静态模板，不强制替换已有使用习惯。
+- 动态封面默认循环速度进一步放慢到约 14.4 秒一圈，更接近背景展示节奏。
+""",
+    },
+    {
         "version": "v7.0.10",
         "published_at": "2026-07-09T20:10:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.10",

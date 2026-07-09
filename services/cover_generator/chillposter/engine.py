@@ -1,4 +1,4 @@
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance, ImageColor
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance, ImageColor, ImageOps
 from io import BytesIO
 import requests
 import base64
@@ -215,6 +215,74 @@ class PosterEngine:
         overlay_resized = overlay.resize((w, h), resample=Image.LANCZOS)
         return Image.alpha_composite(img, overlay_resized)
 
+    def _rounded(self, im, radius):
+        if radius <= 0:
+            return im.convert('RGBA')
+        circle = Image.new('L', (radius * 2, radius * 2), 0)
+        draw = ImageDraw.Draw(circle)
+        draw.ellipse((0, 0, radius * 2, radius * 2), fill=255)
+        alpha = Image.new('L', im.size, 255)
+        w, h = im.size
+        alpha.paste(circle.crop((0, 0, radius, radius)), (0, 0))
+        alpha.paste(circle.crop((0, radius, radius, radius * 2)), (0, h - radius))
+        alpha.paste(circle.crop((radius, 0, radius * 2, radius)), (w - radius, 0))
+        alpha.paste(circle.crop((radius, radius, radius * 2, radius * 2)), (w - radius, h - radius))
+        im = im.convert('RGBA')
+        im.putalpha(alpha)
+        return im
+
+    def _reflection(self, image, opacity=45, decay_rate=1.4):
+        w, h = image.size
+        reflection = ImageOps.flip(image)
+        mask = Image.new("L", (w, h), 0)
+        draw = ImageDraw.Draw(mask)
+        for y in range(h):
+            progress = y / h
+            alpha = max(0, int(opacity * (1 - math.pow(progress, decay_rate))))
+            draw.line((0, y, w, y), fill=alpha)
+        reflection.putalpha(mask)
+        return reflection
+
+    def _relative_loop_position(self, index, active_position, count):
+        return ((index - active_position + count / 2) % count) - count / 2
+
+    def _draw_dynamic_text(self, canvas, config, fonts, scale_factor, mode='center'):
+        draw = ImageDraw.Draw(canvas)
+        width, height = canvas.size
+        title = config.get('title', '')
+        subtitle = config.get('subtitle', '')
+        title_color = config.get('title_color', '#FFFFFF')
+        subtitle_color = config.get('subtitle_color', '#AAAAAA')
+        title_font = fonts.get('main')
+        subtitle_font = fonts.get('sub') or title_font
+
+        if mode == 'focus':
+            baseline_percent = float(config.get('baseline_percent', 85)) / 100
+            hero_h = int(height * (float(config.get('hero_height_percent', 65)) / 100))
+            base_y = int(height * baseline_percent)
+            base_text_y = max(16, (base_y - hero_h) // 2)
+            title_y = base_text_y + int(float(config.get('title_y_offset', 0)) * scale_factor)
+            subtitle_y = title_y + max(10, int(float(config.get('title_size', 140)) * scale_factor)) + int(float(config.get('subtitle_offset_y', 20)) * scale_factor)
+        elif mode == 'fan':
+            title_y = (height // 2) + int(float(config.get('title_offset_y', -280)) * scale_factor)
+            subtitle_y = (height // 2) + int(float(config.get('subtitle_offset_y', -200)) * scale_factor)
+        else:
+            title_y = int(height * (float(config.get('text_top_percent', 75)) / 100))
+            subtitle_y = title_y + int(float(config.get('text_gap', 20)) * scale_factor)
+
+        max_width = int(width * 0.88)
+        if title and title_font:
+            self.draw_text_wrapper(draw, title, width // 2, title_y, title_font, max_width, title_color, line_spacing=max(2, int(10 * scale_factor)), align='center')
+        if subtitle and subtitle_font:
+            self.draw_text_wrapper(draw, subtitle, width // 2, subtitle_y, subtitle_font, max_width, subtitle_color, line_spacing=max(2, int(10 * scale_factor)), align='center')
+
+    def _dynamic_fonts(self, config, font_loader, scale_factor, title_default=140, subtitle_default=60):
+        return {
+            'main': font_loader(config.get('font_title'), max(8, int(float(config.get('title_size', title_default)) * scale_factor))),
+            'sub': font_loader(config.get('font_subtitle'), max(8, int(float(config.get('subtitle_size', subtitle_default)) * scale_factor))),
+            'count': font_loader(config.get('font_count'), max(8, int(float(config.get('count_size', 40)) * scale_factor))),
+        }
+
     def _draw_dynamic_tiled_cover(self, bg, config, assets, font_loader, output):
         """Render the moving ChillPoster cover directly at output size.
 
@@ -225,8 +293,8 @@ class PosterEngine:
         target_w = _clamp_int(config.get('dynamic_output_width', 480), 480, 320, MAX_DYNAMIC_WIDTH)
         target_h = int(target_w * 9 / 16)
         scale_factor = target_w / 1920
-        total_frames = _clamp_int(config.get('anim_frames', 32), 32, 1, MAX_DYNAMIC_FRAMES)
-        duration = _clamp_int(config.get('anim_duration', 150), 150, 20, 1000)
+        total_frames = _clamp_int(config.get('anim_frames', 36), 36, 1, MAX_DYNAMIC_FRAMES)
+        duration = _clamp_int(config.get('anim_duration', 400), 400, 20, 1000)
 
         logger.info(
             ">>> [Engine] 动态 PNG 优化渲染: %sx%s, %s frames, %sms",
@@ -377,6 +445,213 @@ class PosterEngine:
         )
         logger.info(">>> [Engine] 动态 PNG 完成. 帧数: %s, 大小: %.2f MB", len(frames), output.getbuffer().nbytes / 1024 / 1024)
 
+    def _draw_dynamic_focus_cover(self, bg, config, assets, font_loader, output):
+        target_w = _clamp_int(config.get('dynamic_output_width', 480), 480, 320, MAX_DYNAMIC_WIDTH)
+        target_h = int(target_w * 9 / 16)
+        scale_factor = target_w / 1920
+        total_frames = _clamp_int(config.get('anim_frames', 36), 36, 1, MAX_DYNAMIC_FRAMES)
+        duration = _clamp_int(config.get('anim_duration', 400), 400, 20, 1000)
+        logger.info(">>> [Engine] 聚焦C佬动态渲染: %sx%s, %s frames, %sms", target_w, target_h, total_frames, duration)
+
+        poster_urls = list(assets.get('posters') or [])
+        if not poster_urls:
+            return self._draw_dynamic_tiled_cover(bg, config, assets, font_loader, output)
+        count = int(float(config.get('poster_count') or len(poster_urls) or 7))
+        if count % 2 == 0:
+            count += 1
+        count = max(3, min(count, len(poster_urls) if len(poster_urls) >= 3 else count))
+        while len(poster_urls) < count:
+            poster_urls.extend(poster_urls)
+        poster_urls = poster_urls[:count]
+
+        base = bg.resize((target_w, target_h), Image.LANCZOS).convert('RGBA')
+        bg_blur = int(float(config.get('bg_blur', 100)) * scale_factor)
+        if bg_blur > 0:
+            base = base.filter(ImageFilter.GaussianBlur(max(1, bg_blur)))
+        overlay_opacity = int(config.get('bg_overlay_opacity', 100))
+        base = Image.alpha_composite(base, Image.new('RGBA', base.size, (0, 0, 0, overlay_opacity)))
+
+        vignette = int(config.get('bg_vignette', 200))
+        spotlight = int(config.get('spotlight_intensity', 30))
+        if vignette or spotlight:
+            light = Image.new('L', base.size, 0)
+            draw_light = ImageDraw.Draw(light)
+            radius = int(min(target_w, target_h) * 0.9)
+            cx, cy = target_w // 2, target_h // 2
+            draw_light.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=255)
+            mask = light.filter(ImageFilter.GaussianBlur(max(1, radius // 2)))
+            edge = Image.new('RGBA', base.size, (0, 0, 0, vignette))
+            center = Image.new('RGBA', base.size, (255, 255, 255, spotlight))
+            base = Image.alpha_composite(base, Image.composite(center, edge, mask))
+
+        fonts = self._dynamic_fonts(config, font_loader, scale_factor, title_default=140, subtitle_default=60)
+        hero_h = int(target_h * (float(config.get('hero_height_percent', 65)) / 100))
+        hero_w = int(hero_h * float(config.get('poster_ratio', 0.66)))
+        base_y = int(target_h * (float(config.get('baseline_percent', 85)) / 100))
+        scale_step = float(config.get('side_scale_step', 0.85))
+        overlap_pct = float(config.get('overlap_percent', 40)) / 100
+        darken_step = int(config.get('perspective_darken', 40))
+        corner_radius = max(0, int(float(config.get('corner_radius', 16)) * scale_factor))
+        reflection_opacity = int(config.get('reflection_opacity', 50))
+        hero_shadow_opacity = int(config.get('hero_shadow_opacity', 180))
+        travel = hero_w * (1 - overlap_pct) * 0.95
+        center_x = target_w // 2
+
+        raw_posters = []
+        for url in poster_urls:
+            img = self.download_img(url)
+            if img:
+                raw_posters.append(img.convert('RGBA'))
+        if not raw_posters:
+            return self._draw_dynamic_tiled_cover(bg, config, assets, font_loader, output)
+
+        frames = []
+        for frame_idx in range(total_frames):
+            active = (frame_idx / total_frames) * len(raw_posters)
+            frame = base.copy()
+            queue = []
+            for i, raw in enumerate(raw_posters):
+                rel = self._relative_loop_position(i, active, len(raw_posters))
+                abs_rel = abs(rel)
+                if abs_rel > (count // 2 + 0.75):
+                    continue
+                current_scale = math.pow(scale_step, abs_rel)
+                w = max(1, int(hero_w * current_scale))
+                h = max(1, int(hero_h * current_scale))
+                x = center_x + rel * travel
+                y = base_y
+                brightness = max(0.25, 1.0 - (abs_rel * darken_step / 255.0))
+                queue.append((abs_rel, raw, w, h, x, y, brightness))
+
+            queue.sort(key=lambda item: item[0], reverse=True)
+            for abs_rel, raw, w, h, x, y, brightness in queue:
+                poster = raw.resize((w, h), Image.LANCZOS)
+                if brightness < 1.0:
+                    poster = ImageEnhance.Brightness(poster).enhance(brightness)
+                poster = self._rounded(poster, corner_radius)
+                paste_x = int(x - w / 2)
+                paste_y = int(y - h)
+
+                if reflection_opacity > 0:
+                    reflection = self._reflection(poster, opacity=max(5, int(reflection_opacity * max(0.15, 1 - abs_rel / 5))))
+                    frame.paste(reflection, (paste_x, int(y)), mask=reflection)
+
+                if abs_rel < 0.65 and hero_shadow_opacity > 0:
+                    shadow_pad = max(4, int(40 * scale_factor))
+                    shadow = Image.new('RGBA', (w + shadow_pad * 2, h + shadow_pad * 2), (0, 0, 0, 0))
+                    sd = ImageDraw.Draw(shadow)
+                    sd.rounded_rectangle(
+                        (shadow_pad, shadow_pad, shadow_pad + w, shadow_pad + h),
+                        radius=corner_radius,
+                        fill=(0, 0, 0, hero_shadow_opacity),
+                    )
+                    shadow = shadow.filter(ImageFilter.GaussianBlur(max(1, int(20 * scale_factor))))
+                    frame.paste(shadow, (paste_x - shadow_pad, paste_y - shadow_pad + int(10 * scale_factor)), mask=shadow)
+
+                frame.paste(poster, (paste_x, paste_y), mask=poster)
+
+            self._draw_dynamic_text(frame, config, fonts, scale_factor, mode='focus')
+            frame = self._draw_badge(frame, config, assets.get('count', 0), fonts)
+            frames.append(frame)
+
+        frames[0].save(output, format='PNG', save_all=True, append_images=frames[1:], duration=duration, loop=0, optimize=False)
+        logger.info(">>> [Engine] 聚焦C佬动态 PNG 完成. 帧数: %s, 大小: %.2f MB", len(frames), output.getbuffer().nbytes / 1024 / 1024)
+
+    def _draw_dynamic_fan_cover(self, bg, config, assets, font_loader, output):
+        target_w = _clamp_int(config.get('dynamic_output_width', 480), 480, 320, MAX_DYNAMIC_WIDTH)
+        target_h = int(target_w * 9 / 16)
+        scale_factor = target_w / 1920
+        total_frames = _clamp_int(config.get('anim_frames', 36), 36, 1, MAX_DYNAMIC_FRAMES)
+        duration = _clamp_int(config.get('anim_duration', 400), 400, 20, 1000)
+        logger.info(">>> [Engine] 扇形展开动态渲染: %sx%s, %s frames, %sms", target_w, target_h, total_frames, duration)
+
+        poster_urls = list(assets.get('posters') or [])
+        if not poster_urls:
+            return self._draw_dynamic_tiled_cover(bg, config, assets, font_loader, output)
+        count = int(float(config.get('poster_count') or len(poster_urls) or 5))
+        if count % 2 == 0:
+            count += 1
+        count = max(3, min(count, len(poster_urls) if len(poster_urls) >= 3 else count))
+        while len(poster_urls) < count:
+            poster_urls.extend(poster_urls)
+        poster_urls = poster_urls[:count]
+
+        raw_posters = []
+        for url in poster_urls:
+            img = self.download_img(url)
+            if img:
+                raw_posters.append(img.convert('RGBA'))
+        if not raw_posters:
+            return self._draw_dynamic_tiled_cover(bg, config, assets, font_loader, output)
+
+        bg_source = raw_posters[len(raw_posters) // 2].resize((target_w, target_h), Image.LANCZOS).convert('RGBA')
+        bg_blur = int(float(config.get('bg_blur', 100)) * scale_factor)
+        if bg_blur > 0:
+            bg_source = bg_source.filter(ImageFilter.GaussianBlur(max(1, bg_blur)))
+        darkness = int(config.get('bg_darkness', 160))
+        base = Image.alpha_composite(bg_source, Image.new('RGBA', bg_source.size, (0, 0, 0, darkness)))
+
+        fonts = self._dynamic_fonts(config, font_loader, scale_factor, title_default=90, subtitle_default=50)
+        fan_radius = float(config.get('fan_radius', 1200)) * scale_factor
+        fan_spread = float(config.get('fan_spread', 40))
+        center_scale = float(config.get('center_scale', 0.55))
+        shrink_ratio = float(config.get('side_scale_shrink', 0.95))
+        y_offset = float(config.get('layout_y_offset', 100)) * scale_factor
+        base_h = int(target_h * center_scale)
+        base_w = int(base_h * 0.666)
+        pivot_x = target_w // 2
+        pivot_y = (target_h // 2) + fan_radius - (base_h // 2) + y_offset
+        angle_step = fan_spread / max(1, count - 1)
+
+        frames = []
+        for frame_idx in range(total_frames):
+            active = (frame_idx / total_frames) * len(raw_posters)
+            frame = base.copy()
+            queue = []
+            for i, raw in enumerate(raw_posters):
+                rel = self._relative_loop_position(i, active, len(raw_posters))
+                abs_rel = abs(rel)
+                if abs_rel > (count // 2 + 0.75):
+                    continue
+                theta_deg = rel * angle_step
+                theta_rad = math.radians(theta_deg)
+                x = pivot_x + fan_radius * math.sin(theta_rad)
+                y = pivot_y - fan_radius * math.cos(theta_rad)
+                scale = math.pow(shrink_ratio, abs_rel)
+                w = max(1, int(base_w * scale))
+                h = max(1, int(base_h * scale))
+                queue.append((abs_rel, raw, w, h, x, y, theta_deg))
+
+            queue.sort(key=lambda item: item[0], reverse=True)
+            for abs_rel, raw, w, h, x, y, theta_deg in queue:
+                poster = raw.resize((w, h), Image.LANCZOS)
+                poster = self._rounded(poster, max(2, int(15 * scale_factor)))
+
+                padding = max(4, int(30 * scale_factor))
+                group = Image.new('RGBA', (w + padding * 2, h * 2 + padding), (0, 0, 0, 0))
+                shadow_blur = max(1, int((20 if abs_rel < 0.5 else 10) * scale_factor))
+                shadow = Image.new('RGBA', (w + padding * 2, h + padding * 2), (0, 0, 0, 0))
+                sd = ImageDraw.Draw(shadow)
+                sd.rounded_rectangle((padding, padding, padding + w, padding + h), radius=max(2, int(15 * scale_factor)), fill=(0, 0, 0, 150))
+                shadow = shadow.filter(ImageFilter.GaussianBlur(shadow_blur))
+                group.paste(shadow, (0, 0), mask=shadow)
+
+                reflection = self._reflection(poster, opacity=max(10, int(50 * max(0.25, 1 - abs_rel / 5))))
+                group.paste(reflection, (padding, padding + h), mask=reflection)
+                group.paste(poster, (padding, padding), mask=poster)
+
+                rotated = group.rotate(-theta_deg, resample=Image.BICUBIC, expand=True)
+                paste_x = int(x - rotated.size[0] / 2)
+                paste_y = int(y - rotated.size[1] / 2 + h / 2)
+                frame.paste(rotated, (paste_x, paste_y), mask=rotated)
+
+            self._draw_dynamic_text(frame, config, fonts, scale_factor, mode='fan')
+            frame = self._draw_badge(frame, config, assets.get('count', 0), fonts)
+            frames.append(frame)
+
+        frames[0].save(output, format='PNG', save_all=True, append_images=frames[1:], duration=duration, loop=0, optimize=False)
+        logger.info(">>> [Engine] 扇形展开动态 PNG 完成. 帧数: %s, 大小: %.2f MB", len(frames), output.getbuffer().nbytes / 1024 / 1024)
+
     # === 动态 PNG 生成 ===
     def draw(self, config, assets):
         bg = None
@@ -417,7 +692,12 @@ class PosterEngine:
         output = BytesIO()
 
         if is_dynamic:
-            self._draw_dynamic_tiled_cover(bg, config, assets, _load_font, output)
+            if engine_type == '聚焦C佬':
+                self._draw_dynamic_focus_cover(bg, config, assets, _load_font, output)
+            elif engine_type == '扇形展开':
+                self._draw_dynamic_fan_cover(bg, config, assets, _load_font, output)
+            else:
+                self._draw_dynamic_tiled_cover(bg, config, assets, _load_font, output)
         else:
             # 静态图逻辑，保持高清 1920x1080
             if engine_type in self.layout_modules:

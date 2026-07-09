@@ -673,6 +673,12 @@ class CoverGeneratorService:
         return "image/jpeg", ".jpg"
 
     def __is_animated_image(self, image_data: bytes) -> bool:
+        if image_data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return b"acTL" in image_data and b"fcTL" in image_data
+        if image_data.startswith(b"GIF87a") or image_data.startswith(b"GIF89a"):
+            return True
+        if image_data.startswith(b"RIFF") and image_data[8:12] == b"WEBP":
+            return b"ANIM" in image_data[:2048]
         try:
             with Image.open(BytesIO(image_data)) as img:
                 return bool(getattr(img, "is_animated", False)) or int(getattr(img, "n_frames", 1) or 1) > 1
@@ -773,8 +779,15 @@ class CoverGeneratorService:
             logger.warning("  ➜ 未能读取 Emby 封面 Tag，继续通过图片内容校验。")
 
         if candidate.get("expect_animation"):
+            current_image = self.__download_current_primary_image(item_id)
+            if current_image and self.__is_animated_image(current_image):
+                logger.info("  ✅ Emby 已保留动态 PNG 封面。")
+                return True
+            if current_image:
+                logger.warning("  ➜ Emby 已接收封面但未保留动画块，准备降级为静态 JPEG。")
+                return False
             if tag_changed:
-                logger.info("  ✅ Emby 已确认接受动态封面更新；是否播放动画请以前端实际显示为准。")
+                logger.warning("  ➜ Emby 封面 Tag 已变化，但未能回读确认动画；暂按动态封面上传成功处理。")
                 return True
             logger.warning("  ➜ Emby 未确认动态封面已替换，准备降级为静态 JPEG。")
             return False

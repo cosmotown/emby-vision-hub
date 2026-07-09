@@ -1,10 +1,16 @@
 import base64
 import json
 import logging
+import os
+import subprocess
+import sys
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import config_manager
+from gevent import sleep as gevent_sleep
 from services.cover_generator.chillposter.engine import MAX_DYNAMIC_WIDTH, PosterEngine
 
 logger = logging.getLogger(__name__)
@@ -14,6 +20,7 @@ TEMPLATES_DIR = CHILLPOSTER_ROOT / "templates"
 LAYOUTS_DIR = CHILLPOSTER_ROOT / "layouts"
 REPO_FONTS_DIR = Path(__file__).resolve().parents[3] / "fonts"
 DEFAULT_TEMPLATE_ID = "preset_1769062617890"
+DYNAMIC_RENDER_TIMEOUT = 180
 
 _ENGINE: Optional[PosterEngine] = None
 
@@ -68,6 +75,86 @@ def _file_to_data_url(path: str) -> str:
     mime = "image/png" if suffix == ".png" else "image/jpeg"
     data = Path(path).read_bytes()
     return f"data:{mime};base64,{base64.b64encode(data).decode('utf-8')}"
+
+
+def _render_static_fallback(render_config: Dict[str, Any], assets: Dict[str, Any]) -> bytes:
+    static_config = dict(render_config)
+    static_config["enable_animation"] = False
+    image_b64 = _get_engine().draw(static_config, assets)
+    return base64.b64decode(image_b64)
+
+
+def _render_dynamic_in_subprocess(render_config: Dict[str, Any], assets: Dict[str, Any], app_config: Dict[str, Any]) -> Optional[bytes]:
+    jobs_dir = Path(config_manager.PERSISTENT_DATA_PATH) / "cover_generator" / "render_jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    job_id = uuid.uuid4().hex
+    payload_path = jobs_dir / f"{job_id}.json"
+    output_path = jobs_dir / f"{job_id}.png"
+    worker_path = CHILLPOSTER_ROOT / "render_worker.py"
+    repo_root = Path(__file__).resolve().parents[3]
+
+    timeout = app_config.get("chillposter_dynamic_timeout", DYNAMIC_RENDER_TIMEOUT)
+    try:
+        timeout = max(30, min(int(timeout), 600))
+    except (TypeError, ValueError):
+        timeout = DYNAMIC_RENDER_TIMEOUT
+
+    payload = {
+        "fonts_dir": str(REPO_FONTS_DIR),
+        "layouts_dir": str(LAYOUTS_DIR),
+        "config": render_config,
+        "assets": assets,
+    }
+    payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
+    cmd = [sys.executable, str(worker_path), "--payload", str(payload_path), "--output", str(output_path)]
+
+    try:
+        logger.info("  ➜ 动态封面交给独立渲染进程处理，超时限制 %s 秒。", timeout)
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(repo_root),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + timeout
+        while process.poll() is None:
+            if time.monotonic() >= deadline:
+                process.kill()
+                process.communicate()
+                logger.error("  ➜ 动态封面渲染超过 %s 秒，已终止并降级静态封面。", timeout)
+                return None
+            gevent_sleep(0.5)
+        stdout, stderr = process.communicate()
+    except Exception as exc:
+        logger.error("  ➜ 启动动态封面渲染进程失败: %s", exc, exc_info=True)
+        return None
+    finally:
+        try:
+            payload_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    if stdout:
+        logger.debug("  ➜ 动态渲染输出: %s", stdout[-1000:])
+    if process.returncode != 0:
+        logger.error("  ➜ 动态封面渲染失败，返回码 %s: %s", process.returncode, (stderr or "")[-1500:])
+        return None
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        logger.error("  ➜ 动态封面渲染未产生有效输出。")
+        return None
+
+    data = output_path.read_bytes()
+    logger.info("  ✅ 动态封面渲染完成: %.2f MB。", len(data) / 1024 / 1024)
+    try:
+        output_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return data
 
 
 def get_chillposter_templates() -> List[Dict[str, Any]]:
@@ -127,7 +214,8 @@ def create_chillposter_cover(
     render_config["font_subtitle"] = _resolve_font_config(render_config.get("font_subtitle"), config, "en_font_path_local", "en_font.ttf")
     render_config["badge_font"] = _resolve_font_config(render_config.get("badge_font"), config, "zh_font_path_local", "zh_font.ttf")
 
-    if render_config.get("enable_animation"):
+    is_dynamic = bool(render_config.get("enable_animation"))
+    if is_dynamic:
         try:
             dynamic_width = int(config.get("chillposter_dynamic_width") or 480)
         except (TypeError, ValueError):
@@ -137,7 +225,7 @@ def create_chillposter_cover(
             anim_frames = int(float(render_config.get("anim_frames") or 30))
         except (TypeError, ValueError):
             anim_frames = 30
-        render_config["anim_frames"] = max(1, min(anim_frames, 45))
+        render_config["anim_frames"] = max(1, min(anim_frames, 36))
 
     if config.get("show_item_count"):
         render_config["badge_style"] = "ribbon" if config.get("badge_style") == "ribbon" else "box"
@@ -154,6 +242,13 @@ def create_chillposter_cover(
         "posters": poster_urls,
         "count": item_count,
     }
+
+    if is_dynamic:
+        dynamic_image = _render_dynamic_in_subprocess(render_config, assets, config)
+        if dynamic_image:
+            return dynamic_image
+        logger.warning("  ➜ 动态封面生成失败或超时，将使用同模板第一帧静态封面。")
+        return _render_static_fallback(render_config, assets)
 
     image_b64 = _get_engine().draw(render_config, assets)
     return base64.b64decode(image_b64)

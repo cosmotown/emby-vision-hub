@@ -6,14 +6,12 @@ import os
 import re
 import importlib.util
 import math
-import threading 
+import threading
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed 
 
 logger = logging.getLogger(__name__)
 MAX_DYNAMIC_WIDTH = 640
-MAX_DYNAMIC_FRAMES = 45
-MAX_DYNAMIC_WORKERS = 2
+MAX_DYNAMIC_FRAMES = 36
 
 def _clamp_int(value, default, min_value, max_value):
     try:
@@ -217,18 +215,182 @@ class PosterEngine:
         overlay_resized = overlay.resize((w, h), resample=Image.LANCZOS)
         return Image.alpha_composite(img, overlay_resized)
 
-    # === [核心修改] APNG 生成 (含320x180网页优化) ===
+    def _draw_dynamic_tiled_cover(self, bg, config, assets, font_loader, output):
+        """Render the moving ChillPoster cover directly at output size.
+
+        The old path rendered a full 1920x1080 poster for every animation frame
+        and then downscaled it. This path keeps the static layers and poster
+        transforms cached, so each frame only composites the moving strip.
+        """
+        target_w = _clamp_int(config.get('dynamic_output_width', 480), 480, 320, MAX_DYNAMIC_WIDTH)
+        target_h = int(target_w * 9 / 16)
+        scale_factor = target_w / 1920
+        total_frames = _clamp_int(config.get('anim_frames', 32), 32, 1, MAX_DYNAMIC_FRAMES)
+        duration = _clamp_int(config.get('anim_duration', 80), 80, 20, 1000)
+
+        logger.info(
+            ">>> [Engine] 动态 PNG 优化渲染: %sx%s, %s frames, %sms",
+            target_w,
+            target_h,
+            total_frames,
+            duration,
+        )
+
+        base = bg.resize((target_w, target_h), Image.LANCZOS)
+        blur_radius = int(config.get('blur_radius', 4))
+        if blur_radius > 0:
+            base = base.filter(ImageFilter.GaussianBlur(max(1, int(blur_radius * scale_factor))))
+        base = ImageEnhance.Brightness(base).enhance(float(config.get('brightness', 0.7)))
+
+        mask_opacity = int(config.get('mask_opacity', 200))
+        if mask_opacity > 0:
+            mask = self.create_smart_mask(target_w, target_h, mask_opacity, 100, 'horizontal')
+            black_layer = Image.new('RGBA', (target_w, target_h), (0, 0, 0, 255))
+            black_layer.putalpha(mask)
+            base = Image.alpha_composite(base, black_layer)
+
+        font_title_size = max(8, int(float(config.get('title_size', 80)) * scale_factor))
+        font_sub_size = max(8, int(float(config.get('subtitle_size', 40)) * scale_factor))
+        font_count_size = max(8, int(float(config.get('count_size', 40)) * scale_factor))
+        fonts = {
+            'main': font_loader(config.get('font_title'), font_title_size),
+            'sub': font_loader(config.get('font_subtitle'), font_sub_size),
+            'count': font_loader(config.get('font_count'), font_count_size),
+        }
+
+        poster_urls = list(assets.get('posters') or [])
+        count = int(float(config.get('poster_count') or len(poster_urls) or 1))
+        if poster_urls:
+            while len(poster_urls) < count:
+                poster_urls.extend(poster_urls)
+            poster_urls = poster_urls[:count]
+
+        poster_layers = []
+        if poster_urls:
+            poster_scale = float(config.get('poster_scale', 0.55))
+            target_h_poster = max(1, int(550 * poster_scale * scale_factor))
+            target_w_poster = max(1, int(366 * poster_scale * scale_factor))
+            radius = max(0, int(float(config.get('poster_corner_radius', 12)) * scale_factor))
+            shadow_margin = max(2, int(10 * scale_factor))
+            shadow_blur = max(1, int(10 * scale_factor))
+            p_shadow = int(config.get('poster_shadow_opacity', 140))
+            p_bright = float(config.get('poster_brightness', 1.0))
+
+            shadow = Image.new(
+                "RGBA",
+                (target_w_poster + shadow_margin * 2, target_h_poster + shadow_margin * 2),
+                (0, 0, 0, 0),
+            )
+            sd = ImageDraw.Draw(shadow)
+            sd.rounded_rectangle(
+                [(shadow_margin, shadow_margin), (target_w_poster + shadow_margin, target_h_poster + shadow_margin)],
+                radius=radius,
+                fill=(0, 0, 0, p_shadow),
+            )
+            shadow = shadow.filter(ImageFilter.GaussianBlur(shadow_blur))
+
+            for url in poster_urls:
+                p_img = self.download_img(url)
+                if not p_img:
+                    continue
+                p_img = p_img.resize((target_w_poster, target_h_poster), Image.LANCZOS)
+                if p_bright != 1.0:
+                    p_img = ImageEnhance.Brightness(p_img).enhance(p_bright)
+                poster_layers.append((p_img, shadow))
+
+        # The dynamic layout module owns add_rounded_corners, so keep a tiny
+        # local fallback here for the optimized path.
+        def _rounded(im, radius):
+            if radius <= 0:
+                return im
+            circle = Image.new('L', (radius * 2, radius * 2), 0)
+            draw = ImageDraw.Draw(circle)
+            draw.ellipse((0, 0, radius * 2, radius * 2), fill=255)
+            alpha = Image.new('L', im.size, 255)
+            w, h = im.size
+            alpha.paste(circle.crop((0, 0, radius, radius)), (0, 0))
+            alpha.paste(circle.crop((0, radius, radius, radius * 2)), (0, h - radius))
+            alpha.paste(circle.crop((radius, 0, radius * 2, radius)), (w - radius, 0))
+            alpha.paste(circle.crop((radius, radius, radius * 2, radius * 2)), (w - radius, h - radius))
+            im = im.convert('RGBA')
+            im.putalpha(alpha)
+            return im
+
+        if poster_layers:
+            poster_layers = [(_rounded(p, max(0, int(float(config.get('poster_corner_radius', 12)) * scale_factor))), s) for p, s in poster_layers]
+
+        frames = []
+        spacing = max(0, int(float(config.get('poster_spacing', 20)) * scale_factor))
+        layout_start_x = int(float(config.get('layout_start_x', 0)) * scale_factor)
+        direction = int(float(config.get('anim_direction', 1)))
+
+        if poster_layers:
+            poster_w, poster_h = poster_layers[0][0].size
+            unit_width = poster_w + spacing
+            loop_width = max(1, len(poster_layers) * unit_width)
+            pos_y = int(target_h * (float(config.get('poster_y_percent', 45)) / 100)) - (poster_h // 2)
+        else:
+            loop_width = 1
+            pos_y = 0
+
+        badge_config = dict(config)
+        badge_config["badge_size"] = max(8, int(float(config.get('badge_size', 40)) * scale_factor))
+
+        def _draw_text(canvas):
+            draw = ImageDraw.Draw(canvas)
+            cx = int(target_w * (float(config.get('text_left_percent', 5)) / 100))
+            cy = int(target_h * (float(config.get('text_top_percent', 75)) / 100))
+            max_width = int(target_w * 0.9)
+            gap = int(float(config.get('text_gap', 20)) * scale_factor)
+            title = config.get('title', '')
+            subtitle = config.get('subtitle', '')
+            if title:
+                cy = self.draw_text_wrapper(draw, title, cx, cy, fonts['main'], max_width, config.get('title_color', '#FFFFFF'), line_spacing=max(2, int(10 * scale_factor)))
+                cy += gap
+            if subtitle:
+                self.draw_text_wrapper(draw, subtitle, cx, cy, fonts['sub'], max_width, config.get('subtitle_color', '#DDDDDD'), line_spacing=max(2, int(10 * scale_factor)))
+
+        for idx in range(total_frames):
+            step = idx / total_frames if total_frames > 1 else 0
+            frame = base.copy()
+            if poster_layers:
+                anim_offset = step * loop_width * direction
+                for i, (poster, shadow) in enumerate(poster_layers):
+                    x = layout_start_x + ((i * unit_width + anim_offset) % loop_width)
+                    for draw_x in (x, x - loop_width, x + loop_width):
+                        if draw_x > -poster.size[0] - 20 and draw_x < target_w + 20:
+                            frame.paste(shadow, (int(draw_x) - shadow_margin + 2, int(pos_y) - shadow_margin + 2), mask=shadow)
+                            frame.paste(poster, (int(draw_x), int(pos_y)), mask=poster)
+
+            _draw_text(frame)
+            frame = self._draw_badge(frame, badge_config, assets.get('count', 0), fonts)
+            frames.append(frame)
+
+        frames[0].save(
+            output,
+            format='PNG',
+            save_all=True,
+            append_images=frames[1:],
+            duration=duration,
+            loop=0,
+            optimize=False,
+        )
+        logger.info(">>> [Engine] 动态 PNG 完成. 帧数: %s, 大小: %.2f MB", len(frames), output.getbuffer().nbytes / 1024 / 1024)
+
+    # === 动态 PNG 生成 ===
     def draw(self, config, assets):
         bg = None
         if assets.get('bg_url'):
             bg = self.download_img(assets['bg_url'])
         
         if not bg: bg = Image.new("RGBA", (1920, 1080), (20, 30, 50, 255))
+        is_dynamic = config.get('enable_animation', False)
         bg = bg.resize((1920, 1080))
-        
-        blur = int(config.get('blur_radius', 4))
-        if blur > 0: bg = bg.filter(ImageFilter.GaussianBlur(blur))
-        bg = ImageEnhance.Brightness(bg).enhance(float(config.get('brightness', 0.7)))
+
+        if not is_dynamic:
+            blur = int(config.get('blur_radius', 4))
+            if blur > 0: bg = bg.filter(ImageFilter.GaussianBlur(blur))
+            bg = ImageEnhance.Brightness(bg).enhance(float(config.get('brightness', 0.7)))
 
         def _load_font(font_filename, size):
             if font_filename:
@@ -251,74 +413,11 @@ class PosterEngine:
         }
 
         engine_type = config.get('engine', 'classic') 
-        is_dynamic = config.get('enable_animation', False)
         
         output = BytesIO()
 
         if is_dynamic:
-            logger.info(
-                ">>> [Engine] 启动轻量 APNG 渲染 "
-                f"(Max {MAX_DYNAMIC_FRAMES} Frames / {MAX_DYNAMIC_WIDTH}px)"
-            )
-            
-            target_w = _clamp_int(config.get('dynamic_output_width', 480), 480, 320, MAX_DYNAMIC_WIDTH)
-            target_h = int(target_w * 9 / 16) 
-            
-            user_frames = _clamp_int(config.get('anim_frames', 30), 30, 1, MAX_DYNAMIC_FRAMES)
-            total_frames = user_frames
-            
-            duration = _clamp_int(config.get('anim_duration', 100), 100, 20, 1000)
-            logger.info(
-                ">>> [Engine] APNG 实际参数: %sx%s, %s frames, %sms, %s workers",
-                target_w,
-                target_h,
-                total_frames,
-                duration,
-                MAX_DYNAMIC_WORKERS,
-            )
-            
-            frames_dict = {}
-
-            def render_one_frame(idx):
-                step = idx / total_frames if total_frames > 1 else 0
-                frame_canvas = bg.copy()
-                
-                if engine_type in self.layout_modules:
-                    render_func = self.layout_modules[engine_type]
-                    try:
-                        final_frame = render_func(self, frame_canvas, config, assets, fonts, step=step)
-                    except TypeError:
-                        final_frame = render_func(self, frame_canvas, config, assets, fonts)
-                else:
-                    final_frame = frame_canvas
-                
-                count_val = assets.get('count', 0)
-                final_frame = self._draw_badge(final_frame, config, count_val, fonts)
-                resized = final_frame.resize((target_w, target_h), Image.LANCZOS)
-                return idx, resized
-
-            with ThreadPoolExecutor(max_workers=MAX_DYNAMIC_WORKERS) as executor:
-                futures = [executor.submit(render_one_frame, i) for i in range(total_frames)]
-                for future in as_completed(futures):
-                    try:
-                        idx, img = future.result()
-                        frames_dict[idx] = img
-                    except Exception as e:
-                        logger.warning(f"Frame Error: {e}")
-
-            sorted_frames = [frames_dict[i] for i in range(total_frames) if i in frames_dict]
-
-            if sorted_frames:
-                sorted_frames[0].save(
-                    output, 
-                    format='PNG', 
-                    save_all=True, 
-                    append_images=sorted_frames[1:], 
-                    duration=duration, 
-                    loop=0,
-                    optimize=False 
-                )
-                logger.info(f">>> [Engine] APNG 完成. 帧数: {len(sorted_frames)}, 大小: {output.getbuffer().nbytes / 1024 / 1024:.2f} MB")
+            self._draw_dynamic_tiled_cover(bg, config, assets, _load_font, output)
         else:
             # 静态图逻辑，保持高清 1920x1080
             if engine_type in self.layout_modules:

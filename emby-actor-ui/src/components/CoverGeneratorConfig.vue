@@ -162,7 +162,7 @@
                       placeholder="选择模板"
                     />
                   </n-form-item>
-                  <n-form-item v-if="selectedChillPosterTemplate?.dynamic" label="动态封面宽度">
+                  <n-form-item v-if="selectedChillPosterTemplate?.dynamic" label="动态 PNG 宽度">
                     <n-input-number
                       v-model:value="configData.chillposter_dynamic_width"
                       :min="320"
@@ -170,7 +170,7 @@
                       :step="80"
                       placeholder="480"
                     />
-                    <template #feedback>动态 APNG 推荐 480，最大 640。宽度越大生成越慢，960 已知容易卡住。</template>
+                    <template #feedback>动态 PNG 推荐 480，最大 640。新版使用独立渲染进程，超时会自动降级为静态封面。</template>
                   </n-form-item>
                 </div>
               </n-spin>

@@ -129,10 +129,15 @@ def create_chillposter_cover(
 
     if render_config.get("enable_animation"):
         try:
-            dynamic_width = int(config.get("chillposter_dynamic_width") or 960)
+            dynamic_width = int(config.get("chillposter_dynamic_width") or 480)
         except (TypeError, ValueError):
-            dynamic_width = 960
+            dynamic_width = 480
         render_config["dynamic_output_width"] = max(320, min(dynamic_width, MAX_DYNAMIC_WIDTH))
+        try:
+            anim_frames = int(float(render_config.get("anim_frames") or 30))
+        except (TypeError, ValueError):
+            anim_frames = 30
+        render_config["anim_frames"] = max(1, min(anim_frames, 45))
 
     if config.get("show_item_count"):
         render_config["badge_style"] = "ribbon" if config.get("badge_style") == "ribbon" else "box"

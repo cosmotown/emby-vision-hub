@@ -166,11 +166,11 @@
                     <n-input-number
                       v-model:value="configData.chillposter_dynamic_width"
                       :min="320"
-                      :max="1280"
-                      :step="160"
-                      placeholder="960"
+                      :max="640"
+                      :step="80"
+                      placeholder="480"
                     />
-                    <template #feedback>动态 APNG 会保留动画，宽度越大生成和上传越慢，最大 1280。</template>
+                    <template #feedback>动态 APNG 推荐 480，最大 640。宽度越大生成越慢，960 已知容易卡住。</template>
                   </n-form-item>
                 </div>
               </n-spin>

@@ -11,9 +11,9 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed 
 
 logger = logging.getLogger(__name__)
-MAX_DYNAMIC_WIDTH = 1280
-MAX_DYNAMIC_FRAMES = 180
-MAX_DYNAMIC_WORKERS = 4
+MAX_DYNAMIC_WIDTH = 640
+MAX_DYNAMIC_FRAMES = 45
+MAX_DYNAMIC_WORKERS = 2
 
 def _clamp_int(value, default, min_value, max_value):
     try:
@@ -257,17 +257,25 @@ class PosterEngine:
 
         if is_dynamic:
             logger.info(
-                ">>> [Engine] 启动多线程 APNG 渲染 "
+                ">>> [Engine] 启动轻量 APNG 渲染 "
                 f"(Max {MAX_DYNAMIC_FRAMES} Frames / {MAX_DYNAMIC_WIDTH}px)"
             )
             
-            target_w = _clamp_int(config.get('dynamic_output_width', 960), 960, 320, MAX_DYNAMIC_WIDTH)
+            target_w = _clamp_int(config.get('dynamic_output_width', 480), 480, 320, MAX_DYNAMIC_WIDTH)
             target_h = int(target_w * 9 / 16) 
             
             user_frames = _clamp_int(config.get('anim_frames', 30), 30, 1, MAX_DYNAMIC_FRAMES)
             total_frames = user_frames
             
             duration = _clamp_int(config.get('anim_duration', 100), 100, 20, 1000)
+            logger.info(
+                ">>> [Engine] APNG 实际参数: %sx%s, %s frames, %sms, %s workers",
+                target_w,
+                target_h,
+                total_frames,
+                duration,
+                MAX_DYNAMIC_WORKERS,
+            )
             
             frames_dict = {}
 

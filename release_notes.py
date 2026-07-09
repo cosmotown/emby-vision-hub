@@ -2,6 +2,22 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.0.8",
+        "published_at": "2026-07-09T00:20:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.8",
+        "changelog": """## 动态封面轻量化
+
+### 修复
+- 修复动态 ChillPoster 在 960 宽度下生成任务卡死的问题。
+- 动态 APNG 生成改为轻量上限：最大宽度 640、最大 45 帧、最多 2 个渲染线程。
+- 后端会强制裁剪模板中过高的帧数配置，避免内置模板的 200 帧配置拖死任务。
+
+### 调整
+- 动态封面默认宽度从 960 改为 480。
+- 前端动态宽度输入最大值改为 640，并提示 960 已知容易卡住。
+""",
+    },
+    {
         "version": "v7.0.7",
         "published_at": "2026-07-08T23:05:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.7",

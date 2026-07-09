@@ -41,7 +41,7 @@ def get_default_config():
         # 封面风格
         "cover_style": "single_1",
         "chillposter_template": DEFAULT_TEMPLATE_ID,
-        "chillposter_dynamic_width": 960,
+        "chillposter_dynamic_width": 480,
         "tab": "style-tab",
 
         # 封面标题

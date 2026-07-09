@@ -226,7 +226,7 @@ class PosterEngine:
         target_h = int(target_w * 9 / 16)
         scale_factor = target_w / 1920
         total_frames = _clamp_int(config.get('anim_frames', 32), 32, 1, MAX_DYNAMIC_FRAMES)
-        duration = _clamp_int(config.get('anim_duration', 80), 80, 20, 1000)
+        duration = _clamp_int(config.get('anim_duration', 150), 150, 20, 1000)
 
         logger.info(
             ">>> [Engine] 动态 PNG 优化渲染: %sx%s, %s frames, %sms",

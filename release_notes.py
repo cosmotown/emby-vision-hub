@@ -2,6 +2,20 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.0.10",
+        "published_at": "2026-07-09T20:10:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.10",
+        "changelog": """## 前端版本显示与动态速度修正
+
+### 修复
+- 修复 `v7.0.9` 镜像中右上角仍显示 `v7.0.8` 的问题。
+- 前端构建版本与后端 `APP_VERSION` 重新对齐，后续页面显示、更新页和镜像标签会保持一致。
+
+### 调整
+- 动态平铺封面默认速度放慢：从约 2.56 秒一圈调整为约 4.8 秒一圈，更适合作为媒体库封面。
+""",
+    },
+    {
         "version": "v7.0.9",
         "published_at": "2026-07-09T01:10:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.9",

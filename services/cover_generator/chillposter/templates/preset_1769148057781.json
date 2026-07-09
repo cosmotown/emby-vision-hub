@@ -16,7 +16,7 @@
         "enable_animation": true,
         "anim_direction": 1,
         "anim_frames": "32",
-        "anim_duration": "80",
+        "anim_duration": "150",
         "poster_count": 8,
         "backdrop_count": 1,
         "poster_scale": 0.55,

@@ -44,8 +44,8 @@ def get_schema():
                     {"value": 1, "label": "从左往右 >>>"},
                     {"value": -1, "label": "<<< 从右往左"}
                 ], "default": 1},
-                {"key": "anim_frames", "label": "动画帧数 (总长)", "type": "range", "min": 12, "max": 36, "default": 36},
-                {"key": "anim_duration", "label": "帧间隔 (ms)", "type": "range", "min": 80, "max": 800, "default": 400},
+                {"key": "anim_frames", "label": "动画帧数 (总长)", "type": "range", "min": 24, "max": 72, "default": 72},
+                {"key": "anim_duration", "label": "帧间隔 (ms)", "type": "range", "min": 80, "max": 800, "default": 250},
             ]
         },
         # --- 3. 布局与背景 ---

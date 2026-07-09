@@ -21,6 +21,7 @@ LAYOUTS_DIR = CHILLPOSTER_ROOT / "layouts"
 REPO_FONTS_DIR = Path(__file__).resolve().parents[3] / "fonts"
 DEFAULT_TEMPLATE_ID = "preset_1769062617890"
 DYNAMIC_RENDER_TIMEOUT = 180
+HEAVY_DYNAMIC_MAX_WIDTH = 360
 
 _ENGINE: Optional[PosterEngine] = None
 
@@ -220,12 +221,14 @@ def create_chillposter_cover(
             dynamic_width = int(config.get("chillposter_dynamic_width") or 480)
         except (TypeError, ValueError):
             dynamic_width = 480
-        render_config["dynamic_output_width"] = max(320, min(dynamic_width, MAX_DYNAMIC_WIDTH))
+        dynamic_width_limit = HEAVY_DYNAMIC_MAX_WIDTH if render_config.get("engine") in {"聚焦C佬", "扇形展开"} else MAX_DYNAMIC_WIDTH
+        render_config["dynamic_output_width"] = max(320, min(dynamic_width, dynamic_width_limit))
         try:
             anim_frames = int(float(render_config.get("anim_frames") or 30))
         except (TypeError, ValueError):
             anim_frames = 30
-        render_config["anim_frames"] = max(1, min(anim_frames, 36))
+        frame_limit = 36 if render_config.get("engine") in {"聚焦C佬", "扇形展开"} else 72
+        render_config["anim_frames"] = max(1, min(anim_frames, frame_limit))
 
     if config.get("show_item_count"):
         render_config["badge_style"] = "ribbon" if config.get("badge_style") == "ribbon" else "box"

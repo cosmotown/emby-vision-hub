@@ -247,6 +247,28 @@ class PosterEngine:
     def _relative_loop_position(self, index, active_position, count):
         return ((index - active_position + count / 2) % count) - count / 2
 
+    def _dynamic_badge_config(self, config, scale_factor):
+        """Scale the template badge from its 1920px design canvas to animation output."""
+        badge_config = dict(config)
+        try:
+            badge_size = float(config.get('badge_size', 40))
+        except (TypeError, ValueError):
+            badge_size = 40
+        badge_config['badge_size'] = max(8, int(badge_size * scale_factor))
+        return badge_config
+
+    def _stepped_active_position(self, frame_idx, total_frames, poster_count):
+        """Hold each C-position briefly, then ease into the next poster page."""
+        phase = (frame_idx / total_frames) * poster_count
+        page = math.floor(phase)
+        within_page = phase - page
+        hold_ratio = 0.25
+        if within_page <= hold_ratio:
+            return page
+        transition = (within_page - hold_ratio) / (1 - hold_ratio)
+        eased = transition * transition * (3 - 2 * transition)
+        return page + eased
+
     def _draw_dynamic_text(self, canvas, config, fonts, scale_factor, mode='center'):
         draw = ImageDraw.Draw(canvas)
         width, height = canvas.size
@@ -402,8 +424,7 @@ class PosterEngine:
             loop_width = 1
             pos_y = 0
 
-        badge_config = dict(config)
-        badge_config["badge_size"] = max(8, int(float(config.get('badge_size', 40)) * scale_factor))
+        badge_config = self._dynamic_badge_config(config, scale_factor)
 
         def _draw_text(canvas):
             draw = ImageDraw.Draw(canvas)
@@ -497,6 +518,7 @@ class PosterEngine:
         hero_shadow_opacity = int(config.get('hero_shadow_opacity', 180))
         travel = hero_w * (1 - overlap_pct) * 0.95
         center_x = target_w // 2
+        badge_config = self._dynamic_badge_config(config, scale_factor)
 
         raw_posters = []
         for url in poster_urls:
@@ -507,53 +529,57 @@ class PosterEngine:
             return self._draw_dynamic_tiled_cover(bg, config, assets, font_loader, output)
 
         frames = []
-        for frame_idx in range(total_frames):
-            active = (frame_idx / total_frames) * len(raw_posters)
-            frame = base.copy()
-            queue = []
-            for i, raw in enumerate(raw_posters):
-                rel = self._relative_loop_position(i, active, len(raw_posters))
-                abs_rel = abs(rel)
-                if abs_rel > (count // 2 + 0.75):
-                    continue
-                current_scale = math.pow(scale_step, abs_rel)
-                w = max(1, int(hero_w * current_scale))
-                h = max(1, int(hero_h * current_scale))
-                x = center_x + rel * travel
-                y = base_y
-                brightness = max(0.25, 1.0 - (abs_rel * darken_step / 255.0))
-                queue.append((abs_rel, raw, w, h, x, y, brightness))
+        try:
+            for frame_idx in range(total_frames):
+                active = self._stepped_active_position(frame_idx, total_frames, len(raw_posters))
+                frame = base.copy()
+                queue = []
+                for i, raw in enumerate(raw_posters):
+                    rel = self._relative_loop_position(i, active, len(raw_posters))
+                    abs_rel = abs(rel)
+                    if abs_rel > (count // 2 + 0.75):
+                        continue
+                    current_scale = math.pow(scale_step, abs_rel)
+                    w = max(1, int(hero_w * current_scale))
+                    h = max(1, int(hero_h * current_scale))
+                    x = center_x + rel * travel
+                    y = base_y
+                    brightness = max(0.25, 1.0 - (abs_rel * darken_step / 255.0))
+                    queue.append((abs_rel, raw, w, h, x, y, brightness))
 
-            queue.sort(key=lambda item: item[0], reverse=True)
-            for abs_rel, raw, w, h, x, y, brightness in queue:
-                poster = raw.resize((w, h), Image.LANCZOS)
-                if brightness < 1.0:
-                    poster = ImageEnhance.Brightness(poster).enhance(brightness)
-                poster = self._rounded(poster, corner_radius)
-                paste_x = int(x - w / 2)
-                paste_y = int(y - h)
+                queue.sort(key=lambda item: item[0], reverse=True)
+                for abs_rel, raw, w, h, x, y, brightness in queue:
+                    poster = raw.resize((w, h), Image.LANCZOS)
+                    if brightness < 1.0:
+                        poster = ImageEnhance.Brightness(poster).enhance(brightness)
+                    poster = self._rounded(poster, corner_radius)
+                    paste_x = int(x - w / 2)
+                    paste_y = int(y - h)
 
-                if reflection_opacity > 0:
-                    reflection = self._reflection(poster, opacity=max(5, int(reflection_opacity * max(0.15, 1 - abs_rel / 5))))
-                    frame.paste(reflection, (paste_x, int(y)), mask=reflection)
+                    if reflection_opacity > 0:
+                        reflection = self._reflection(poster, opacity=max(5, int(reflection_opacity * max(0.15, 1 - abs_rel / 5))))
+                        frame.paste(reflection, (paste_x, int(y)), mask=reflection)
 
-                if abs_rel < 0.65 and hero_shadow_opacity > 0:
-                    shadow_pad = max(4, int(40 * scale_factor))
-                    shadow = Image.new('RGBA', (w + shadow_pad * 2, h + shadow_pad * 2), (0, 0, 0, 0))
-                    sd = ImageDraw.Draw(shadow)
-                    sd.rounded_rectangle(
-                        (shadow_pad, shadow_pad, shadow_pad + w, shadow_pad + h),
-                        radius=corner_radius,
-                        fill=(0, 0, 0, hero_shadow_opacity),
-                    )
-                    shadow = shadow.filter(ImageFilter.GaussianBlur(max(1, int(20 * scale_factor))))
-                    frame.paste(shadow, (paste_x - shadow_pad, paste_y - shadow_pad + int(10 * scale_factor)), mask=shadow)
+                    if abs_rel < 0.65 and hero_shadow_opacity > 0:
+                        shadow_pad = max(4, int(40 * scale_factor))
+                        shadow = Image.new('RGBA', (w + shadow_pad * 2, h + shadow_pad * 2), (0, 0, 0, 0))
+                        sd = ImageDraw.Draw(shadow)
+                        sd.rounded_rectangle(
+                            (shadow_pad, shadow_pad, shadow_pad + w, shadow_pad + h),
+                            radius=corner_radius,
+                            fill=(0, 0, 0, hero_shadow_opacity),
+                        )
+                        shadow = shadow.filter(ImageFilter.GaussianBlur(max(1, int(20 * scale_factor))))
+                        frame.paste(shadow, (paste_x - shadow_pad, paste_y - shadow_pad + int(10 * scale_factor)), mask=shadow)
 
-                frame.paste(poster, (paste_x, paste_y), mask=poster)
+                    frame.paste(poster, (paste_x, paste_y), mask=poster)
 
-            self._draw_dynamic_text(frame, config, fonts, scale_factor, mode='focus')
-            frame = self._draw_badge(frame, config, assets.get('count', 0), fonts)
-            frames.append(frame)
+                self._draw_dynamic_text(frame, config, fonts, scale_factor, mode='focus')
+                frame = self._draw_badge(frame, badge_config, assets.get('count', 0), fonts)
+                frames.append(frame)
+        except Exception:
+            logger.exception(">>> [Engine] 聚焦C佬动态在第 %s/%s 帧渲染失败", frame_idx + 1, total_frames)
+            raise
 
         frames[0].save(output, format='PNG', save_all=True, append_images=frames[1:], duration=duration, loop=0, optimize=False)
         logger.info(">>> [Engine] 聚焦C佬动态 PNG 完成. 帧数: %s, 大小: %.2f MB", len(frames), output.getbuffer().nbytes / 1024 / 1024)
@@ -603,6 +629,7 @@ class PosterEngine:
         pivot_x = target_w // 2
         pivot_y = (target_h // 2) + fan_radius - (base_h // 2) + y_offset
         angle_step = fan_spread / max(1, count - 1)
+        badge_config = self._dynamic_badge_config(config, scale_factor)
 
         frames = []
         for frame_idx in range(total_frames):
@@ -647,7 +674,7 @@ class PosterEngine:
                 frame.paste(rotated, (paste_x, paste_y), mask=rotated)
 
             self._draw_dynamic_text(frame, config, fonts, scale_factor, mode='fan')
-            frame = self._draw_badge(frame, config, assets.get('count', 0), fonts)
+            frame = self._draw_badge(frame, badge_config, assets.get('count', 0), fonts)
             frames.append(frame)
 
         frames[0].save(output, format='PNG', save_all=True, append_images=frames[1:], duration=duration, loop=0, optimize=False)

@@ -2,6 +2,21 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.0.13",
+        "published_at": "2026-07-10T01:15:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.13",
+        "changelog": """## 动态聚焦封面修正
+
+### 修复
+- 修复扇形与聚焦动态模板在小尺寸输出时角标没有同步缩放、位置异常的问题。
+- 聚焦 C 佬动态渲染失败时会记录具体帧号和异常，便于直接定位失败阶段。
+
+### 调整
+- 聚焦 C 佬动态改为换页式效果：C 位会停留展示，再阶梯式切换到下一组海报。
+- 聚焦模板调整为 28 帧、每帧 500ms，完整循环约 14 秒，兼顾停留感和 NAS 负载。
+""",
+    },
+    {
         "version": "v7.0.12",
         "published_at": "2026-07-10T00:30:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.12",

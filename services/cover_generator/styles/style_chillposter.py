@@ -221,13 +221,20 @@ def create_chillposter_cover(
             dynamic_width = int(config.get("chillposter_dynamic_width") or 480)
         except (TypeError, ValueError):
             dynamic_width = 480
-        dynamic_width_limit = HEAVY_DYNAMIC_MAX_WIDTH if render_config.get("engine") in {"聚焦C佬", "扇形展开"} else MAX_DYNAMIC_WIDTH
+        dynamic_width_limit = HEAVY_DYNAMIC_MAX_WIDTH if render_config.get("engine") in {"聚焦C佬", "扇形展开", "旋转堆叠"} else MAX_DYNAMIC_WIDTH
         render_config["dynamic_output_width"] = max(320, min(dynamic_width, dynamic_width_limit))
         try:
             anim_frames = int(float(render_config.get("anim_frames") or 30))
         except (TypeError, ValueError):
             anim_frames = 30
-        frame_limit = 36 if render_config.get("engine") in {"聚焦C佬", "扇形展开"} else 72
+        if render_config.get("engine") == "聚焦C佬":
+            frame_limit = 36
+        elif render_config.get("engine") in {"扇形展开", "旋转堆叠"}:
+            frame_limit = 54
+        elif render_config.get("engine") == "旋转":
+            frame_limit = 48
+        else:
+            frame_limit = 72
         render_config["anim_frames"] = max(1, min(anim_frames, frame_limit))
 
     if config.get("show_item_count"):

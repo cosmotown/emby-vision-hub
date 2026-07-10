@@ -1,0 +1,32 @@
+{
+    "name": "旋转堆叠动态",
+    "engine": "旋转堆叠",
+    "config": {
+        "engine": "旋转堆叠",
+        "badge_style": "box",
+        "badge_font": "剑豪体.ttf",
+        "badge_size": "90",
+        "badge_bg_color": "#000000",
+        "badge_text_color": "#ffffff",
+        "badge_opacity": "0",
+        "title": "韩国电影",
+        "subtitle": "Korean Movies",
+        "font_title": "剑豪体.ttf",
+        "font_subtitle": "剑豪体.ttf",
+        "enable_animation": true,
+        "anim_frames": "54",
+        "anim_duration": "333",
+        "poster_count": 9,
+        "corner_radius": 46,
+        "rotation": "-16",
+        "title_size": 160,
+        "title_x": 5,
+        "title_y": 40,
+        "font_sub": "default.ttf",
+        "sub_size": 50,
+        "sub_x": 8,
+        "sub_y": 58,
+        "bg_blur_radius": 60,
+        "badge_border_opacity": "23"
+    }
+}

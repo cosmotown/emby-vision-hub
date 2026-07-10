@@ -172,8 +172,8 @@
                     />
                     <template #feedback>
                       {{ isHeavyDynamicTemplate
-                        ? '聚焦/扇形动态模板较重，已限制最大 360，避免 NAS 生成时卡住。'
-                        : '动态平铺推荐 480，最大 640。新版使用独立渲染进程，超时会自动降级为静态封面。' }}
+                        ? '聚焦、扇形、旋转堆叠动态模板较重，已限制最大 360，避免 NAS 生成时卡住。'
+                        : '轻量动态模板推荐 480，最大 640。新版使用独立渲染进程，超时会自动降级为静态封面。' }}
                     </template>
                   </n-form-item>
                 </div>
@@ -410,7 +410,7 @@ const selectedChillPosterTemplate = computed(() => (
   chillposterTemplates.value.find(item => item.id === configData.value.chillposter_template)
 ));
 const isHeavyDynamicTemplate = computed(() => (
-  ['聚焦C佬', '扇形展开'].includes(selectedChillPosterTemplate.value?.engine)
+  ['聚焦C佬', '扇形展开', '旋转堆叠'].includes(selectedChillPosterTemplate.value?.engine)
 ));
 // ★ 新增：用于封面标题UI的结构化数据
 const titleConfigs = ref([]);

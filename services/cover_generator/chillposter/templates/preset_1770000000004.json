@@ -30,6 +30,7 @@
         "subtitle_pos_y": 55,
         "sub_width_pct": 40,
         "bg_blur": "60",
+        "dynamic_bg_blur": "0",
         "badge_border_opacity": "20"
     }
 }

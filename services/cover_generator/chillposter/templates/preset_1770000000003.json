@@ -17,7 +17,7 @@
         "anim_frames": "48",
         "page_hold_duration": "650",
         "page_transition_duration": "150",
-        "dynamic_bg_blur": "36",
+        "dynamic_bg_blur": "0",
         "poster_count": 6,
         "poster_scale": "0.9",
         "poster_x_percent": "55",

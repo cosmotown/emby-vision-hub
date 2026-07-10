@@ -344,24 +344,54 @@ class PosterEngine:
         gap = max(10, int(float(config.get('poster_gap', 140)) * scale_factor))
 
         frames = []
+        frames_per_page = max(8, total_frames // len(raw_posters))
         for frame_idx in range(total_frames):
-            active = (frame_idx / total_frames) * len(raw_posters)
-            page = int(active)
-            progress = active - page
+            page = (frame_idx // frames_per_page) % len(raw_posters)
+            page_frame = frame_idx % frames_per_page
+            transition_start = frames_per_page - 2
+            if page_frame < transition_start:
+                transition = 0.0
+            else:
+                transition = (page_frame - transition_start + 1) / 3
+                transition = transition * transition * (3 - 2 * transition)
+
             frame = base.copy()
-            for depth in range(len(raw_posters) - 1, -1, -1):
-                source = raw_posters[(page + depth) % len(raw_posters)]
-                depth_scale = math.pow(0.9, depth)
+
+            # During the short transition, each card advances exactly one stack slot.
+            # The outgoing front card exits left while a new card enters at the back.
+            if transition:
+                incoming_position = len(raw_posters) - transition
+                incoming_scale = math.pow(0.9, incoming_position)
+                incoming_w = max(24, int(card_w * incoming_scale))
+                incoming_h = max(36, int(card_h * incoming_scale))
+                incoming = self._rounded(
+                    ImageOps.fit(raw_posters[(page + len(raw_posters)) % len(raw_posters)], (incoming_w, incoming_h), method=Image.LANCZOS).convert('RGBA'),
+                    radius,
+                )
+                frame.paste(
+                    incoming,
+                    (int(anchor_x + incoming_position * gap), int(anchor_y + (card_h - incoming_h) / 2)),
+                    mask=incoming,
+                )
+
+            for depth in range(len(raw_posters) - 1, 0, -1):
+                position = depth - transition
+                depth_scale = math.pow(0.9, position)
                 width = max(24, int(card_w * depth_scale))
                 height = max(36, int(card_h * depth_scale))
-                card = ImageOps.fit(source, (width, height), method=Image.LANCZOS).convert('RGBA')
-                card = self._rounded(card, radius)
-                x = int(anchor_x + (depth - progress) * gap)
+                source = raw_posters[(page + depth) % len(raw_posters)]
+                card = self._rounded(ImageOps.fit(source, (width, height), method=Image.LANCZOS).convert('RGBA'), radius)
+                x = int(anchor_x + position * gap)
                 y = int(anchor_y + (card_h - height) / 2)
                 if x < target_w + card_w:
-                    shadow = Image.new('RGBA', card.size, (0, 0, 0, 100)).filter(ImageFilter.GaussianBlur(max(1, int(6 * scale_factor))))
-                    frame.paste(shadow, (x + 2, y + 3), mask=card)
                     frame.paste(card, (x, y), mask=card)
+
+            current = self._rounded(ImageOps.fit(raw_posters[page], (card_w, card_h), method=Image.LANCZOS).convert('RGBA'), radius)
+            if transition:
+                current.putalpha(current.getchannel('A').point(lambda value: value * int(255 * (1 - transition)) // 255))
+                frame.paste(current, (int(anchor_x - transition * gap), anchor_y), mask=current)
+            else:
+                frame.paste(current, (anchor_x, anchor_y), mask=current)
             self._draw_dynamic_layout_text(frame, config, fonts, scale_factor, 'classic_stack')
             frames.append(self._draw_badge(frame, badge_config, assets.get('count', 0), fonts))
 
@@ -440,27 +470,36 @@ class PosterEngine:
         rotation = float(config.get('rotation', -16))
         columns = []
         for column_index in range(3):
-            column = Image.new('RGBA', (cell_w, cell_h * 4), (0, 0, 0, 0))
-            for row_index in range(4):
-                source = raw_posters[(column_index * 3 + row_index) % len(raw_posters)]
-                card = ImageOps.fit(source, (cell_w, cell_h), method=Image.LANCZOS).convert('RGBA')
-                card = self._rounded(card, radius)
-                column.paste(card, (0, row_index * cell_h), mask=card)
-            columns.append(column.rotate(rotation, resample=Image.BICUBIC, expand=True))
+            columns.append([
+                self._rounded(
+                    ImageOps.fit(raw_posters[column_index * 3 + row_index], (cell_w, cell_h), method=Image.LANCZOS).convert('RGBA'),
+                    radius,
+                )
+                for row_index in range(3)
+            ])
 
         frames = []
+        lane_centers = [int(target_w * 0.32), int(target_w * 0.56), int(target_w * 0.80)]
+        row_stride = int(cell_h * 0.86)
+        loop_height = row_stride * 3
+        base_y = -int(cell_h * 0.8)
         for frame_idx in range(total_frames):
             frame = base.copy()
-            for column_index, column in enumerate(columns):
-                direction = -1 if column_index == 1 else 1
-                speed = 0.82 if column_index == 1 else 1.0
-                offset = direction * (frame_idx / total_frames) * cell_h * speed
-                x = int(target_w * 0.27 + column_index * cell_w * 0.95)
-                y = int(-cell_h * 1.1 + offset)
-                loop_height = cell_h * 3
-                frame.paste(column, (x, y), mask=column)
-                frame.paste(column, (x, y + loop_height), mask=column)
-                frame.paste(column, (x, y - loop_height), mask=column)
+            for column_index, cards in enumerate(columns):
+                direction = 1 if column_index != 1 else -1
+                speed = 1.0 if column_index != 1 else 0.82
+                scroll = direction * (frame_idx / total_frames) * row_stride * speed
+                for row_index, card in enumerate(cards):
+                    y = int(base_y + ((row_index * row_stride + scroll) % loop_height))
+                    self._paste_rotated_card(
+                        frame,
+                        card,
+                        lane_centers[column_index],
+                        y + cell_h // 2,
+                        rotation,
+                        shadow_opacity=105,
+                        shadow_blur=max(1, int(4 * scale_factor)),
+                    )
             self._draw_dynamic_layout_text(frame, config, fonts, scale_factor, 'rotate_stack')
             frames.append(self._draw_badge(frame, badge_config, assets.get('count', 0), fonts))
 

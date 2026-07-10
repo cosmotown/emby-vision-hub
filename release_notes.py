@@ -2,6 +2,20 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.0.15",
+        "published_at": "2026-07-10T03:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.15",
+        "changelog": """## 动态堆叠修正
+
+### 修复
+- 修复 `经典堆叠动态` 整组持续横向平移的问题，改为前卡退出、后卡逐层顶位、新卡从末层补入。
+- 修复 `旋转堆叠动态` 将整列拼接后滚动导致的错层问题，改为每张海报独立定位并在各自列内滚动。
+
+### 调整
+- 旋转堆叠继续保持第一、三列同向滚动，中间列反向滚动，速度维持约 18 秒一轮。
+""",
+    },
+    {
         "version": "v7.0.14",
         "published_at": "2026-07-10T02:10:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.14",

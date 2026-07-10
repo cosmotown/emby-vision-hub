@@ -300,6 +300,25 @@ class PosterEngine:
             card = ImageEnhance.Brightness(card).enhance(brightness)
         return self._rounded(card, radius)
 
+    def _make_dynamic_backgrounds(self, posters, size, blur_radius, overlay_opacity):
+        overlay = Image.new('RGBA', size, (0, 0, 0, overlay_opacity))
+        backgrounds = []
+        for poster in posters:
+            background = ImageOps.fit(poster, size, method=Image.LANCZOS).convert('RGBA')
+            if blur_radius:
+                background = background.filter(ImageFilter.GaussianBlur(blur_radius))
+            backgrounds.append(Image.alpha_composite(background, overlay))
+        return backgrounds
+
+    def _dynamic_background_transition(self, backgrounds, active_position):
+        current_index = int(active_position) % len(backgrounds)
+        progress = active_position - int(active_position)
+        if progress < 0.75:
+            return backgrounds[current_index].copy()
+        blend = (progress - 0.75) / 0.25
+        blend = blend * blend * (3 - 2 * blend)
+        return Image.blend(backgrounds[current_index], backgrounds[(current_index + 1) % len(backgrounds)], blend)
+
     def _paste_rotated_card(self, canvas, card, center_x, center_y, angle, opacity=255, shadow_opacity=120, shadow_blur=4):
         if opacity < 255:
             alpha = card.getchannel('A').point(lambda value: value * opacity // 255)
@@ -320,7 +339,8 @@ class PosterEngine:
         target_h = int(target_w * 9 / 16)
         scale_factor = target_w / 1920
         total_frames = _clamp_int(config.get('anim_frames', 48), 48, 1, 54)
-        duration = _clamp_int(config.get('anim_duration', 375), 375, 80, 1000)
+        page_hold_duration = _clamp_int(config.get('page_hold_duration', 650), 650, 250, 3000)
+        page_transition_duration = _clamp_int(config.get('page_transition_duration', 150), 150, 60, 500)
         poster_urls = list(assets.get('posters') or [])
         if not poster_urls:
             return self._draw_dynamic_tiled_cover(bg, config, assets, font_loader, output)
@@ -329,11 +349,14 @@ class PosterEngine:
         if not raw_posters:
             return self._draw_dynamic_tiled_cover(bg, config, assets, font_loader, output)
 
-        base = bg.resize((target_w, target_h), Image.LANCZOS).convert('RGBA')
-        blur = int(float(config.get('blur_radius', 0)) * scale_factor)
-        if blur:
-            base = base.filter(ImageFilter.GaussianBlur(max(1, blur)))
-        base = Image.alpha_composite(base, Image.new('RGBA', base.size, (0, 0, 0, int(config.get('mask_opacity', 180)))))
+        # The background follows the current front card, preserving its aspect ratio.
+        background_blur = max(4, int(float(config.get('dynamic_bg_blur', 36)) * scale_factor))
+        background_overlay = Image.new('RGBA', (target_w, target_h), (0, 0, 0, int(config.get('mask_opacity', 180))))
+        backgrounds = []
+        for poster in raw_posters:
+            poster_bg = ImageOps.fit(poster, (target_w, target_h), method=Image.LANCZOS).convert('RGBA')
+            poster_bg = poster_bg.filter(ImageFilter.GaussianBlur(background_blur))
+            backgrounds.append(Image.alpha_composite(poster_bg, background_overlay))
         fonts = self._dynamic_fonts(config, font_loader, scale_factor, title_default=160, subtitle_default=80)
         badge_config = self._dynamic_badge_config(config, scale_factor)
         card_h = max(56, int(target_h * 0.5 * float(config.get('poster_scale', 0.9))))
@@ -344,6 +367,7 @@ class PosterEngine:
         gap = max(10, int(float(config.get('poster_gap', 140)) * scale_factor))
 
         frames = []
+        frame_durations = []
         frames_per_page = max(8, total_frames // len(raw_posters))
         for frame_idx in range(total_frames):
             page = (frame_idx // frames_per_page) % len(raw_posters)
@@ -355,7 +379,9 @@ class PosterEngine:
                 transition = (page_frame - transition_start + 1) / 3
                 transition = transition * transition * (3 - 2 * transition)
 
-            frame = base.copy()
+            frame = backgrounds[page].copy()
+            if transition:
+                frame = Image.blend(frame, backgrounds[(page + 1) % len(backgrounds)], transition)
 
             # During the short transition, each card advances exactly one stack slot.
             # The outgoing front card exits left while a new card enters at the back.
@@ -394,8 +420,9 @@ class PosterEngine:
                 frame.paste(current, (anchor_x, anchor_y), mask=current)
             self._draw_dynamic_layout_text(frame, config, fonts, scale_factor, 'classic_stack')
             frames.append(self._draw_badge(frame, badge_config, assets.get('count', 0), fonts))
+            frame_durations.append(page_hold_duration if page_frame < transition_start else page_transition_duration)
 
-        frames[0].save(output, format='PNG', save_all=True, append_images=frames[1:], duration=duration, loop=0, optimize=False)
+        frames[0].save(output, format='PNG', save_all=True, append_images=frames[1:], duration=frame_durations, loop=0, optimize=False)
 
     def _draw_dynamic_rotate_cover(self, bg, config, assets, font_loader, output):
         target_w = _clamp_int(config.get('dynamic_output_width', 480), 480, 320, 480)
@@ -410,10 +437,8 @@ class PosterEngine:
         if not raw_posters:
             return self._draw_dynamic_tiled_cover(bg, config, assets, font_loader, output)
 
-        source_bg = ImageOps.fit(raw_posters[0], (target_w, target_h), method=Image.LANCZOS)
         blur = max(1, int(float(config.get('bg_blur', 60)) * scale_factor))
-        base = source_bg.filter(ImageFilter.GaussianBlur(blur)).convert('RGBA')
-        base = Image.alpha_composite(base, Image.new('RGBA', base.size, (0, 0, 0, 110)))
+        backgrounds = self._make_dynamic_backgrounds(raw_posters, (target_w, target_h), blur, 110)
         fonts = self._dynamic_fonts(config, font_loader, scale_factor, title_default=160, subtitle_default=80)
         badge_config = self._dynamic_badge_config(config, scale_factor)
         card_size = max(80, int(target_h * float(config.get('card_scale', 0.65))))
@@ -431,7 +456,7 @@ class PosterEngine:
             transition = transition * transition * (3 - 2 * transition)
             current = self._make_dynamic_card(raw_posters[page % len(raw_posters)], card_size, radius)
             upcoming = self._make_dynamic_card(raw_posters[(page + 1) % len(raw_posters)], card_size, radius)
-            frame = base.copy()
+            frame = self._dynamic_background_transition(backgrounds, active)
             for layer_index, angle in enumerate(angles[:2]):
                 layer = current.filter(ImageFilter.GaussianBlur((2 - layer_index) * max(1, int(4 * scale_factor))))
                 self._paste_rotated_card(frame, layer, center_x, center_y, angle, opacity=130, shadow_opacity=70, shadow_blur=max(1, int(4 * scale_factor)))
@@ -464,7 +489,7 @@ class PosterEngine:
         base = Image.alpha_composite(base, Image.new('RGBA', base.size, (0, 0, 0, 115)))
         fonts = self._dynamic_fonts(config, font_loader, scale_factor, title_default=160, subtitle_default=50)
         badge_config = self._dynamic_badge_config(config, scale_factor)
-        cell_h = max(64, int(target_h * 0.56))
+        cell_h = max(60, int(target_h * 0.42))
         cell_w = max(44, int(cell_h * 0.666))
         radius = max(3, int(float(config.get('corner_radius', 46)) * scale_factor))
         rotation = float(config.get('rotation', -16))
@@ -479,18 +504,21 @@ class PosterEngine:
             ])
 
         frames = []
-        lane_centers = [int(target_w * 0.32), int(target_w * 0.56), int(target_w * 0.80)]
-        row_stride = int(cell_h * 0.86)
+        # Keep the left title area clear and let each lane loop independently.
+        lane_centers = [int(target_w * 0.55), int(target_w * 0.75), int(target_w * 0.95)]
+        row_stride = int(cell_h * 0.92)
         loop_height = row_stride * 3
-        base_y = -int(cell_h * 0.8)
+        base_y = -cell_h
         for frame_idx in range(total_frames):
             frame = base.copy()
             for column_index, cards in enumerate(columns):
-                direction = 1 if column_index != 1 else -1
-                speed = 1.0 if column_index != 1 else 0.82
-                scroll = direction * (frame_idx / total_frames) * row_stride * speed
+                # Outer lanes move upward while the centre lane moves downward.
+                # Each lane still completes a full three-card loop without a seam.
+                phase_offset = column_index * (loop_height / 3)
+                direction = -1 if column_index == 1 else 1
+                scroll = direction * (frame_idx / total_frames) * loop_height + phase_offset
                 for row_index, card in enumerate(cards):
-                    y = int(base_y + ((row_index * row_stride + scroll) % loop_height))
+                    y = int(base_y + ((row_index * row_stride - scroll) % loop_height))
                     self._paste_rotated_card(
                         frame,
                         card,
@@ -879,12 +907,9 @@ class PosterEngine:
         if not raw_posters:
             return self._draw_dynamic_tiled_cover(bg, config, assets, font_loader, output)
 
-        bg_source = raw_posters[len(raw_posters) // 2].resize((target_w, target_h), Image.LANCZOS).convert('RGBA')
         bg_blur = int(float(config.get('bg_blur', 100)) * scale_factor)
-        if bg_blur > 0:
-            bg_source = bg_source.filter(ImageFilter.GaussianBlur(max(1, bg_blur)))
         darkness = int(config.get('bg_darkness', 160))
-        base = Image.alpha_composite(bg_source, Image.new('RGBA', bg_source.size, (0, 0, 0, darkness)))
+        backgrounds = self._make_dynamic_backgrounds(raw_posters, (target_w, target_h), max(1, bg_blur), darkness)
 
         fonts = self._dynamic_fonts(config, font_loader, scale_factor, title_default=90, subtitle_default=50)
         fan_radius = float(config.get('fan_radius', 1200)) * scale_factor
@@ -902,7 +927,7 @@ class PosterEngine:
         frames = []
         for frame_idx in range(total_frames):
             active = (frame_idx / total_frames) * len(raw_posters)
-            frame = base.copy()
+            frame = self._dynamic_background_transition(backgrounds, active)
             queue = []
             for i, raw in enumerate(raw_posters):
                 rel = self._relative_loop_position(i, active, len(raw_posters))

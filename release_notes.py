@@ -2,6 +2,23 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.1",
+        "published_at": "2026-07-12T01:41:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.1",
+        "changelog": """## 虚拟电影合集与媒体去重安全修复
+
+### 修复
+- Toolkit 虚拟电影合集不再伪装为 Emby 原生 `movies` 媒体库，统一以兼容的 `mixed` 视图提供给客户端；内部内容查询仍严格限定为电影。
+- 主页视图与虚拟库详情复用同一类型判断，修复 Emby Web 打开纯电影自建合集报错，以及部分官方客户端无法解析媒体库列表的问题。
+- 元数据同步严格拒绝 `0`、空值和非数字 TMDb ID，防止无有效身份的不同影片被归入同一多版本记录。
+- 媒体去重扫描会过滤 Emby 已不存在的缓存版本，并核验电影 TMDb ID 或分集的剧集、季、集身份。
+
+### 安全
+- 执行媒体删除前再次从 Emby 实时核验全部候选版本；身份不一致时整组终止，不执行任何删除。
+- 本次虚拟库修复只调整 8097 反代的动态响应，不修改 Emby 数据库、合集成员或封面文件。
+""",
+    },
+    {
         "version": "v7.1.0",
         "published_at": "2026-07-12T00:14:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.0",

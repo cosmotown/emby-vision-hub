@@ -10,7 +10,7 @@ from collections import defaultdict
 import task_manager
 import handler.emby as emby
 from database import connection, cleanup_db, settings_db, maintenance_db, queries_db
-from .media import task_populate_metadata_cache
+from .media import is_valid_tmdb_id, task_populate_metadata_cache
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +256,80 @@ def _determine_best_version_by_rules(versions: List[Dict[str, Any]]) -> Optional
     
     return sorted_versions[0]['id'] if sorted_versions else None
 
+def _collect_unique_emby_ids_from_assets(items: List[Dict[str, Any]]) -> List[str]:
+    seen = set()
+    ordered_ids = []
+    for item in items or []:
+        for version in item.get('asset_details_json') or []:
+            if not isinstance(version, dict):
+                continue
+            emby_id = str(version.get('emby_item_id') or '').strip()
+            if emby_id and emby_id not in seen:
+                seen.add(emby_id)
+                ordered_ids.append(emby_id)
+    return ordered_ids
+
+def _fetch_current_cleanup_items(processor, emby_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not emby_ids:
+        return {}
+    current_items = emby.get_emby_items_by_id(
+        processor.emby_url,
+        processor.emby_api_key,
+        processor.emby_user_id,
+        emby_ids,
+        fields="Id,Type,ProviderIds,SeriesId,ParentIndexNumber,IndexNumber"
+    )
+    return {
+        str(item.get('Id') or '').strip(): item
+        for item in current_items or []
+        if str(item.get('Id') or '').strip()
+    }
+
+def _validate_cleanup_identity(
+    expected_tmdb_id: str,
+    item_type: str,
+    versions: List[Dict[str, Any]],
+    current_items_by_id: Dict[str, Dict[str, Any]]
+) -> Optional[str]:
+    """Fail closed when cached versions no longer identify the same Emby media."""
+    version_ids = {
+        str(version.get('emby_item_id') or version.get('id') or '').strip()
+        for version in versions or []
+    }
+    version_ids.discard('')
+    if len(version_ids) < 2:
+        return "有效版本不足 2 个"
+
+    missing_ids = sorted(version_ids - set(current_items_by_id))
+    if missing_ids:
+        return f"Emby 中有 {len(missing_ids)} 个版本已不存在或无法读取"
+
+    current_items = [current_items_by_id[emby_id] for emby_id in version_ids]
+    if item_type == 'Movie':
+        if not is_valid_tmdb_id(expected_tmdb_id):
+            return f"媒体记录使用了无效 TMDb ID: {expected_tmdb_id}"
+        expected_tmdb_id = str(expected_tmdb_id)
+        for item in current_items:
+            current_tmdb_id = (item.get('ProviderIds') or {}).get('Tmdb')
+            if item.get('Type') != 'Movie' or not is_valid_tmdb_id(current_tmdb_id):
+                return f"版本 {item.get('Id')} 缺少可信的电影身份"
+            if str(current_tmdb_id) != expected_tmdb_id:
+                return f"版本 {item.get('Id')} 的 TMDb ID 与任务不一致"
+        return None
+
+    if item_type == 'Episode':
+        episode_keys = set()
+        for item in current_items:
+            key = (item.get('SeriesId'), item.get('ParentIndexNumber'), item.get('IndexNumber'))
+            if item.get('Type') != 'Episode' or not key[0] or key[1] is None or key[2] is None:
+                return f"版本 {item.get('Id')} 缺少可信的分集身份"
+            episode_keys.add(tuple(str(value) for value in key))
+        if len(episode_keys) != 1:
+            return "候选版本并非同一剧集、季和集"
+        return None
+
+    return f"不支持清理媒体类型: {item_type}"
+
 # ======================================================================
 # 任务函数
 # ======================================================================
@@ -330,7 +404,7 @@ def task_scan_for_cleanup_issues(processor):
                 t.in_library = TRUE 
                 AND jsonb_array_length(t.asset_details_json) > 1
                 AND (
-                    (t.item_type = 'Movie' AND t.tmdb_id = ANY(%(movie_ids)s))
+                    (t.item_type = 'Movie' AND t.tmdb_id ~ '^[1-9][0-9]*$' AND t.tmdb_id = ANY(%(movie_ids)s))
                     OR
                     (t.item_type = 'Episode' AND t.parent_series_tmdb_id = ANY(%(series_ids)s))
                 )
@@ -352,9 +426,16 @@ def task_scan_for_cleanup_issues(processor):
             task_manager.update_status_from_thread(100, "扫描完成：未发现任何多版本媒体。")
             return
 
+        candidate_emby_ids = _collect_unique_emby_ids_from_assets(multi_version_items)
+        current_items_by_id = _fetch_current_cleanup_items(processor, candidate_emby_ids)
+        missing_count = len(candidate_emby_ids) - len(current_items_by_id)
+        if missing_count > 0:
+            logger.info(f"  ➜ [媒体去重] 扫描前剔除 {missing_count} 个 Emby 已不存在的版本缓存。")
+
         task_manager.update_status_from_thread(10, f"发现 {total_items} 组多版本媒体，开始分析...")
         
         cleanup_index_entries = []
+        rejected_identity_count = 0
         for i, item in enumerate(multi_version_items):
             progress = 10 + int((i / total_items) * 80)
             # 获取标题用于日志
@@ -370,14 +451,25 @@ def task_scan_for_cleanup_issues(processor):
             raw_versions = item['asset_details_json']
             unique_versions_map = {}
             for v in raw_versions:
-                eid = v.get('emby_item_id')
-                if eid:
+                eid = str(v.get('emby_item_id') or '').strip()
+                if eid and eid in current_items_by_id:
                     unique_versions_map[eid] = v
             
             versions_from_db = list(unique_versions_map.values())
 
             # ★★★ 二次检查：去重后如果只剩1个版本，说明是脏数据，直接跳过 ★★★
             if len(versions_from_db) < 2: continue
+
+            identity_error = _validate_cleanup_identity(
+                item['tmdb_id'], item['item_type'], versions_from_db, current_items_by_id
+            )
+            if identity_error:
+                rejected_identity_count += 1
+                logger.error(
+                    f"  🚫 [媒体去重安全拦截] '{display_title}' 的版本身份异常："
+                    f"{identity_error}。本组不会进入删除列表。"
+                )
+                continue
 
             # =================================================
             # ★★★ 核心逻辑分叉 ★★★
@@ -449,6 +541,8 @@ def task_scan_for_cleanup_issues(processor):
             cleanup_db.batch_upsert_cleanup_index(cleanup_index_entries)
 
         final_message = f"扫描完成！共发现 {len(cleanup_index_entries)} 组需要清理的多版本媒体。"
+        if rejected_identity_count:
+            final_message += f" 已安全拦截 {rejected_identity_count} 组身份异常数据。"
         task_manager.update_status_from_thread(100, final_message)
         logger.info(f"--- '{task_name}' 任务成功完成 ---")
 
@@ -492,6 +586,23 @@ def task_execute_cleanup(processor, task_ids: List[int], **kwargs):
                     title_row = cursor.fetchone()
                     item_name = title_row['title'] if title_row else '未知媒体'
 
+            versions = task['versions_info_json']
+            version_ids = [
+                str(version.get('id') or '').strip()
+                for version in versions or []
+                if str(version.get('id') or '').strip()
+            ]
+            current_items_by_id = _fetch_current_cleanup_items(processor, version_ids)
+            identity_error = _validate_cleanup_identity(
+                task['tmdb_id'], task['item_type'], versions, current_items_by_id
+            )
+            if identity_error:
+                logger.error(
+                    f"  🚫 [删除前安全拦截] '{item_name}' 的版本身份校验失败："
+                    f"{identity_error}。本任务未执行任何删除。"
+                )
+                continue
+
             raw_best_val = task['best_version_json']
             safe_ids_set = set()
 
@@ -505,7 +616,6 @@ def task_execute_cleanup(processor, task_ids: List[int], **kwargs):
                 logger.error(f"  🚫 严重错误：无法确定 '{item_name}' 的保留版本... 跳过。")
                 continue
 
-            versions = task['versions_info_json']
             task_manager.update_status_from_thread(int((i / total) * 100), f"({i+1}/{total}) 正在清理: {item_name}")
 
             for version in versions:

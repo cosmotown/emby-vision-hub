@@ -156,6 +156,29 @@ def _fetch_sorted_items_via_emby_proxy(user_id, item_ids, sort_by, sort_order, l
         logger.error(f"  ➜ Emby代理排序或内存回退时失败: {e}", exc_info=True)
         return {"Items": [], "TotalRecordCount": 0}
 
+def _virtual_library_collection_type(definition):
+    """Expose virtual views without impersonating a native movie library."""
+    if isinstance(definition, str):
+        try:
+            definition = json.loads(definition)
+        except (TypeError, ValueError):
+            definition = {}
+    if not isinstance(definition, dict):
+        definition = {}
+
+    item_types = definition.get('item_type', [])
+    if isinstance(item_types, str):
+        item_types = [item_types]
+    normalized_types = {
+        str(item_type).strip().lower()
+        for item_type in item_types or []
+        if str(item_type).strip()
+    }
+
+    if normalized_types and normalized_types <= {'series', 'season', 'episode'}:
+        return 'tvshows'
+    return 'mixed'
+
 def handle_get_views():
     """
     获取用户的主页视图列表。
@@ -201,11 +224,7 @@ def handle_get_views():
             image_tags = {"Primary": f"{real_emby_collection_id}?timestamp={int(time.time())}"}
             definition = coll.get('definition_json') or {}
             
-            item_type_from_db = definition.get('item_type', 'Movie')
-            collection_type = "mixed"
-            if not (isinstance(item_type_from_db, list) and len(item_type_from_db) > 1):
-                 authoritative_type = item_type_from_db[0] if isinstance(item_type_from_db, list) and item_type_from_db else item_type_from_db if isinstance(item_type_from_db, str) else 'Movie'
-                 collection_type = "tvshows" if authoritative_type == 'Series' else "movies"
+            collection_type = _virtual_library_collection_type(definition)
 
             fake_view = {
                 "Name": coll['name'], "ServerId": real_server_id, "Id": mimicked_id,
@@ -263,11 +282,7 @@ def handle_get_mimicked_library_details(user_id, mimicked_id):
         image_tags = {"Primary": real_emby_collection_id} if real_emby_collection_id else {}
         
         definition = coll.get('definition_json') or {}
-        item_type_from_db = definition.get('item_type', 'Movie')
-        collection_type = "mixed"
-        if not (isinstance(item_type_from_db, list) and len(item_type_from_db) > 1):
-             authoritative_type = item_type_from_db[0] if isinstance(item_type_from_db, list) and item_type_from_db else item_type_from_db if isinstance(item_type_from_db, str) else 'Movie'
-             collection_type = "tvshows" if authoritative_type == 'Series' else "movies"
+        collection_type = _virtual_library_collection_type(definition)
 
         fake_library_details = {
             "Name": coll['name'], "ServerId": real_server_id, "Id": mimicked_id,

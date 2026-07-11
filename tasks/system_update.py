@@ -30,6 +30,33 @@ def _update_process_generator(container_name, image_name_tag):
             yield {"status": f"无法连接 Docker 守护进程: {e}", "event": "ERROR"}
             return
 
+        try:
+            target_repository = image_name_tag.rsplit(':', 1)[0]
+            target_tag = image_name_tag.rsplit(':', 1)[1] if ':' in image_name_tag.rsplit('/', 1)[-1] else 'latest'
+            target_container = client.containers.get(container_name)
+            current_image = (target_container.attrs.get('Config') or {}).get('Image', '')
+            current_repository = current_image.rsplit(':', 1)[0] if ':' in current_image.rsplit('/', 1)[-1] else current_image
+            current_tag = current_image.rsplit(':', 1)[1] if ':' in current_image.rsplit('/', 1)[-1] else 'latest'
+
+            if current_repository != target_repository:
+                yield {
+                    "status": f"当前容器镜像为 {current_image or '未知'}，不是受管理的 {target_repository}:latest。为避免覆盖部署，已取消更新。",
+                    "event": "ERROR",
+                }
+                return
+            if current_tag != target_tag:
+                yield {
+                    "status": f"当前容器固定在 {current_image}。网页更新只更新 latest，请先在 compose 中改为 {image_name_tag} 并重新部署一次。",
+                    "event": "ERROR",
+                }
+                return
+        except docker.errors.NotFound:
+            yield {"status": f"找不到名为 '{container_name}' 的容器，无法执行更新。", "event": "ERROR"}
+            return
+        except Exception as e:
+            yield {"status": f"无法校验当前 Docker 容器镜像: {e}", "event": "ERROR"}
+            return
+
         yield {"status": f"正在检查并拉取最新镜像: {image_name_tag}..."}
         
         # 使用流式 API 拉取镜像

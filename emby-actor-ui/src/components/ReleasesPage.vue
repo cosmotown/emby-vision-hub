@@ -16,13 +16,13 @@
           反馈问题
         </n-button>
         
-        <n-button 
-          v-if="appStore.isUpdateAvailable" 
-          type="success" 
+        <n-button
+          type="success"
           @click="handleUpdate"
           :loading="isUpdating"
+          :disabled="isUpdating"
         >
-          立即更新
+          {{ appStore.isUpdateAvailable ? '立即更新' : '检查并更新' }}
         </n-button>
       </template>
     </n-page-header>
@@ -130,8 +130,8 @@ let eventSource = null;
 const handleUpdate = () => {
   dialog.warning({
     title: '确认更新',
-    content: '这将拉取最新的镜像并重启应用，期间服务将短暂中断。确定要继续吗？',
-    positiveText: '立即更新',
+    content: '将从 DockerHub 拉取 tzyzero186/emby-toolkit:latest 并重启应用，期间服务将短暂中断。确定要继续吗？',
+    positiveText: '检查并更新',
     negativeText: '取消',
     onPositiveClick: () => {
       // 重置状态

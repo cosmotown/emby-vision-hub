@@ -306,7 +306,10 @@ class PosterEngine:
         for poster in posters:
             source = poster.convert('RGBA')
             background = ImageOps.fit(source, size, method=Image.LANCZOS).convert('RGBA')
-            background = ImageEnhance.Brightness(background).enhance(0.35)
+            # Let each template's overlay control readability. The old 0.35
+            # multiplier made every backdrop look washed out before its own
+            # darkness setting was even applied.
+            background = ImageEnhance.Brightness(background).enhance(0.68)
             if blur_radius:
                 background = background.filter(ImageFilter.GaussianBlur(blur_radius))
             backgrounds.append(Image.alpha_composite(background, overlay))
@@ -375,13 +378,17 @@ class PosterEngine:
         if not raw_posters:
             return self._draw_dynamic_tiled_cover(bg, config, assets, font_loader, output)
 
-        # Keep the complete poster visible over a dark, aspect-preserving backdrop.
+        # The legacy mask value was calibrated for a full-size static cover.
+        # At dynamic output size it made the supplied Backdrop almost black.
+        # Preserve the user's relative setting while using a lighter dynamic mask.
+        legacy_mask_opacity = int(config.get('mask_opacity', 180))
+        background_mask_opacity = max(0, min(135, int(legacy_mask_opacity * 0.52)))
         background_blur = max(0, int(float(config.get('dynamic_bg_blur', 0)) * scale_factor))
         backgrounds = self._make_dynamic_backgrounds(
             self._dynamic_background_sources(assets, raw_posters),
             (target_w, target_h),
             background_blur,
-            int(config.get('mask_opacity', 180)),
+            background_mask_opacity,
         )
         fonts = self._dynamic_fonts(config, font_loader, scale_factor, title_default=160, subtitle_default=80)
         badge_config = self._dynamic_badge_config(config, scale_factor)
@@ -459,7 +466,8 @@ class PosterEngine:
         target_h = int(target_w * 9 / 16)
         scale_factor = target_w / 1920
         total_frames = _clamp_int(config.get('anim_frames', 36), 36, 1, 48)
-        duration = _clamp_int(config.get('anim_duration', 500), 500, 80, 1000)
+        page_hold_duration = _clamp_int(config.get('page_hold_duration', 3200), 3200, 1000, 6000)
+        page_transition_duration = _clamp_int(config.get('page_transition_duration', 80), 80, 50, 250)
         poster_urls = list(assets.get('posters') or [])
         if not poster_urls:
             return self._draw_dynamic_tiled_cover(bg, config, assets, font_loader, output)
@@ -476,7 +484,7 @@ class PosterEngine:
             self._dynamic_background_sources(assets, raw_posters),
             (target_w, target_h),
             blur,
-            110,
+            _clamp_int(config.get('bg_overlay_opacity', 65), 65, 0, 160),
         )
         fonts = self._dynamic_fonts(config, font_loader, scale_factor, title_default=160, subtitle_default=80)
         badge_config = self._dynamic_badge_config(config, scale_factor)
@@ -488,32 +496,85 @@ class PosterEngine:
 
         cards = [self._make_dynamic_card(poster, card_size, radius) for poster in raw_posters]
         blurred_layers = [
-            [card.filter(ImageFilter.GaussianBlur((2 - layer_index) * max(1, int(4 * scale_factor)))) for layer_index in range(2)]
+            card.filter(ImageFilter.GaussianBlur(max(1, int(4 * scale_factor))))
             for card in cards
         ]
         frames = []
-        for frame_idx in range(total_frames):
-            active = (frame_idx / total_frames) * len(raw_posters)
-            page = int(active)
-            local = active - page
-            transition = max(0.0, min(1.0, (local - 0.5) / 0.5))
-            transition = transition * transition * (3 - 2 * transition)
-            idle_sway = math.sin(local * math.pi) * 1.5
-            current = cards[page]
-            upcoming = cards[(page + 1) % len(cards)]
-            frame = backgrounds[page].copy()
-            if transition:
-                frame = Image.blend(frame, backgrounds[(page + 1) % len(backgrounds)], transition)
-            for layer_index, angle in enumerate(angles[:2]):
-                layer = blurred_layers[page][layer_index]
-                self._paste_rotated_card(frame, layer, center_x, center_y, angle + idle_sway * 0.35, opacity=130, shadow_opacity=70, shadow_blur=max(1, int(4 * scale_factor)))
-            self._paste_rotated_card(frame, current, center_x, center_y, angles[2] + idle_sway - 12 * transition, opacity=int(255 * (1 - transition)), shadow_opacity=130, shadow_blur=max(1, int(5 * scale_factor)))
-            if transition:
-                self._paste_rotated_card(frame, upcoming, center_x, center_y, 12 * (1 - transition) - idle_sway, opacity=int(255 * transition), shadow_opacity=130, shadow_blur=max(1, int(5 * scale_factor)))
-            self._draw_dynamic_layout_text(frame, config, fonts, scale_factor, 'rotate')
-            frames.append(self._draw_badge(frame, badge_config, assets.get('count', 0), fonts))
+        frame_durations = []
+        front_x = center_x
+        middle_x = center_x + int(card_size * 0.11)
+        rear_x = center_x + int(card_size * 0.22)
+        incoming_x = center_x + int(card_size * 0.33)
 
-        frames[0].save(output, format='PNG', save_all=True, append_images=frames[1:], duration=duration, loop=0, optimize=False)
+        def _lerp(start, end, progress):
+            return int(start + (end - start) * progress)
+
+        # Keep three fixed stack positions. On each page change the front card
+        # exits, the two following cards advance, and a new card fills the rear.
+        # This reads as a deliberate replacement, rather than one card rotating.
+        transition_steps = max(3, min(5, (total_frames // len(cards)) - 1))
+        for page in range(len(cards)):
+            for step in range(transition_steps + 1):
+                transition = step / transition_steps
+                eased = transition * transition * (3 - 2 * transition)
+                frame = backgrounds[page].copy()
+                if transition:
+                    frame = Image.blend(frame, backgrounds[(page + 1) % len(backgrounds)], eased)
+
+                outgoing = page
+                front = (page + 1) % len(cards)
+                middle = (page + 2) % len(cards)
+                rear = (page + 3) % len(cards)
+
+                # Draw from rear to front, then let the outgoing front card
+                # leave to the left. This gives each poster a visible stage
+                # position instead of making the whole stack spin in place.
+                self._paste_rotated_card(
+                    frame,
+                    blurred_layers[rear],
+                    _lerp(incoming_x, rear_x, eased),
+                    center_y,
+                    angles[0],
+                    opacity=int(75 * eased),
+                    shadow_opacity=50,
+                    shadow_blur=max(1, int(3 * scale_factor)),
+                )
+                self._paste_rotated_card(
+                    frame,
+                    blurred_layers[middle],
+                    _lerp(rear_x, middle_x, eased),
+                    center_y,
+                    angles[0] - (angles[0] - angles[1]) * eased,
+                    opacity=int(80 + 70 * eased),
+                    shadow_opacity=65,
+                    shadow_blur=max(1, int(3 * scale_factor)),
+                )
+                self._paste_rotated_card(
+                    frame,
+                    cards[front],
+                    _lerp(middle_x, front_x, eased),
+                    center_y,
+                    angles[1] * (1 - eased),
+                    opacity=int(105 + 150 * eased),
+                    shadow_opacity=90,
+                    shadow_blur=max(1, int(4 * scale_factor)),
+                )
+                if transition < 1:
+                    self._paste_rotated_card(
+                        frame,
+                        cards[outgoing],
+                        _lerp(front_x, front_x - int(card_size * 0.3), eased),
+                        center_y,
+                        angles[2] - 8 * eased,
+                        opacity=int(255 * (1 - eased)),
+                        shadow_opacity=130,
+                        shadow_blur=max(1, int(5 * scale_factor)),
+                    )
+                self._draw_dynamic_layout_text(frame, config, fonts, scale_factor, 'rotate')
+                frames.append(self._draw_badge(frame, badge_config, assets.get('count', 0), fonts))
+                frame_durations.append(page_hold_duration if step == 0 else page_transition_duration)
+
+        frames[0].save(output, format='PNG', save_all=True, append_images=frames[1:], duration=frame_durations, loop=0, optimize=False)
 
     def _draw_dynamic_rotate_stack_cover(self, bg, config, assets, font_loader, output):
         target_w = _clamp_int(config.get('dynamic_output_width', 360), 360, 320, 360)

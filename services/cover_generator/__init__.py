@@ -456,18 +456,35 @@ class CoverGeneratorService:
             return []
 
     def __deduplicate_items_by_image(self, items: List[Dict], limit: int) -> List[Dict]:
-        """Prevent multi-poster templates from repeating shared primary artwork."""
+        """Prevent multi-poster templates from repeating shared Emby artwork."""
         unique_items = []
-        seen_image_urls = set()
+        seen_image_keys = set()
         for item in items:
-            image_url = self.__get_image_url(item)
-            if not image_url or image_url in seen_image_urls:
+            image_key = self.__get_image_identity(item)
+            if not image_key or image_key in seen_image_keys:
                 continue
-            seen_image_urls.add(image_url)
+            seen_image_keys.add(image_key)
             unique_items.append(item)
             if len(unique_items) >= limit:
                 break
         return unique_items
+
+    def __get_image_identity(self, item: Dict[str, Any]) -> Optional[str]:
+        """Return the Emby image identity without the child-item URL wrapper.
+
+        Episodes and virtual-library entries can expose one shared poster under
+        different ``/Items/<id>/Images/...`` URLs. Their tag is the stable image
+        identity, so comparing URLs alone still lets the same artwork through.
+        """
+        use_primary = (self._cover_style.startswith('single') and self._single_use_primary) or \
+                      (self._cover_style.startswith('multi') and self._multi_1_use_primary) or \
+                      self._cover_style == 'chillposter'
+
+        primary_tag = (item.get('ImageTags') or {}).get('Primary') or item.get('PrimaryImageTag')
+        primary_identity = f"primary:{primary_tag}" if primary_tag else None
+        backdrop_tags = item.get('BackdropImageTags') or []
+        backdrop_identity = f"backdrop:{backdrop_tags[0]}" if backdrop_tags else None
+        return (primary_identity or backdrop_identity) if use_primary else (backdrop_identity or primary_identity)
 
     def __get_image_url(self, item: Dict[str, Any]) -> str:
         primary_url = self.__get_primary_image_url(item)

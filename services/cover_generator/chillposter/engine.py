@@ -319,6 +319,20 @@ class PosterEngine:
         return backgrounds
 
     @staticmethod
+    def _make_theme_gradient(source, size):
+        """Match the rotate-stack static layout's poster-derived gradient."""
+        theme = source.convert('RGB').resize((1, 1), Image.Resampling.BICUBIC).getpixel((0, 0))
+        left = tuple(max(0, min(255, int(channel * 0.6))) for channel in theme)
+        right = tuple(max(0, min(255, int(channel * 1.2))) for channel in theme)
+        strip = Image.new('RGB', (256, 1))
+        draw = ImageDraw.Draw(strip)
+        for x in range(256):
+            ratio = x / 255
+            color = tuple(int(start * (1 - ratio) + end * ratio) for start, end in zip(left, right))
+            draw.point((x, 0), fill=color)
+        return strip.resize(size, Image.Resampling.BICUBIC).convert('RGBA')
+
+    @staticmethod
     def _quantize_animation_frames(frames, colors=192):
         """Build one representative palette for compact, compatible APNG output."""
         sample_count = min(16, len(frames))
@@ -611,9 +625,10 @@ class PosterEngine:
         while len(raw_posters) < 9:
             raw_posters.extend(raw_posters)
 
-        background_source = self._dynamic_background_sources(assets, raw_posters)[0]
-        background_blur = max(0, int(float(config.get('dynamic_bg_blur', 0)) * scale_factor))
-        base = self._make_dynamic_backgrounds([background_source], (target_w, target_h), background_blur, 0)[0]
+        # This layout already has three continuously moving tracks. Keep the
+        # quieter poster-derived gradient used by its static counterpart instead
+        # of adding another moving full-frame image behind the title.
+        base = self._make_theme_gradient(raw_posters[0], (target_w, target_h))
         fonts = self._dynamic_fonts(config, font_loader, scale_factor, title_default=160, subtitle_default=50)
         badge_config = self._dynamic_badge_config(config, scale_factor)
         # Reuse the static template's geometry. The static renderer builds and

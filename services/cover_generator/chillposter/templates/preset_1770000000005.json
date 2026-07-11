@@ -20,6 +20,7 @@
         "backdrop_count": 9,
         "corner_radius": 46,
         "rotation": "-16",
+        "start_x": 450,
         "title_size": 160,
         "title_x": 5,
         "title_y": 40,

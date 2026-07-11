@@ -2,6 +2,21 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.0.24",
+        "published_at": "2026-07-11T22:19:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.0.24",
+        "changelog": """## 旋转堆叠构图收尾
+
+### 修复
+- 旋转堆叠动态模板的三条轨道整体右移约 19px，恢复左侧标题留白，避免轨道压住文字区域。
+- 旋转堆叠背景恢复静态模板同款的海报主题色横向渐变，取消该模板的全幅海报背景，减少画面干扰和素材重复感。
+
+### 调整
+- 旋转堆叠不再叠加动态背景的 12% 遮罩；其他动态模板继续保留原有轻遮罩。
+- 固定渐变背景降低 APNG 体积和渲染开销，三列 160 帧反向循环逻辑保持不变。
+""",
+    },
+    {
         "version": "v7.0.23",
         "published_at": "2026-07-11T20:41:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.0.23",

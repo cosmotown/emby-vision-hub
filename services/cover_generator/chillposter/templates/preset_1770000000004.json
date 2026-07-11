@@ -14,7 +14,7 @@
         "anim_frames": "36",
         "page_hold_duration": "3200",
         "page_transition_duration": "80",
-        "bg_overlay_opacity": "65",
+        "bg_overlay_opacity": "0",
         "poster_count": 6,
         "backdrop_count": 6,
         "card_scale": 0.65,

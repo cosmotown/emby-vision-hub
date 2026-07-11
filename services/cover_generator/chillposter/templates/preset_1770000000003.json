@@ -26,7 +26,7 @@
         "blur_radius": "0",
         "poster_radius": 20,
         "poster_gap": 140,
-        "mask_opacity": "180",
+        "mask_opacity": "0",
         "title_size": 160,
         "title_color": "#FFFFFF",
         "subtitle_size": 80,

@@ -14,8 +14,8 @@
         "font_title": "剑豪体.ttf",
         "font_subtitle": "剑豪体.ttf",
         "enable_animation": true,
-        "anim_frames": "54",
-        "anim_duration": "333",
+        "anim_frames": "120",
+        "anim_duration": "150",
         "poster_count": 9,
         "backdrop_count": 9,
         "corner_radius": 46,
@@ -27,7 +27,8 @@
         "sub_size": 50,
         "sub_x": 8,
         "sub_y": 58,
-        "bg_blur_radius": 60,
+        "bg_blur_radius": 0,
+        "dynamic_bg_blur": 0,
         "badge_border_opacity": "23"
     }
 }

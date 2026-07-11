@@ -616,55 +616,73 @@ class PosterEngine:
         base = self._make_dynamic_backgrounds([background_source], (target_w, target_h), background_blur, 0)[0]
         fonts = self._dynamic_fonts(config, font_loader, scale_factor, title_default=160, subtitle_default=50)
         badge_config = self._dynamic_badge_config(config, scale_factor)
-        cell_h = max(60, int(target_h * 0.48))
-        cell_w = max(44, int(cell_h * 0.666))
+        # Reuse the static template's geometry. The static renderer builds and
+        # rotates a complete column; rotating cards individually changes both
+        # their spacing and their apparent column alignment.
+        cell_w = max(36, int(float(config.get('cell_width', 410)) * scale_factor))
+        cell_h = max(54, int(float(config.get('cell_height', 610)) * scale_factor))
         radius = max(3, int(float(config.get('corner_radius', 46)) * scale_factor))
         rotation = float(config.get('rotation', -16))
+        start_x = int(float(config.get('start_x', 350)) * scale_factor)
+        start_y = int(float(config.get('start_y', -200)) * scale_factor)
+        column_gap = int(float(config.get('col_spacing', 50)) * scale_factor)
+        column_step_x = cell_w - max(1, int(50 * scale_factor)) + column_gap
+        column_step_y = int(-80 * scale_factor)
+        shadow_offset = max(1, int(15 * scale_factor))
+        shadow_blur = max(1, int(15 * scale_factor))
+        overlap = max(1, int(30 * scale_factor))
+        margin_y = max(1, int(22 * scale_factor))
+
+        def _make_static_card(raw):
+            card = self._rounded(
+                ImageOps.fit(raw, (cell_w, cell_h), method=Image.LANCZOS).convert('RGBA'),
+                radius,
+            )
+            shadow_w = cell_w + shadow_offset + shadow_blur * 2
+            shadow_h = cell_h + shadow_offset + shadow_blur * 2
+            shadow = Image.new('RGBA', (shadow_w, shadow_h), (0, 0, 0, 0))
+            shadow_layer = Image.new('RGBA', (cell_w, cell_h), (0, 0, 0, 180))
+            shadow.paste(shadow_layer, (shadow_blur + shadow_offset, shadow_blur + shadow_offset))
+            shadow = shadow.filter(ImageFilter.GaussianBlur(shadow_blur))
+            result = Image.new('RGBA', (shadow_w, shadow_h), (0, 0, 0, 0))
+            result.paste(shadow, (0, 0), mask=shadow)
+            result.paste(card, (shadow_blur, shadow_blur), mask=card)
+            return result
+
         columns = []
-        shadow_blur = max(1, int(4 * scale_factor))
         for column_index in range(3):
             columns.append([
-                self._make_rotated_card_layer(
-                    self._rounded(
-                        ImageOps.fit(raw_posters[column_index * 3 + row_index], (cell_w, cell_h), method=Image.LANCZOS).convert('RGBA'),
-                        radius,
-                    ),
-                    rotation,
-                    shadow_opacity=105,
-                    shadow_blur=shadow_blur,
-                )
+                _make_static_card(raw_posters[column_index * 3 + row_index])
                 for row_index in range(3)
             ])
 
         frames = []
-        # Keep the left title area clear and let each lane loop independently.
-        # Drawing the neighbouring loop copies prevents a lane from disappearing
-        # while its first card wraps from one edge to the other.
-        lane_centers = [int(target_w * 0.55), int(target_w * 0.75), int(target_w * 0.95)]
-        row_stride = int(cell_h * 0.92)
+        card_layer_h = columns[0][0].height
+        row_stride = max(1, card_layer_h - overlap)
         loop_height = row_stride * 3
-        lane_offsets = [0, -int(row_stride * 0.18), -int(row_stride * 0.36)]
+        column_view_h = card_layer_h * 3 + margin_y * 3
         for frame_idx in range(total_frames):
             frame = base.copy()
             for column_index, cards in enumerate(columns):
-                # Outer lanes move downward while the centre lane moves upward.
+                # Build one complete moving column, then rotate and place it
+                # with the exact same top-left coordinates as the static layout.
                 direction = -1 if column_index == 1 else 1
                 scroll = direction * (frame_idx / total_frames) * loop_height
+                column_canvas = Image.new('RGBA', (cards[0].width, column_view_h), (0, 0, 0, 0))
                 for row_index, card_layer in enumerate(cards):
                     phase = (row_index * row_stride + scroll) % loop_height
-                    center_y = phase - row_stride + lane_offsets[column_index]
                     for wrap_offset in (-loop_height, 0, loop_height):
-                        draw_center_y = center_y + wrap_offset
-                        if draw_center_y < -card_layer.height / 2 or draw_center_y > target_h + card_layer.height / 2:
+                        draw_y = int(phase + wrap_offset)
+                        if draw_y <= -card_layer.height or draw_y >= column_view_h:
                             continue
-                        frame.paste(
-                            card_layer,
-                            (
-                                int(lane_centers[column_index] - card_layer.width / 2),
-                                int(draw_center_y - card_layer.height / 2),
-                            ),
-                            mask=card_layer,
-                        )
+                        column_canvas.paste(card_layer, (0, draw_y), mask=card_layer)
+
+                rotated_column = column_canvas.rotate(rotation, resample=Image.BICUBIC, expand=True)
+                frame.paste(
+                    rotated_column,
+                    (start_x + column_index * column_step_x, start_y + column_index * column_step_y),
+                    mask=rotated_column,
+                )
             self._draw_dynamic_layout_text(frame, config, fonts, scale_factor, 'rotate_stack')
             frames.append(self._draw_badge(frame, badge_config, assets.get('count', 0), fonts))
 
@@ -1052,7 +1070,7 @@ class PosterEngine:
         scale_factor = target_w / 1920
         page_hold_duration = _clamp_int(config.get('page_hold_duration', 3100), 3100, 1000, 6000)
         page_transition_duration = _clamp_int(config.get('page_transition_duration', 100), 100, 50, 250)
-        transition_steps = 10
+        transition_frames_per_slot = 2
 
         poster_urls = list(assets.get('posters') or [])
         if not poster_urls:
@@ -1130,24 +1148,28 @@ class PosterEngine:
         frames = []
         frame_durations = []
         for page in range(len(raw_posters)):
+            transition_steps = count * transition_frames_per_slot
             for step in range(transition_steps + 1):
-                transition = 0 if step == 0 else step / (transition_steps + 1)
-                center_start = 0.15
-                center_progress = max(0.0, min(1.0, (transition - center_start) / 0.7))
-                center_eased = center_progress * center_progress * (3 - 2 * center_progress)
                 frame = backgrounds[page].copy()
-                if transition:
-                    frame = Image.blend(frame, backgrounds[(page + 1) % len(backgrounds)], center_eased)
+
+                active_slot = -1 if step == 0 else min(count - 1, (step - 1) // transition_frames_per_slot)
+                active_progress = 0.0 if step == 0 else ((step - 1) % transition_frames_per_slot + 1) / transition_frames_per_slot
+                active_eased = active_progress * active_progress * (3 - 2 * active_progress)
+
+                center_slot = half_count
+                if active_slot > center_slot:
+                    frame = backgrounds[(page + 1) % len(backgrounds)].copy()
+                elif active_slot == center_slot:
+                    frame = Image.blend(frame, backgrounds[(page + 1) % len(backgrounds)], active_eased)
 
                 for relative, abs_relative, x, y, layers in sorted(slot_layers, key=lambda item: item[1], reverse=True):
+                    slot_rank = relative + half_count
                     current = layers[(page + relative) % len(raw_posters)]
-                    if transition:
-                        upcoming = layers[(page + relative + 1) % len(raw_posters)]
-                        slot_rank = relative + half_count
-                        slot_start = (slot_rank / max(1, count - 1)) * 0.3
-                        slot_progress = max(0.0, min(1.0, (transition - slot_start) / 0.7))
-                        slot_eased = slot_progress * slot_progress * (3 - 2 * slot_progress)
-                        card = Image.blend(current, upcoming, slot_eased)
+                    upcoming = layers[(page + relative + 1) % len(raw_posters)]
+                    if slot_rank < active_slot:
+                        card = upcoming
+                    elif slot_rank == active_slot:
+                        card = Image.blend(current, upcoming, active_eased)
                     else:
                         card = current
                     frame.paste(card, (int(x - card.width / 2), int(y - card.height / 2)), mask=card)

@@ -51,8 +51,28 @@ def get_github_releases(owner: str, repo: str, token: Optional[str] = None, prox
                 "url": release.get("html_url")
             })
         
-        logger.trace(f"成功从 GitHub 获取到 {len(parsed_releases)} 个 release。")
-        return parsed_releases
+        if parsed_releases:
+            logger.trace(f"成功从 GitHub 获取到 {len(parsed_releases)} 个 release。")
+            return parsed_releases
+
+        # Forks that publish only Git tags should still be able to discover a
+        # newer version. A proper GitHub Release will provide richer notes once
+        # available, while tags remain a reliable fallback for version checks.
+        tags_url = f"https://api.github.com/repos/{owner}/{repo}/tags"
+        tags_response = requests.get(tags_url, headers=headers, timeout=20, proxies=proxies)
+        tags_response.raise_for_status()
+        parsed_tags = [
+            {
+                "version": tag.get("name"),
+                "published_at": None,
+                "changelog": "远端版本已发布，更新后可查看完整更新记录。",
+                "url": f"https://github.com/{owner}/{repo}/tree/{tag.get('name')}",
+            }
+            for tag in tags_response.json()
+            if tag.get("name")
+        ]
+        logger.trace(f"GitHub Releases 为空，改从 Tags 获取到 {len(parsed_tags)} 个版本。")
+        return parsed_tags
 
     except requests.exceptions.RequestException as e:
         logger.error(f"请求 GitHub API 时发生网络错误: {e}", exc_info=True)

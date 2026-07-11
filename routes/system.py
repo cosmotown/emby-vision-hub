@@ -11,6 +11,7 @@ import task_manager
 from logger_setup import frontend_log_queue
 import config_manager
 import handler.emby as emby
+import handler.github as github
 # 导入共享模块
 import extensions
 from extensions import admin_required, task_lock_required
@@ -349,12 +350,38 @@ def api_delete_custom_theme():
 @system_bp.route('/system/about_info', methods=['GET'])
 def get_about_info():
     """
-    获取关于页面的版本信息和本分支维护的更新记录。
+    获取当前版本，并合并远端发布信息与本地详细更新记录。
     """
     try:
+        github_token = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_GITHUB_TOKEN)
+        remote_releases = github.get_github_releases(
+            owner=constants.GITHUB_REPO_OWNER,
+            repo=constants.GITHUB_REPO_NAME,
+            token=github_token,
+            proxies=config_manager.get_proxies_for_requests(),
+        ) or []
+
+        merged_by_version = {release.get("version"): dict(release) for release in CUSTOM_RELEASES if release.get("version")}
+        for remote in remote_releases:
+            version = remote.get("version")
+            if not version:
+                continue
+            local = merged_by_version.get(version, {})
+            merged_by_version[version] = {
+                "version": version,
+                "published_at": remote.get("published_at") or local.get("published_at"),
+                "changelog": local.get("changelog") or remote.get("changelog") or "远端版本已发布。",
+                "url": remote.get("url") or local.get("url"),
+            }
+
+        def version_key(release):
+            numbers = re.findall(r'\d+', release.get("version") or "")
+            return tuple(int(number) for number in numbers[:4])
+
+        releases = sorted(merged_by_version.values(), key=version_key, reverse=True)
         response_data = {
             "current_version": constants.APP_VERSION,
-            "releases": CUSTOM_RELEASES
+            "releases": releases,
         }
         return jsonify(response_data)
 

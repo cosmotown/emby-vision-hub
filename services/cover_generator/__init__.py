@@ -197,24 +197,45 @@ class CoverGeneratorService:
     def __generate_from_server(self, server_id: str, library: Dict[str, Any], title: Tuple[str, str], item_count: Optional[int] = None, content_types: Optional[List[str]] = None, custom_collection_data: Optional[Dict] = None) -> Union[bytes, str, None]:
         if self._cover_style == 'chillposter':
             required_items_count = get_chillposter_required_count(self._chillposter_template)
+            candidate_items_count = required_items_count * 6
         else:
             required_items_count = 1 if self._cover_style.startswith('single') else 9
-        items = self.__get_valid_items_from_library(server_id, library, required_items_count, content_types, custom_collection_data)
+            candidate_items_count = required_items_count
+        items = self.__get_valid_items_from_library(server_id, library, candidate_items_count, content_types, custom_collection_data)
         if not items:
             logger.warning(f"  ➜ 在媒体库 '{library['Name']}' 中找不到任何带有可用图片的媒体项。")
             return None
         if self._cover_style == 'chillposter':
             poster_paths = []
             backdrop_paths = []
+            poster_fingerprints = []
             poster_limit, backdrop_limit = get_chillposter_asset_counts(self._chillposter_template)
             for item in items:
+                if len(poster_paths) >= poster_limit and len(backdrop_paths) >= backdrop_limit:
+                    break
+                accepted_poster = poster_limit <= 0
                 if len(poster_paths) < poster_limit:
                     primary_url = self.__get_primary_image_url(item)
                     if primary_url:
                         path = self.__download_image(server_id, primary_url, library['Name'], len(poster_paths) + 1, prefix="chillposter_poster_")
                         if path:
-                            poster_paths.append(path)
-                if len(backdrop_paths) < backdrop_limit:
+                            fingerprint = self.__image_fingerprint(path)
+                            is_duplicate = fingerprint is not None and any(
+                                (fingerprint ^ existing).bit_count() <= 8
+                                for existing in poster_fingerprints
+                            )
+                            if is_duplicate:
+                                logger.debug("  ➜ 跳过视觉重复的 ChillPoster 海报: %s", item.get('Name') or item.get('Id'))
+                                try:
+                                    path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                            else:
+                                poster_paths.append(path)
+                                if fingerprint is not None:
+                                    poster_fingerprints.append(fingerprint)
+                                accepted_poster = True
+                if accepted_poster and len(backdrop_paths) < backdrop_limit:
                     backdrop_url = self.__get_backdrop_image_url(item)
                     if backdrop_url:
                         path = self.__download_image(server_id, backdrop_url, library['Name'], len(backdrop_paths) + 1, prefix="chillposter_backdrop_")
@@ -242,6 +263,22 @@ class CoverGeneratorService:
                 logger.warning(f"  ➜ 为多图模式下载图片失败。")
                 return None
             return self.__generate_image_from_path(library['Name'], title, image_paths, item_count)
+
+    @staticmethod
+    def __image_fingerprint(path: Path) -> Optional[int]:
+        """Return a small perceptual fingerprint for downloaded artwork."""
+        try:
+            with Image.open(path) as image:
+                pixels = list(image.convert('L').resize((17, 16), Image.LANCZOS).getdata())
+            fingerprint = 0
+            for row in range(16):
+                offset = row * 17
+                for column in range(16):
+                    fingerprint = (fingerprint << 1) | int(pixels[offset + column] > pixels[offset + column + 1])
+            return fingerprint
+        except Exception as exc:
+            logger.warning("  ➜ 无法计算封面图片指纹 %s: %s", path, exc)
+            return None
 
     def __get_valid_items_from_library(self, server_id: str, library: Dict[str, Any], limit: int, content_types: Optional[List[str]] = None, custom_collection_data: Optional[Dict] = None) -> List[Dict]:
         library_id = library.get("Id") or library.get("ItemId")

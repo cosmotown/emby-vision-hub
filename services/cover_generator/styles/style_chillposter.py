@@ -229,8 +229,10 @@ def create_chillposter_cover(
             anim_frames = 30
         if render_config.get("engine") == "聚焦C佬":
             frame_limit = 36
-        elif render_config.get("engine") in {"扇形展开", "旋转堆叠"}:
-            frame_limit = 54
+        elif render_config.get("engine") == "扇形展开":
+            frame_limit = 77
+        elif render_config.get("engine") == "旋转堆叠":
+            frame_limit = 160
         elif render_config.get("engine") == "旋转":
             frame_limit = 48
         else:

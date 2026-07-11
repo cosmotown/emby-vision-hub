@@ -13,8 +13,9 @@ logger = logging.getLogger(__name__)
 MAX_DYNAMIC_WIDTH = 640
 MAX_DYNAMIC_FRAMES = 72
 MAX_FOCUS_DYNAMIC_FRAMES = 36
-MAX_FAN_DYNAMIC_FRAMES = 54
-MAX_ROTATE_STACK_DYNAMIC_FRAMES = 120
+MAX_FAN_DYNAMIC_FRAMES = 77
+MAX_ROTATE_STACK_DYNAMIC_FRAMES = 160
+DYNAMIC_BACKGROUND_OVERLAY_OPACITY = 31
 
 def _clamp_int(value, default, min_value, max_value):
     try:
@@ -304,7 +305,7 @@ class PosterEngine:
         return self._rounded(card, radius)
 
     def _make_dynamic_backgrounds(self, posters, size, blur_radius, overlay_opacity):
-        overlay = Image.new('RGBA', size, (0, 0, 0, overlay_opacity))
+        overlay = Image.new('RGBA', size, (0, 0, 0, DYNAMIC_BACKGROUND_OVERLAY_OPACITY))
         backgrounds = []
         for poster in posters:
             source = poster.convert('RGBA')
@@ -316,6 +317,24 @@ class PosterEngine:
                 background = background.filter(ImageFilter.GaussianBlur(blur_radius))
             backgrounds.append(Image.alpha_composite(background, overlay))
         return backgrounds
+
+    @staticmethod
+    def _quantize_animation_frames(frames, colors=192):
+        """Build one representative palette for compact, compatible APNG output."""
+        sample_count = min(16, len(frames))
+        sample_width, sample_height = 64, 36
+        columns = 4
+        rows = max(1, math.ceil(sample_count / columns))
+        palette_sheet = Image.new('RGB', (columns * sample_width, rows * sample_height))
+        for sample_index in range(sample_count):
+            frame_index = round(sample_index * (len(frames) - 1) / max(1, sample_count - 1))
+            sample = ImageOps.fit(frames[frame_index].convert('RGB'), (sample_width, sample_height), method=Image.LANCZOS)
+            palette_sheet.paste(sample, ((sample_index % columns) * sample_width, (sample_index // columns) * sample_height))
+        palette = palette_sheet.quantize(colors=colors, method=Image.Quantize.MEDIANCUT)
+        return [
+            frame.convert('RGB').quantize(palette=palette, dither=Image.Dither.FLOYDSTEINBERG)
+            for frame in frames
+        ]
 
     def _dynamic_background_sources(self, assets, posters):
         """Prefer one landscape backdrop per poster; fall back to poster art if incomplete."""
@@ -649,7 +668,16 @@ class PosterEngine:
             self._draw_dynamic_layout_text(frame, config, fonts, scale_factor, 'rotate_stack')
             frames.append(self._draw_badge(frame, badge_config, assets.get('count', 0), fonts))
 
-        frames[0].save(output, format='PNG', save_all=True, append_images=frames[1:], duration=duration, loop=0, optimize=False)
+        quantized_frames = self._quantize_animation_frames(frames)
+        quantized_frames[0].save(
+            output,
+            format='PNG',
+            save_all=True,
+            append_images=quantized_frames[1:],
+            duration=duration,
+            loop=0,
+            optimize=False,
+        )
 
     def _focus_page_state(self, frame_idx, total_frames, poster_count):
         """Return the C-position and whether this frame belongs to a page hold."""
@@ -1024,7 +1052,7 @@ class PosterEngine:
         scale_factor = target_w / 1920
         page_hold_duration = _clamp_int(config.get('page_hold_duration', 3100), 3100, 1000, 6000)
         page_transition_duration = _clamp_int(config.get('page_transition_duration', 100), 100, 50, 250)
-        transition_steps = 5
+        transition_steps = 10
 
         poster_urls = list(assets.get('posters') or [])
         if not poster_urls:
@@ -1104,16 +1132,22 @@ class PosterEngine:
         for page in range(len(raw_posters)):
             for step in range(transition_steps + 1):
                 transition = 0 if step == 0 else step / (transition_steps + 1)
-                eased = transition * transition * (3 - 2 * transition)
+                center_start = 0.15
+                center_progress = max(0.0, min(1.0, (transition - center_start) / 0.7))
+                center_eased = center_progress * center_progress * (3 - 2 * center_progress)
                 frame = backgrounds[page].copy()
                 if transition:
-                    frame = Image.blend(frame, backgrounds[(page + 1) % len(backgrounds)], eased)
+                    frame = Image.blend(frame, backgrounds[(page + 1) % len(backgrounds)], center_eased)
 
                 for relative, abs_relative, x, y, layers in sorted(slot_layers, key=lambda item: item[1], reverse=True):
                     current = layers[(page + relative) % len(raw_posters)]
                     if transition:
                         upcoming = layers[(page + relative + 1) % len(raw_posters)]
-                        card = Image.blend(current, upcoming, eased)
+                        slot_rank = relative + half_count
+                        slot_start = (slot_rank / max(1, count - 1)) * 0.3
+                        slot_progress = max(0.0, min(1.0, (transition - slot_start) / 0.7))
+                        slot_eased = slot_progress * slot_progress * (3 - 2 * slot_progress)
+                        card = Image.blend(current, upcoming, slot_eased)
                     else:
                         card = current
                     frame.paste(card, (int(x - card.width / 2), int(y - card.height / 2)), mask=card)
@@ -1123,7 +1157,16 @@ class PosterEngine:
                 frames.append(frame)
                 frame_durations.append(page_hold_duration if step == 0 else page_transition_duration)
 
-        frames[0].save(output, format='PNG', save_all=True, append_images=frames[1:], duration=frame_durations, loop=0, optimize=False)
+        quantized_frames = self._quantize_animation_frames(frames)
+        quantized_frames[0].save(
+            output,
+            format='PNG',
+            save_all=True,
+            append_images=quantized_frames[1:],
+            duration=frame_durations,
+            loop=0,
+            optimize=False,
+        )
         logger.info(">>> [Engine] 扇形展开动态 PNG 完成. 帧数: %s, 大小: %.2f MB", len(frames), output.getbuffer().nbytes / 1024 / 1024)
 
     # === 动态 PNG 生成 ===

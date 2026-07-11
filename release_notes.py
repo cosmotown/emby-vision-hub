@@ -2,6 +2,23 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.0.22",
+        "published_at": "2026-07-11T16:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.0.22",
+        "changelog": """## 动态素材去重与远端更新发现
+
+### 修复
+- ChillPoster 下载候选海报后新增 16×16 感知指纹去重；即使 Emby 为同一视觉图片返回不同条目和图片 Tag，也会继续向后寻找真正不同的素材。
+- 旋转堆叠保持三列无缝轨道，完整循环由 18 秒放慢到 24 秒，并提升至 160 帧避免走马灯观感。
+- 旋转堆叠使用统一 192 色调色板压缩 APNG，显著降低文件大小，减少 Emby 只显示首帧的概率。
+- 七卡扇形改为从左到右错峰换图，卡位和角度保持固定，不再七张海报与背景同时整图切换。
+
+### 调整
+- 动态背景统一增加约 12% 的轻遮罩，在保留清晰度的同时稍微压住过亮背景。
+- 更新页恢复远端版本发现：优先读取 `cosmotown/emby-toolkit` 的 GitHub Releases，没有 Release 时回退 Tags，并与本地详细更新记录合并。
+""",
+    },
+    {
         "version": "v7.0.21",
         "published_at": "2026-07-11T14:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.21",

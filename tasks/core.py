@@ -18,7 +18,7 @@ from .watchlist import task_process_watchlist, task_refresh_completed_series, ta
 from .custom_collections import task_process_all_custom_collections, process_single_custom_collection
 from .tmdb_collections import task_refresh_collections
 from .subscriptions import task_auto_subscribe, task_manual_subscribe_batch
-from .covers import task_generate_all_covers, task_generate_all_custom_collection_covers
+from .covers import task_generate_all_covers, task_generate_all_custom_collection_covers, task_generate_single_cover
 from .cleanup import task_scan_for_cleanup_issues 
 from .users import task_sync_all_user_data, task_check_expired_users
 from .discover import task_update_daily_theme
@@ -191,7 +191,7 @@ def get_task_registry(context: str = 'all'):
         'custom-collections': (task_process_all_custom_collections, "刷新自建合集", 'media', True),
         'update-resubscribe-cache': (task_update_resubscribe_cache, "刷新媒体整理", 'media', True),
         'auto-subscribe': (task_auto_subscribe, "统一订阅处理", 'media', True),
-        'generate-all-covers': (task_generate_all_covers, "生成原生封面", 'media', True),
+        'generate-all-covers': (task_generate_all_covers, "生成全部封面", 'media', True),
         'generate-custom-collection-covers': (task_generate_all_custom_collection_covers, "生成合集封面", 'media', True),
         'purge-unregistered-actors': (task_purge_unregistered_actors, "删除黑户演员", 'media', True),
         'purge-ghost-actors': (task_purge_ghost_actors, "删除幽灵演员", 'media', True),
@@ -210,6 +210,7 @@ def get_task_registry(context: str = 'all'):
         'add-all-series-to-watchlist': (task_add_all_series_to_watchlist, "一键扫描全库剧集", 'watchlist', False),
         'process_all_custom_collections': (task_process_all_custom_collections, "生成所有自建合集", 'media', False),
         'process-single-custom-collection': (process_single_custom_collection, "生成单个自建合集", 'media', False),
+        'generate-single-cover': (task_generate_single_cover, "生成单个封面", 'media', False),
         'scan-cleanup-issues': (task_scan_for_cleanup_issues, "扫描媒体重复项", 'media', False),
         'resubscribe-library': (task_resubscribe_library, "媒体订阅删除", 'media', False),
         'update-daily-theme': (task_update_daily_theme, "更新每日主题", 'media', False),

@@ -381,7 +381,7 @@ class SchedulerManager:
             registry = get_task_registry()
             task_info = registry.get('generate-all-covers')
             if not task_info:
-                logger.error("  ⚠️ 设置'定时更新媒体库封面'失败：在任务注册表中未找到 'generate-all-covers'。")
+                logger.error("  ⚠️ 设置'定时更新全部封面'失败：在任务注册表中未找到 'generate-all-covers'。")
                 return
 
             task_function, task_description, processor_type = task_info

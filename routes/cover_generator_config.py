@@ -11,7 +11,7 @@ import handler.emby as emby
 from services.cover_generator.styles.badge_drawer import draw_badge
 from services.cover_generator import CoverGeneratorService 
 from services.cover_generator.styles.style_chillposter import DEFAULT_TEMPLATE_ID, get_chillposter_templates
-from database import settings_db
+from database import custom_collection_db, settings_db
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,43 @@ def get_all_libraries():
     except Exception as e:
         logger.error(f"为封面生成器获取媒体库列表失败: {e}", exc_info=True)
         return jsonify({"error": "获取媒体库列表失败"}), 500
+
+
+@cover_generator_config_bp.route('/targets', methods=['GET'])
+@admin_required
+def get_cover_generation_targets():
+    """返回可单独生成封面的原生媒体库与已创建自建合集。"""
+    try:
+        targets = []
+        libraries = emby.get_emby_libraries(
+            emby_server_url=config_manager.APP_CONFIG.get('emby_server_url'),
+            emby_api_key=config_manager.APP_CONFIG.get('emby_api_key'),
+            user_id=config_manager.APP_CONFIG.get('emby_user_id'),
+        ) or []
+        targets.extend(
+            {
+                'label': f"原生 · {library.get('Name')}",
+                'value': f"native:{library.get('Id')}",
+                'target_type': 'native',
+            }
+            for library in libraries
+            if library.get('Name') and library.get('Id')
+        )
+
+        collections = custom_collection_db.get_all_custom_collections() or []
+        targets.extend(
+            {
+                'label': f"自建 · {collection.get('name')}",
+                'value': f"custom:{collection.get('id')}",
+                'target_type': 'custom',
+            }
+            for collection in collections
+            if collection.get('name') and collection.get('id') and collection.get('emby_collection_id')
+        )
+        return jsonify(targets)
+    except Exception as e:
+        logger.error(f"获取封面生成目标失败: {e}", exc_info=True)
+        return jsonify({"error": "获取封面生成目标失败"}), 500
 
 
 @cover_generator_config_bp.route('/chillposter/templates', methods=['GET'])

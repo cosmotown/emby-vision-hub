@@ -3,12 +3,12 @@
     <n-spin :show="isLoading">
       <div class="cover-generator-config">
         <n-page-header>
-          <template #title>媒体库封面生成</template>
+          <template #title>封面生成</template>
           <template #extra>
             <n-space>
               <n-button @click="runGenerateAllTask" :loading="isGenerating">
                 <template #icon><n-icon :component="ImagesIcon" /></template>
-                立即生成所有媒体库封面
+                立即生成全部封面
               </n-button>
               <n-button type="primary" @click="saveConfig" :loading="isSaving">
                 <template #icon><n-icon :component="SaveIcon" /></template>
@@ -22,7 +22,7 @@
                   target="_blank"
                   style="font-size: 0.85em; margin-left: 8px; color: var(--n-primary-color); text-decoration: underline;"
                 >justzerock</a><br />
-          开启监控新入库可实时生成封面，包括原生媒体库、自建合集。如需自定义图片，可以在【其他设置】里填写自定义路径，例如：/config/custom_images。<br />
+          此处统一管理原生媒体库与自建合集的模板、手动生成和定时更新。开启监控新入库后也会复用同一套配置。如需自定义图片，可以在【其他设置】里填写自定义路径，例如：/config/custom_images。<br />
           然后在这个目录下新建想要自定义图片的媒体库子目录，例如：/config/custom_images/漫威宇宙，在这个目录下放入以1.jpg、2.jpg...命名的图片。
         </n-alert>
         </n-page-header>
@@ -50,7 +50,7 @@
             <n-gi>
               <n-form-item label="定时更新封面">
                 <n-switch v-model:value="configData.scheduled_refresh_enabled" />
-                <template #feedback>按固定时间自动执行生成原生封面</template>
+                <template #feedback>按固定时间更新原生媒体库和自建合集封面</template>
               </n-form-item>
             </n-gi>
             <n-gi>
@@ -95,7 +95,7 @@
             
             <!-- 忽略媒体库部分 -->
             <n-gi :span="5"> <!-- ★ 确保这里也是 span="4" -->
-              <n-form-item label="选择要【忽略】的媒体库">
+              <n-form-item label="选择要【忽略】的原生媒体库">
                 <n-checkbox-group 
                   v-model:value="configData.exclude_libraries"
                   style="display: flex; flex-wrap: wrap; gap: 8px 16px;"
@@ -107,6 +107,30 @@
                     :label="lib.label" 
                   />
                 </n-checkbox-group>
+              </n-form-item>
+            </n-gi>
+            <n-gi :span="5">
+              <n-form-item label="单独生成一个封面">
+                <n-space align="center" style="width: 100%;">
+                  <n-select
+                    v-model:value="selectedCoverTarget"
+                    :options="coverTargetOptions"
+                    filterable
+                    clearable
+                    placeholder="选择原生媒体库或自建合集"
+                    style="width: min(520px, 70vw);"
+                  />
+                  <n-button
+                    type="primary"
+                    secondary
+                    :disabled="!selectedCoverTarget"
+                    :loading="isGeneratingSingle"
+                    @click="runGenerateSingleTask"
+                  >
+                    生成选中封面
+                  </n-button>
+                </n-space>
+                <template #feedback>列表中的自建合集均已在 Emby 创建，可直接使用当前模板生成并上传。</template>
               </n-form-item>
             </n-gi>
           </n-grid>
@@ -402,6 +426,7 @@ const message = useMessage();
 const isLoading = ref(true);
 const isSaving = ref(false);
 const isGenerating = ref(false);
+const isGeneratingSingle = ref(false);
 const configData = ref({});
 const ratingLimitOptions = ref([]);
 const chillposterTemplates = ref([]);
@@ -416,6 +441,8 @@ const isHeavyDynamicTemplate = computed(() => (
 const titleConfigs = ref([]);
 
 const libraryOptions = ref([]);
+const coverTargetOptions = ref([]);
+const selectedCoverTarget = ref(null);
 
 const sortOptions = [
   { label: "最新添加", value: "Latest" },
@@ -505,6 +532,15 @@ const fetchLibraryOptions = async () => {
   }
 };
 
+const fetchCoverTargets = async () => {
+  try {
+    const response = await axios.get('/api/config/cover_generator/targets');
+    coverTargetOptions.value = response.data || [];
+  } catch (error) {
+    message.error('获取可生成封面的媒体库和自建合集失败。');
+  }
+};
+
 const setChillPosterPreview = () => {
   const selected = chillposterTemplates.value.find(
     item => item.id === configData.value.chillposter_template
@@ -550,11 +586,35 @@ const runGenerateAllTask = async () => {
   isGenerating.value = true;
   try {
     await axios.post('/api/tasks/run', { task_name: 'generate-all-covers' });
-    message.success('已成功触发“立即生成所有媒体库封面”任务，请在任务队列中查看进度。');
+    message.success('已触发全部封面生成任务，将依次处理原生媒体库和自建合集。');
   } catch (error) {
     message.error('触发任务失败，请检查后端日志。');
   } finally {
     isGenerating.value = false;
+  }
+};
+
+const runGenerateSingleTask = async () => {
+  if (!selectedCoverTarget.value) return;
+  const separator = selectedCoverTarget.value.indexOf(':');
+  if (separator < 1) {
+    message.error('封面目标格式无效，请重新选择。');
+    return;
+  }
+  const targetType = selectedCoverTarget.value.slice(0, separator);
+  const targetId = selectedCoverTarget.value.slice(separator + 1);
+  isGeneratingSingle.value = true;
+  try {
+    await axios.post('/api/tasks/run', {
+      task_name: 'generate-single-cover',
+      target_type: targetType,
+      target_id: targetId,
+    });
+    message.success('已提交选中封面的生成任务，请在任务日志中查看进度。');
+  } catch (error) {
+    message.error(error.response?.data?.error || '提交单个封面任务失败。');
+  } finally {
+    isGeneratingSingle.value = false;
   }
 };
 
@@ -682,6 +742,7 @@ watch(
 onMounted(() => {
   fetchConfig();
   fetchLibraryOptions();
+  fetchCoverTargets();
   fetchRatingOptions();
   fetchChillPosterTemplates();
 });

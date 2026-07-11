@@ -21,9 +21,9 @@
               <template #icon><n-icon :component="SparklesIcon" /></template>
               映射管理
             </n-button>
-            <n-button type="default" @click="handleGenerateAllCovers" :loading="isGeneratingCovers">
+            <n-button type="default" @click="goToCoverGenerator">
               <template #icon><n-icon :component="CoverIcon" /></template>
-              生成所有封面
+              封面生成
             </n-button>
             <n-button type="primary" ghost @click="handleSyncAll" :loading="isSyncingAll">
               <template #icon><n-icon :component="GenerateIcon" /></template>
@@ -43,7 +43,7 @@
                   target="_blank"
                   style="font-size: 0.85em; margin-left: 8px; color: var(--n-primary-color); text-decoration: underline;"
                 >逗猫佬</a>。</li>
-              <li>在创建或生成“筛选规则”合集前，请先点击 <n-icon :component="SyncIcon" /> 按钮同步一次媒体数据。筛选类合集只需要生成一次，如需更换封面请运行生成合集封面任务</li>
+              <li>在创建或生成“筛选规则”合集前，请先点击 <n-icon :component="SyncIcon" /> 按钮同步一次媒体数据。封面模板、手动生成和定时更新统一在“封面生成”页面管理。</li>
               <li>您可以通过拖动卡片来对合集进行排序，Emby虚拟库实时联动更新排序。</li>
             </ul>
           </n-alert>
@@ -1004,6 +1004,7 @@
 
 <script setup>
 import { ref, onMounted, h, computed, watch, nextTick } from 'vue';
+import { useRouter } from 'vue-router';
 import axios from 'axios';
 import { useConfig } from '../composables/useConfig.js';
 import Sortable from 'sortablejs';
@@ -1043,6 +1044,7 @@ import {
 // ▼▼▼ 所有 ref 变量定义 ▼▼▼
 // ===================================================================
 const message = useMessage();
+const router = useRouter();
 const collections = ref([]);
 const isLoading = ref(true);
 const showModal = ref(false);
@@ -1067,7 +1069,6 @@ const isSearchingActors = ref(false);
 const isSavingOrder = ref(false);
 const embyLibraryOptions = ref([]);
 const isLoadingLibraries = ref(false);
-const isGeneratingCovers = ref(false);
 const embyUserOptions = ref([]);
 const isLoadingEmbyUsers = ref(false);
 const dialog = useDialog();
@@ -1463,16 +1464,8 @@ const createRuleWatcher = (rulesRef) => {
   }, { deep: true });
 };
 
-const handleGenerateAllCovers = async () => {
-  isGeneratingCovers.value = true;
-  try {
-    const response = await axios.post('/api/tasks/run', { task_name: 'generate-custom-collection-covers' });
-    message.success(response.data.message || '已提交一键生成自建合集封面任务！');
-  } catch (error) {
-    message.error(error.response?.data?.error || '提交任务失败。');
-  } finally {
-    isGeneratingCovers.value = false;
-  }
+const goToCoverGenerator = () => {
+  router.push({ name: 'CoverGeneratorConfig' });
 };
 
 const renderPersonOption = ({ node, option }) => {

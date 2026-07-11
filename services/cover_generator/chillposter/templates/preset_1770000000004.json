@@ -14,6 +14,7 @@
         "anim_frames": "36",
         "anim_duration": "600",
         "poster_count": 6,
+        "backdrop_count": 6,
         "card_scale": 0.65,
         "card_x_percent": 68,
         "card_y_percent": 50,

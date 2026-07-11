@@ -18,6 +18,7 @@
         "page_hold_duration": "1950",
         "page_transition_duration": "150",
         "poster_count": "9",
+        "backdrop_count": "9",
         "hero_height_percent": "51",
         "poster_ratio": 0.66,
         "baseline_percent": "94",

@@ -127,6 +127,10 @@ def task_generate_all_covers(processor):
         # 3. 筛选媒体库
         # ★★★ 核心修复：直接使用原始ID进行比较 ★★★
         exclude_ids = set(cover_config.get("exclude_libraries", []))
+        exclude_custom_collection_ids = {
+            str(collection_id)
+            for collection_id in cover_config.get("exclude_custom_collections", [])
+        }
         # 允许处理的媒体库类型列表，增加了 'audiobooks'
         ALLOWED_COLLECTION_TYPES = ['movies', 'tvshows', 'boxsets', 'mixed', 'music', 'audiobooks']
 
@@ -145,6 +149,7 @@ def task_generate_all_covers(processor):
             collection
             for collection in custom_collection_db.get_all_active_custom_collections()
             if collection.get('emby_collection_id')
+            and str(collection.get('id')) not in exclude_custom_collection_ids
         ]
 
         total = len(libraries_to_process) + len(collections_to_process)

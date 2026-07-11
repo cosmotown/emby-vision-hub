@@ -110,6 +110,31 @@
               </n-form-item>
             </n-gi>
             <n-gi :span="5">
+              <n-form-item label="选择要【忽略】的自建合集">
+                <n-button
+                  size="small"
+                  secondary
+                  :loading="isRefreshingCoverTargets"
+                  @click="refreshCoverTargets"
+                  style="margin-bottom: 10px;"
+                >
+                  刷新封面目标
+                </n-button>
+                <n-checkbox-group
+                  v-model:value="configData.exclude_custom_collections"
+                  style="display: flex; flex-wrap: wrap; gap: 8px 16px;"
+                >
+                  <n-checkbox
+                    v-for="collection in customCollectionOptions"
+                    :key="collection.value"
+                    :value="collection.value"
+                    :label="collection.label"
+                  />
+                </n-checkbox-group>
+                <template #feedback>勾选后，一键生成、定时更新和合集刷新都不会修改这些合集的封面。</template>
+              </n-form-item>
+            </n-gi>
+            <n-gi :span="5">
               <n-form-item label="单独生成一个封面">
                 <n-space align="center" style="width: 100%;">
                   <n-select
@@ -390,7 +415,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue';
+import { ref, computed, onMounted, onActivated, watch } from 'vue';
 import axios from 'axios';
 import { 
   useMessage, NLayout, NPageHeader, NButton, NIcon, NCard, NGrid, NGi, 
@@ -427,6 +452,7 @@ const isLoading = ref(true);
 const isSaving = ref(false);
 const isGenerating = ref(false);
 const isGeneratingSingle = ref(false);
+const isRefreshingCoverTargets = ref(false);
 const configData = ref({});
 const ratingLimitOptions = ref([]);
 const chillposterTemplates = ref([]);
@@ -442,6 +468,7 @@ const titleConfigs = ref([]);
 
 const libraryOptions = ref([]);
 const coverTargetOptions = ref([]);
+const customCollectionOptions = ref([]);
 const selectedCoverTarget = ref(null);
 
 const sortOptions = [
@@ -536,8 +563,24 @@ const fetchCoverTargets = async () => {
   try {
     const response = await axios.get('/api/config/cover_generator/targets');
     coverTargetOptions.value = response.data || [];
+    customCollectionOptions.value = coverTargetOptions.value
+      .filter(target => target.target_type === 'custom')
+      .map(target => ({
+        label: target.label.replace(/^自建 · /, ''),
+        value: target.value.slice('custom:'.length),
+      }));
   } catch (error) {
     message.error('获取可生成封面的媒体库和自建合集失败。');
+  }
+};
+
+const refreshCoverTargets = async () => {
+  isRefreshingCoverTargets.value = true;
+  try {
+    await Promise.all([fetchLibraryOptions(), fetchCoverTargets()]);
+    message.success('封面目标列表已刷新。');
+  } finally {
+    isRefreshingCoverTargets.value = false;
   }
 };
 
@@ -745,6 +788,11 @@ onMounted(() => {
   fetchCoverTargets();
   fetchRatingOptions();
   fetchChillPosterTemplates();
+});
+
+onActivated(() => {
+  fetchLibraryOptions();
+  fetchCoverTargets();
 });
 </script>
 

@@ -27,6 +27,7 @@ def get_default_config():
         "scheduled_refresh_enabled": False,
         "scheduled_refresh_cron": "0 4 * * *",
         "exclude_libraries": [], # 现在是勾选框
+        "exclude_custom_collections": [],
         "sort_by": "Latest", # 默认改为最新添加
 
         # ★★★ 新增：默认安全分级上限 (默认为 8，即 PG-13) ★★★

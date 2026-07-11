@@ -320,7 +320,11 @@ def task_process_all_custom_collections(processor):
                 custom_collection_db.update_custom_collection_sync_results(collection_id, update_data)
 
                 # 3. 封面生成
-                if cover_service and emby_collection_id:
+                excluded_cover_ids = {
+                    str(collection_id)
+                    for collection_id in cover_config.get('exclude_custom_collections', [])
+                }
+                if cover_service and emby_collection_id and str(collection_id) not in excluded_cover_ids:
                     try:
                         library_info = emby.get_emby_item_details(emby_collection_id, processor.emby_url, processor.emby_api_key, processor.emby_user_id)
                         if library_info:
@@ -622,7 +626,11 @@ def process_single_custom_collection(processor, custom_collection_id: int):
         # 7. 封面生成
         try:
             cover_config = settings_db.get_setting('cover_generator_config') or {}
-            if cover_config.get("enabled") and emby_collection_id:
+            excluded_cover_ids = {
+                str(collection_id)
+                for collection_id in cover_config.get('exclude_custom_collections', [])
+            }
+            if cover_config.get("enabled") and emby_collection_id and str(custom_collection_id) not in excluded_cover_ids:
                 cover_service = CoverGeneratorService(config=cover_config)
                 library_info = emby.get_emby_item_details(emby_collection_id, processor.emby_url, processor.emby_api_key, processor.emby_user_id)
                 if library_info:

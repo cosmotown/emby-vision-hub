@@ -290,7 +290,7 @@ class CoverGeneratorService:
                     rules=rules,
                     logic=definition.get('logic', 'AND'),
                     user_id=user_id,
-                    limit=limit,
+                    limit=limit * 4,
                     offset=0,
                     sort_by=db_sort_by,
                     item_types=definition.get('item_type', ['Movie']),
@@ -331,7 +331,7 @@ class CoverGeneratorService:
                 if valid_emby_ids:
                     if self._sort_by == "Random": random.shuffle(valid_emby_ids)
                     # 构造伪对象传给 fetcher
-                    items_payload = [{'Id': i} for i in valid_emby_ids[:limit*2]]
+                    items_payload = [{'Id': i} for i in valid_emby_ids[:limit * 5]]
                     return self.__fetch_emby_items_by_ids(items_payload, base_url, api_key, user_id, limit)
                 
                 # Fallback: 现有成员
@@ -342,7 +342,7 @@ class CoverGeneratorService:
                     fields="Id,Name,Type,ImageTags,BackdropImageTags,PrimaryImageTag,PrimaryImageItemId",
                     limit=limit
                 )
-                return [item for item in fallback_items if self.__get_image_url(item)][:limit]
+                return self.__deduplicate_items_by_image(fallback_items, limit)
 
             except Exception as e:
                 logger.error(f"  ➜ 处理自定义合集 '{library_name}' 出错: {e}", exc_info=True)
@@ -378,7 +378,7 @@ class CoverGeneratorService:
                 rules=[], # 无额外规则
                 logic='AND',
                 user_id=None, # 使用管理员视角，但通过 override 限制分级
-                limit=limit,
+                limit=limit * 4,
                 offset=0,
                 sort_by=db_sort_by,
                 item_types=media_type_to_fetch,
@@ -422,7 +422,7 @@ class CoverGeneratorService:
         if self._sort_by == "Random":
             random.shuffle(valid_items)
             
-        return valid_items[:limit]
+        return self.__deduplicate_items_by_image(valid_items, limit)
 
     # ★★★ 辅助方法：根据 ID 列表批量获取 Emby 详情 (带图片Tag) ★★★
     def __fetch_emby_items_by_ids(self, items_from_db: List[Dict], base_url: str, api_key: str, user_id: str, limit: int) -> List[Dict]:
@@ -450,10 +450,24 @@ class CoverGeneratorService:
             if self._sort_by == "Random":
                 random.shuffle(valid_items)
             
-            return valid_items[:limit]
+            return self.__deduplicate_items_by_image(valid_items, limit)
         except Exception as e:
             logger.error(f"  ➜ 批量获取 Emby 项目详情失败: {e}")
             return []
+
+    def __deduplicate_items_by_image(self, items: List[Dict], limit: int) -> List[Dict]:
+        """Prevent multi-poster templates from repeating shared primary artwork."""
+        unique_items = []
+        seen_image_urls = set()
+        for item in items:
+            image_url = self.__get_image_url(item)
+            if not image_url or image_url in seen_image_urls:
+                continue
+            seen_image_urls.add(image_url)
+            unique_items.append(item)
+            if len(unique_items) >= limit:
+                break
+        return unique_items
 
     def __get_image_url(self, item: Dict[str, Any]) -> str:
         primary_url = self.__get_primary_image_url(item)

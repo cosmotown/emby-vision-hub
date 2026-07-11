@@ -307,15 +307,18 @@ class PosterEngine:
             source = poster.convert('RGBA')
             background = ImageOps.fit(source, size, method=Image.LANCZOS).convert('RGBA')
             background = ImageEnhance.Brightness(background).enhance(0.35)
-            contained = ImageOps.contain(source, size, method=Image.LANCZOS)
-            background.alpha_composite(
-                contained,
-                ((size[0] - contained.width) // 2, (size[1] - contained.height) // 2),
-            )
             if blur_radius:
                 background = background.filter(ImageFilter.GaussianBlur(blur_radius))
             backgrounds.append(Image.alpha_composite(background, overlay))
         return backgrounds
+
+    def _dynamic_background_sources(self, assets, posters):
+        """Prefer one landscape backdrop per poster; fall back to poster art if incomplete."""
+        backdrop_urls = list(assets.get('backdrops') or [])
+        backdrops = [image.convert('RGBA') for image in (self.download_img(url) for url in backdrop_urls) if image]
+        if len(backdrops) >= len(posters):
+            return backdrops[:len(posters)]
+        return posters
 
     def _dynamic_background_transition(self, backgrounds, active_position):
         current_index = int(active_position) % len(backgrounds)
@@ -375,7 +378,7 @@ class PosterEngine:
         # Keep the complete poster visible over a dark, aspect-preserving backdrop.
         background_blur = max(0, int(float(config.get('dynamic_bg_blur', 0)) * scale_factor))
         backgrounds = self._make_dynamic_backgrounds(
-            raw_posters,
+            self._dynamic_background_sources(assets, raw_posters),
             (target_w, target_h),
             background_blur,
             int(config.get('mask_opacity', 180)),
@@ -469,7 +472,12 @@ class PosterEngine:
             return self._draw_dynamic_tiled_cover(bg, config, assets, font_loader, output)
 
         blur = max(0, int(float(config.get('dynamic_bg_blur', 0)) * scale_factor))
-        backgrounds = self._make_dynamic_backgrounds(raw_posters, (target_w, target_h), blur, 110)
+        backgrounds = self._make_dynamic_backgrounds(
+            self._dynamic_background_sources(assets, raw_posters),
+            (target_w, target_h),
+            blur,
+            110,
+        )
         fonts = self._dynamic_fonts(config, font_loader, scale_factor, title_default=160, subtitle_default=80)
         badge_config = self._dynamic_badge_config(config, scale_factor)
         card_size = max(80, int(target_h * float(config.get('card_scale', 0.65))))
@@ -524,7 +532,8 @@ class PosterEngine:
         while len(raw_posters) < 9:
             raw_posters.extend(raw_posters)
 
-        base = ImageOps.fit(raw_posters[0], (target_w, target_h), method=Image.LANCZOS).filter(ImageFilter.GaussianBlur(max(1, int(float(config.get('bg_blur_radius', 60)) * scale_factor)))).convert('RGBA')
+        background_source = self._dynamic_background_sources(assets, raw_posters)[0]
+        base = ImageOps.fit(background_source, (target_w, target_h), method=Image.LANCZOS).filter(ImageFilter.GaussianBlur(max(1, int(float(config.get('bg_blur_radius', 60)) * scale_factor)))).convert('RGBA')
         base = Image.alpha_composite(base, Image.new('RGBA', base.size, (0, 0, 0, 115)))
         fonts = self._dynamic_fonts(config, font_loader, scale_factor, title_default=160, subtitle_default=50)
         badge_config = self._dynamic_badge_config(config, scale_factor)
@@ -839,7 +848,7 @@ class PosterEngine:
         bg_blur = int(float(config.get('dynamic_bg_blur', 0)) * scale_factor)
         overlay_opacity = int(config.get('bg_overlay_opacity', 100))
         backgrounds = self._make_dynamic_backgrounds(
-            raw_posters,
+            self._dynamic_background_sources(assets, raw_posters),
             (target_w, target_h),
             bg_blur,
             overlay_opacity,
@@ -967,7 +976,12 @@ class PosterEngine:
 
         bg_blur = int(float(config.get('dynamic_bg_blur', 0)) * scale_factor)
         darkness = int(config.get('bg_darkness', 160))
-        backgrounds = self._make_dynamic_backgrounds(raw_posters, (target_w, target_h), max(0, bg_blur), darkness)
+        backgrounds = self._make_dynamic_backgrounds(
+            self._dynamic_background_sources(assets, raw_posters),
+            (target_w, target_h),
+            max(0, bg_blur),
+            darkness,
+        )
 
         fonts = self._dynamic_fonts(config, font_loader, scale_factor, title_default=90, subtitle_default=50)
         fan_radius = float(config.get('fan_radius', 1200)) * scale_factor
@@ -982,56 +996,94 @@ class PosterEngine:
         angle_step = fan_spread / max(1, count - 1)
         badge_config = self._dynamic_badge_config(config, scale_factor)
 
-        slot_layers = []
-        for rel in range(-(count // 2), count // 2 + 1):
-            abs_rel = abs(rel)
-            theta_deg = rel * angle_step
-            theta_rad = math.radians(theta_deg)
-            x = pivot_x + fan_radius * math.sin(theta_rad)
-            y = pivot_y - fan_radius * math.cos(theta_rad)
-            scale = math.pow(shrink_ratio, abs_rel)
-            w = max(1, int(base_w * scale))
-            h = max(1, int(base_h * scale))
-            layers = []
-            for raw in raw_posters:
-                poster = self._rounded(ImageOps.fit(raw, (w, h), method=Image.LANCZOS), max(2, int(15 * scale_factor)))
-                padding = max(4, int(30 * scale_factor))
-                group = Image.new('RGBA', (w + padding * 2, h * 2 + padding), (0, 0, 0, 0))
-                shadow_blur = max(1, int((20 if abs_rel < 0.5 else 10) * scale_factor))
-                shadow = Image.new('RGBA', (w + padding * 2, h + padding * 2), (0, 0, 0, 0))
-                sd = ImageDraw.Draw(shadow)
-                sd.rounded_rectangle((padding, padding, padding + w, padding + h), radius=max(2, int(15 * scale_factor)), fill=(0, 0, 0, 150))
-                shadow = shadow.filter(ImageFilter.GaussianBlur(shadow_blur))
-                group.paste(shadow, (0, 0), mask=shadow)
-                reflection = self._reflection(poster, opacity=max(10, int(50 * max(0.25, 1 - abs_rel / 5))))
-                group.paste(reflection, (padding, padding + h), mask=reflection)
-                group.paste(poster, (padding, padding), mask=poster)
-                layers.append(group.rotate(-theta_deg, resample=Image.BICUBIC, expand=True))
-            slot_layers.append((rel, abs_rel, x, y, h, layers))
+        half_count = count // 2
+        padding = max(4, int(30 * scale_factor))
+        corner_radius = max(2, int(15 * scale_factor))
+        shadow_blur = max(1, int(20 * scale_factor))
+        base_layers = []
+        for raw in raw_posters:
+            poster = self._rounded(ImageOps.fit(raw, (base_w, base_h), method=Image.LANCZOS), corner_radius)
+            group = Image.new('RGBA', (base_w + padding * 2, base_h * 2 + padding), (0, 0, 0, 0))
+            shadow = Image.new('RGBA', (base_w + padding * 2, base_h + padding * 2), (0, 0, 0, 0))
+            shadow_draw = ImageDraw.Draw(shadow)
+            shadow_draw.rounded_rectangle(
+                (padding, padding, padding + base_w, padding + base_h),
+                radius=corner_radius,
+                fill=(0, 0, 0, 150),
+            )
+            shadow = shadow.filter(ImageFilter.GaussianBlur(shadow_blur))
+            group.paste(shadow, (0, 0), mask=shadow)
+            reflection = self._reflection(poster, opacity=50)
+            group.paste(reflection, (padding, padding + base_h), mask=reflection)
+            group.paste(poster, (padding, padding), mask=poster)
+            base_layers.append(group)
+
+        def get_anchor(relative):
+            abs_relative = min(abs(relative), half_count)
+            theta = math.radians(relative * angle_step)
+            x = pivot_x + fan_radius * math.sin(theta)
+            y = pivot_y - fan_radius * math.cos(theta)
+            height = max(1, int(base_h * math.pow(shrink_ratio, abs_relative)))
+            return x, y + height / 2
+
+        def paste_moving_card(frame, poster_index, start_relative, end_relative, motion, opacity=1.0):
+            relative = start_relative + (end_relative - start_relative) * motion
+            scale = math.pow(shrink_ratio, min(abs(relative), half_count))
+            source = base_layers[poster_index]
+            card = source.resize(
+                (max(1, int(source.width * scale)), max(1, int(source.height * scale))),
+                Image.LANCZOS,
+            ).rotate(-relative * angle_step, resample=Image.BICUBIC, expand=True)
+            if opacity < 0.999:
+                card.putalpha(card.getchannel('A').point(lambda value: int(value * opacity)))
+            anchor = get_anchor(relative)
+            frame.paste(
+                card,
+                (int(anchor[0] - card.width / 2), int(anchor[1] - card.height / 2)),
+                mask=card,
+            )
 
         frames = []
         for frame_idx in range(total_frames):
             active = (frame_idx / total_frames) * len(raw_posters)
             page = int(active)
             local = active - page
-            transition = max(0.0, min(1.0, (local - 0.5) / 0.5))
-            transition = transition * transition * (3 - 2 * transition)
+            motion = local * local * (3 - 2 * local)
             frame = backgrounds[page].copy()
-            if transition:
-                frame = Image.blend(frame, backgrounds[(page + 1) % len(backgrounds)], transition)
+            if motion:
+                frame = Image.blend(frame, backgrounds[(page + 1) % len(backgrounds)], motion)
 
-            for rel, abs_rel, x, y, h, layers in sorted(slot_layers, key=lambda item: item[1], reverse=True):
-                current_layer = layers[(page + rel) % len(raw_posters)]
-                paste_x = int(x - current_layer.width / 2)
-                paste_y = int(y - current_layer.height / 2 + h / 2)
-                if transition < 1:
-                    current = current_layer.copy()
-                    current.putalpha(current.getchannel('A').point(lambda value: int(value * (1 - transition))))
-                    frame.paste(current, (paste_x, paste_y), mask=current)
-                if transition:
-                    next_layer = layers[(page + rel + 1) % len(raw_posters)].copy()
-                    next_layer.putalpha(next_layer.getchannel('A').point(lambda value: int(value * transition)))
-                    frame.paste(next_layer, (paste_x, paste_y), mask=next_layer)
+            # Every poster advances one fixed fan slot. The outermost card fades out
+            # and re-enters from the opposite edge, keeping a continuous nine-card loop.
+            edge_rel = -half_count
+            edge_poster_index = (page + edge_rel) % len(raw_posters)
+            paste_moving_card(
+                frame,
+                edge_poster_index,
+                edge_rel,
+                edge_rel - 1,
+                motion,
+                opacity=1 - motion,
+            )
+            paste_moving_card(
+                frame,
+                edge_poster_index,
+                half_count + 1,
+                half_count,
+                motion,
+                opacity=motion,
+            )
+
+            moving_rels = range(-half_count + 1, half_count + 1)
+            for rel in sorted(moving_rels, key=lambda value: abs(value - motion), reverse=True):
+                poster_index = (page + rel) % len(raw_posters)
+                paste_moving_card(
+                    frame,
+                    poster_index,
+                    rel,
+                    rel - 1,
+                    motion,
+                )
 
             self._draw_dynamic_text(frame, config, fonts, scale_factor, mode='fan')
             frame = self._draw_badge(frame, badge_config, assets.get('count', 0), fonts)

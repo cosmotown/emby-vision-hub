@@ -17,6 +17,7 @@
         "anim_frames": "54",
         "anim_duration": "333",
         "poster_count": 9,
+        "backdrop_count": 9,
         "corner_radius": 46,
         "rotation": "-16",
         "title_size": 160,

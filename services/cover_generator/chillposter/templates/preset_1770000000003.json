@@ -19,6 +19,7 @@
         "page_transition_duration": "150",
         "dynamic_bg_blur": "0",
         "poster_count": 6,
+        "backdrop_count": 6,
         "poster_scale": "0.9",
         "poster_x_percent": "55",
         "poster_y_percent": "50",

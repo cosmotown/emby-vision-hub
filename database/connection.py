@@ -84,6 +84,29 @@ def init_db():
                     )
                 """)
 
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS webhook_event_queue (
+                        id BIGSERIAL PRIMARY KEY,
+                        dedupe_key TEXT NOT NULL,
+                        event_source TEXT NOT NULL DEFAULT 'emby',
+                        task_kind TEXT NOT NULL,
+                        task_name TEXT NOT NULL,
+                        item_id TEXT,
+                        item_name TEXT,
+                        item_type TEXT,
+                        payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        max_attempts INTEGER NOT NULL DEFAULT 4,
+                        next_attempt_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        last_error TEXT,
+                        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        started_at TIMESTAMP WITH TIME ZONE,
+                        completed_at TIMESTAMP WITH TIME ZONE
+                    )
+                """)
+
                 logger.trace("  ➜ 正在创建 'emby_users' 表...")
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS emby_users (
@@ -530,6 +553,20 @@ def init_db():
 
                     # 11. 【跟播系统】加速“正在连载”剧集的筛选
                     cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_watchlist_airing ON media_metadata (watchlist_is_airing) WHERE item_type = 'Series';")
+
+                    cursor.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_event_pending_dedupe
+                        ON webhook_event_queue (dedupe_key)
+                        WHERE status IN ('pending', 'retry')
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_webhook_event_runnable
+                        ON webhook_event_queue (status, next_attempt_at, id)
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_webhook_event_item
+                        ON webhook_event_queue (item_id, created_at DESC)
+                    """)
 
                 except Exception as e_index:
                     logger.error(f"  ➜ 创建索引时出错: {e_index}", exc_info=True)

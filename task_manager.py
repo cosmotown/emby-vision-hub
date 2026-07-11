@@ -1,7 +1,7 @@
 # task_manager.py (V2 - 精确调度版)
 import threading
 import logging
-from queue import Queue
+from queue import Empty, Queue
 from typing import Optional, Callable, Union, Literal
 
 # 导入类型提示，注意使用字符串避免循环导入
@@ -33,7 +33,10 @@ task_worker_lock = threading.Lock()
 def update_status_from_thread(progress: int, message: str):
     """由处理器或任务函数调用，用于更新任务状态。"""
     if progress >= 0:
-        background_task_status["progress"] = progress
+        try:
+            background_task_status["progress"] = max(0, min(100, int(progress)))
+        except (TypeError, ValueError):
+            background_task_status["progress"] = progress
     background_task_status["message"] = message
 
 def get_task_status() -> dict:
@@ -42,15 +45,23 @@ def get_task_status() -> dict:
 
 def is_task_running() -> bool:
     """检查是否有后台任务正在运行。"""
-    return task_lock.locked()
+    return task_lock.locked() or bool(background_task_status.get("is_running"))
 
-def _execute_task_with_lock(task_function: Callable, task_name: str, processor: Union[MediaProcessor, WatchlistProcessor, ActorSubscriptionProcessor], *args, **kwargs):
+def _execute_task_with_lock(task_function: Callable, task_name: str, processor: Union[MediaProcessor, WatchlistProcessor, ActorSubscriptionProcessor], *args, silent: bool = False, **kwargs):
     """【工人专用】通用后台任务执行器。"""
     global background_task_status
     
     with task_lock:
         if not processor:
-            logger.error(f"任务 '{task_name}' 无法启动：对应的处理器未初始化。")
+            message = f"任务 '{task_name}' 无法启动：对应的处理器未初始化。"
+            logger.error(message)
+            background_task_status.update({
+                "is_running": False,
+                "current_action": "无",
+                "last_action": task_name,
+                "progress": 0,
+                "message": message,
+            })
             return
 
         processor.clear_stop_signal()
@@ -59,9 +70,11 @@ def _execute_task_with_lock(task_function: Callable, task_name: str, processor: 
             "is_running": True, "current_action": task_name, "last_action": task_name,
             "progress": 0, "message": f"{task_name} 初始化..."
         })
-        logger.info(f"  ➜ 后台任务 '{task_name}' 开始执行")
+        if not silent:
+            logger.info(f"  ➜ 后台任务 '{task_name}' 开始执行")
 
         task_completed_normally = False
+        task_error = None
         try:
             if processor.is_stop_requested():
                 raise InterruptedError("任务被取消")
@@ -70,24 +83,35 @@ def _execute_task_with_lock(task_function: Callable, task_name: str, processor: 
             
             if not processor.is_stop_requested():
                 task_completed_normally = True
+        except Exception as exc:
+            task_error = exc
+            raise
         finally:
             final_message = "未知结束状态"
             current_progress = background_task_status["progress"]
 
             if processor.is_stop_requested():
                 final_message = "任务已成功中断。"
+            elif task_error is not None:
+                final_message = f"执行失败: {task_error}"
+                current_progress = 0
             elif task_completed_normally:
                 final_message = "处理完成。"
                 current_progress = 100
             
             update_status_from_thread(current_progress, final_message)
-            logger.info(f"  ✅ 后台任务 '{task_name}' 结束，最终状态: {final_message}")
+            if not silent:
+                logger.info(f"  ➜ 后台任务 '{task_name}' 结束，最终状态: {final_message}")
 
             background_task_status.update({
-                "is_running": False, "current_action": "无", "progress": 0, "message": "等待任务"
+                "is_running": False,
+                "current_action": "无",
+                "last_action": task_name,
+                "progress": current_progress,
+                "message": final_message,
             })
             processor.clear_stop_signal()
-            logger.trace(f"后台任务 '{task_name}' 状态已重置。")
+            logger.trace(f"后台任务 '{task_name}' 状态已完成并保留最终结果。")
 
 def task_worker_function():
     """
@@ -96,13 +120,20 @@ def task_worker_function():
     """
     logger.trace("  ➜ 通用任务线程已启动，等待任务...")
     while True:
+        task_info = None
         try:
             task_info = task_queue.get()
             if task_info is None:
                 logger.info("工人线程收到停止信号，即将退出。")
+                task_queue.task_done()
+                task_info = None
                 break
 
-            task_function, task_name, processor_type, args, kwargs = task_info
+            if len(task_info) == 6:
+                task_function, task_name, processor_type, args, kwargs, silent = task_info
+            else:
+                task_function, task_name, processor_type, args, kwargs = task_info
+                silent = False
             
             # ★★★ 核心修复：使用精确的、基于类型的调度逻辑 ★★★
             processor_map = {
@@ -115,14 +146,23 @@ def task_worker_function():
             logger.trace(f"任务 '{task_name}' 请求使用 '{processor_type}' 处理器。")
 
             if not processor_to_use:
-                logger.error(f"任务 '{task_name}' 无法执行：类型为 '{processor_type}' 的处理器未初始化或不存在。")
-                task_queue.task_done()
+                message = f"任务 '{task_name}' 无法执行：类型为 '{processor_type}' 的处理器未初始化或不存在。"
+                logger.error(message)
+                background_task_status.update({
+                    "is_running": False,
+                    "current_action": "无",
+                    "last_action": task_name,
+                    "progress": 0,
+                    "message": message,
+                })
                 continue
 
-            _execute_task_with_lock(task_function, task_name, processor_to_use, *args, **kwargs)
-            task_queue.task_done()
+            _execute_task_with_lock(task_function, task_name, processor_to_use, *args, silent=silent, **kwargs)
         except Exception as e:
             logger.error(f"通用工人线程发生未知错误: {e}", exc_info=True)
+        finally:
+            if task_info is not None:
+                task_queue.task_done()
 
 def start_task_worker_if_not_running():
     """安全地启动通用工人线程。"""
@@ -135,26 +175,51 @@ def start_task_worker_if_not_running():
         else:
             logger.trace("通用任务线程已在运行。")
 
-def submit_task(task_function: Callable, task_name: str, processor_type: ProcessorType = 'media', *args, **kwargs) -> bool:
+def submit_task(
+    task_function: Callable,
+    task_name: str,
+    processor_type: ProcessorType = 'media',
+    *args,
+    silent: bool = False,
+    reject_if_busy: bool = False,
+    **kwargs,
+) -> bool:
     """
     【V2 - 公共接口】将一个任务提交到通用队列中。
     新增 processor_type 参数，用于精确指定任务所需的处理器。
     """
     from logger_setup import frontend_log_queue # 延迟导入以避免循环
 
-    with task_lock:
+    acquired = task_lock.acquire(blocking=not reject_if_busy)
+    if not acquired:
+        if not silent:
+            logger.debug(f"  ➜ 任务 '{task_name}' 提交失败：已有任务正在运行。")
+        return False
+
+    try:
         if background_task_status["is_running"]:
-            logger.warning(f"任务 '{task_name}' 提交失败：已有任务正在运行。")
+            if not silent:
+                logger.debug(f"  ➜ 任务 '{task_name}' 提交失败：已有任务正在运行。")
             return False
 
-        frontend_log_queue.clear()
-        logger.trace(f"  ➜ 任务 '{task_name}' 已提交到队列，并已清空前端日志。")
+        if not silent:
+            frontend_log_queue.clear()
+            logger.trace(f"  ➜ 任务 '{task_name}' 已提交到队列，并已清空前端日志。")
+
+        background_task_status.update({
+            "is_running": True,
+            "current_action": task_name,
+            "last_action": task_name,
+            "progress": 0,
+            "message": f"{task_name} 已提交，等待任务线程启动...",
+        })
         
-        # ★★★ 核心修复：将 processor_type 加入任务信息元组 ★★★
-        task_info = (task_function, task_name, processor_type, args, kwargs)
+        task_info = (task_function, task_name, processor_type, args, kwargs, silent)
         task_queue.put(task_info)
         start_task_worker_if_not_running()
         return True
+    finally:
+        task_lock.release()
 
 def stop_task_worker():
     """【公共接口】停止工人线程，用于应用退出。"""
@@ -175,6 +240,6 @@ def clear_task_queue():
         while not task_queue.empty():
             try:
                 task_queue.get_nowait()
-            except Queue.Empty:
+            except Empty:
                 break
         logger.info("任务队列已清空。")

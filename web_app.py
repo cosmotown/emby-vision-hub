@@ -45,7 +45,7 @@ from routes.tasks import tasks_bp
 from routes.resubscribe import resubscribe_bp
 from routes.media_cleanup import media_cleanup_bp
 from routes.user_management import user_management_bp
-from routes.webhook import webhook_bp
+from routes.webhook import webhook_bp, resume_persistent_webhook_queue
 from routes.unified_auth import unified_auth_bp
 from routes.user_portal import user_portal_bp
 from routes.discover import discover_bp
@@ -446,6 +446,7 @@ def main_app_start():
     ensure_cover_generator_fonts()
     initialize_processors()
     task_manager.start_task_worker_if_not_running()
+    resume_persistent_webhook_queue()
     scheduler_manager.start()
 
     # ★★★ 新增：启动实时监控服务 ★★★

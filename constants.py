@@ -4,7 +4,7 @@ import os
 # ==============================================================================
 # ✨ 应用基础信息 (Application Basics)
 # ==============================================================================
-APP_VERSION = "7.0.24"  # 更新版本号
+APP_VERSION = "7.1.0"  # 更新版本号
 GITHUB_REPO_OWNER = "cosmotown"  # 您的 GitHub 用户名
 GITHUB_REPO_NAME = "emby-toolkit" # 您的 GitHub 仓库名
 DEFAULT_DOCKER_IMAGE_NAME = "tzyzero186/emby-toolkit:latest"

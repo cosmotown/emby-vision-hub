@@ -6,6 +6,7 @@ from flask import Blueprint, request, jsonify
 # 导入您项目中用于管理和执行任务的核心模块
 import task_manager 
 from extensions import admin_required, processor_ready_required, task_lock_required
+from database import webhook_event_db
 # ★★★ 导入任务注册表，这是“翻译”的关键 ★★★
 from tasks.core import get_task_registry
 
@@ -75,3 +76,30 @@ def run_task():
     except Exception as e:
         logger.error(f"提交任务 '{task_key}' 时出错: {e}", exc_info=True)
         return jsonify({"error": f"服务器内部错误: {e}"}), 500
+
+
+@tasks_bp.route('/webhook-events', methods=['GET'])
+@admin_required
+def get_webhook_events():
+    try:
+        limit = request.args.get('limit', 50, type=int)
+        events = webhook_event_db.list_recent_events(limit=limit)
+        return jsonify({"events": events}), 200
+    except Exception as exc:
+        logger.error(f"获取 Webhook 事件队列失败: {exc}", exc_info=True)
+        return jsonify({"error": "无法获取 Webhook 事件队列"}), 500
+
+
+@tasks_bp.route('/webhook-events/<int:event_id>/retry', methods=['POST'])
+@admin_required
+def retry_webhook_event(event_id):
+    try:
+        if not webhook_event_db.retry_event(event_id):
+            return jsonify({"error": "事件不存在或当前状态不可重试"}), 409
+
+        from routes.webhook import _schedule_persistent_webhook_drain
+        _schedule_persistent_webhook_drain(delay=0)
+        return jsonify({"message": "事件已重新加入处理队列", "event_id": event_id}), 202
+    except Exception as exc:
+        logger.error(f"重试 Webhook 事件 {event_id} 失败: {exc}", exc_info=True)
+        return jsonify({"error": "无法重试 Webhook 事件"}), 500

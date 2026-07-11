@@ -2,6 +2,27 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.0",
+        "published_at": "2026-07-12T00:14:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.0",
+        "changelog": """## Emby 入库可靠事件队列
+
+### 新增
+- 使用现有 PostgreSQL 新增独立的 `webhook_event_queue`，持久化保存 Emby 入库、元数据更新和图片更新事件，无需修改 Compose 或环境变量。
+- 同一媒体的待处理事件自动去重；连续入库的剧集分集 ID 会合并到同一任务，避免重复处理和漏集。
+- 容器重启后自动恢复未完成事件；执行失败后按 5、20、60 秒退避重试三次，并保留最终失败原因。
+- 新增管理员事件查询和失败重试 API，完成记录保留 30 天。
+
+### 修复
+- Webhook 在后台已有任务时不再等待或丢弃，改为持久化排队并在空闲后自动执行。
+- 任务管理器保留旧模块的等待行为，仅 Webhook 调度使用忙时立即返回，避免影响现有任务链。
+- 后台任务完成后保留最终进度和状态，修复页面低频轮询看不到执行结果的问题。
+
+### 安全
+- 数据库升级只新增队列表和索引，不修改或删除现有媒体、演员、合集及用户数据表。
+""",
+    },
+    {
         "version": "v7.0.24",
         "published_at": "2026-07-11T22:19:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.0.24",

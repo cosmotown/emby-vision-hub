@@ -26,7 +26,7 @@ from tasks.media import task_sync_all_metadata, task_sync_images
 from handler.custom_collection import RecommendationEngine
 from handler import tmdb_collections as collections_handler
 from services.cover_generator import CoverGeneratorService
-from database import custom_collection_db, tmdb_collection_db, settings_db, user_db, maintenance_db, media_db, queries_db, watchlist_db
+from database import custom_collection_db, tmdb_collection_db, settings_db, user_db, maintenance_db, media_db, queries_db, watchlist_db, webhook_event_db
 from database.log_db import LogDBManager
 from handler.tmdb import get_movie_details, get_tv_details
 from handler.p115_service import P115Service, SmartOrganizer, notify_cms_scan
@@ -53,6 +53,10 @@ UPDATE_DEBOUNCE_TIME = 15
 STREAM_CHECK_MAX_RETRIES = 60   # 最大重试次数 
 STREAM_CHECK_INTERVAL = 10      # 每次轮询间隔(秒)
 STREAM_CHECK_SEMAPHORE = Semaphore(5) # 限制并发预检的数量，防止大量入库时查挂 Emby
+
+WEBHOOK_EVENT_REQUEUE_DELAY = 5
+WEBHOOK_EVENT_DRAINER = None
+WEBHOOK_EVENT_DRAINER_LOCK = threading.Lock()
 
 def _is_valid_webhook_token() -> bool:
     expected_token = str(config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_WEBHOOK_TOKEN) or '').strip()
@@ -83,12 +87,12 @@ def _handle_full_processing_flow(processor: 'MediaProcessor', item_id: str, forc
     """
     if not processor:
         logger.error(f"  🚫 完整处理流程中止：核心处理器 (MediaProcessor) 未初始化。")
-        return
+        return False
 
     item_details = emby.get_emby_item_details(item_id, processor.emby_url, processor.emby_api_key, processor.emby_user_id)
     if not item_details:
         logger.error(f"  🚫 无法获取项目 {item_id} 的详情，任务中止。")
-        return
+        return False
     
     item_name_for_log = item_details.get("Name", f"ID:{item_id}")
     item_type = item_details.get("Type")
@@ -103,7 +107,7 @@ def _handle_full_processing_flow(processor: 'MediaProcessor', item_id: str, forc
     
     if not processed_successfully:
         logger.warning(f"  ➜ 项目 '{item_name_for_log}' 的元数据处理未成功完成，跳过后续步骤。")
-        return
+        return False
 
     # 2. 智能追剧判断 - 初始入库
     if is_new_item and item_type == "Series":
@@ -277,6 +281,112 @@ def _handle_full_processing_flow(processor: 'MediaProcessor', item_id: str, forc
         # 启动协程，不等待结果，直接让当前 Webhook 任务结束
         spawn(_async_trigger_watchlist)
 
+    return True
+
+
+def _schedule_persistent_webhook_drain(delay=WEBHOOK_EVENT_REQUEUE_DELAY):
+    global WEBHOOK_EVENT_DRAINER
+    with WEBHOOK_EVENT_DRAINER_LOCK:
+        if WEBHOOK_EVENT_DRAINER is not None and not WEBHOOK_EVENT_DRAINER.ready():
+            return
+        WEBHOOK_EVENT_DRAINER = spawn_later(max(0, delay), _drain_persistent_webhook_events)
+
+
+def _enqueue_persistent_webhook_task(
+    task_kind,
+    task_name,
+    *,
+    item_id,
+    item_name=None,
+    item_type=None,
+    payload=None,
+):
+    dedupe_key = f"emby:{task_kind}:{item_id}"
+    event_id, created = webhook_event_db.enqueue_event(
+        dedupe_key=dedupe_key,
+        task_kind=task_kind,
+        task_name=task_name,
+        payload=payload or {},
+        item_id=item_id,
+        item_name=item_name,
+        item_type=item_type,
+    )
+    action = "已进入持久化队列" if created else "已合并到待处理事件"
+    logger.info(f"  ➜ [Webhook队列] '{task_name}' {action} (事件ID: {event_id})。")
+    _schedule_persistent_webhook_drain(delay=0)
+    return event_id
+
+
+def _execute_persisted_webhook_event(processor, event_id, task_kind, payload):
+    payload = dict(payload or {})
+    try:
+        if task_kind == 'media_process':
+            succeeded = _handle_full_processing_flow(processor, **payload)
+            if not succeeded:
+                raise RuntimeError("Emby 项目尚未准备完成或核心处理未成功")
+        elif task_kind == 'metadata_sync':
+            task_sync_all_metadata(processor, **payload)
+        elif task_kind == 'image_sync':
+            task_sync_images(processor, **payload)
+        else:
+            raise ValueError(f"未知 Webhook 任务类型: {task_kind}")
+
+        webhook_event_db.mark_completed(event_id)
+        logger.info(f"  ➜ [Webhook队列] 事件 {event_id} 已处理完成。")
+    except Exception as exc:
+        status = webhook_event_db.mark_failed(event_id, str(exc))
+        logger.warning(f"  ➜ [Webhook队列] 事件 {event_id} 执行失败，状态更新为 {status}: {exc}")
+        raise
+    finally:
+        _schedule_persistent_webhook_drain()
+
+
+def _drain_persistent_webhook_events():
+    global WEBHOOK_EVENT_DRAINER
+    try:
+        if task_manager.get_task_status().get('is_running') or task_manager.is_task_running():
+            return
+
+        event = webhook_event_db.claim_next_event()
+        if not event:
+            return
+
+        submitted = task_manager.submit_task(
+            _execute_persisted_webhook_event,
+            task_name=event['task_name'],
+            processor_type='media',
+            reject_if_busy=True,
+            event_id=event['id'],
+            task_kind=event['task_kind'],
+            payload=event.get('payload_json') or {},
+        )
+        if not submitted:
+            webhook_event_db.defer_claim(event['id'], WEBHOOK_EVENT_REQUEUE_DELAY)
+            logger.debug(f"  ➜ [Webhook队列] 事件 {event['id']} 提交时任务繁忙，已延后。")
+    except Exception as exc:
+        logger.error(f"  ➜ [Webhook队列] 调度持久化事件失败: {exc}", exc_info=True)
+    finally:
+        with WEBHOOK_EVENT_DRAINER_LOCK:
+            WEBHOOK_EVENT_DRAINER = None
+        try:
+            if webhook_event_db.has_pending_events():
+                _schedule_persistent_webhook_drain()
+        except Exception as exc:
+            logger.error(f"  ➜ [Webhook队列] 检查后续待处理事件失败: {exc}", exc_info=True)
+
+
+def resume_persistent_webhook_queue():
+    try:
+        recovered = webhook_event_db.recover_interrupted_events(stale_minutes=0)
+        if recovered:
+            logger.info(f"  ➜ [Webhook队列] 已从上次重启恢复 {recovered} 个处理中事件。")
+        pruned = webhook_event_db.prune_old_events(retention_days=30)
+        if pruned:
+            logger.info(f"  ➜ [Webhook队列] 已清理 {pruned} 条超过 30 天的完成记录。")
+        _schedule_persistent_webhook_drain(delay=1)
+    except Exception as exc:
+        logger.error(f"  ➜ [Webhook队列] 恢复持久化队列失败: {exc}", exc_info=True)
+
 def _handle_immediate_tagging_with_lib(item_id, item_name, lib_id, lib_name, known_rating=None):
     """
     自动打标 (支持分级过滤)。
@@ -413,39 +523,46 @@ def _process_batch_webhook_events():
         
         logger.info(f"  ➜ 为 '{parent_name}' 分派任务: {task_name_prefix} (分集数: {len(episode_ids)})")
         
-        task_manager.submit_task(
-            _handle_full_processing_flow,
-            task_name=f"{task_name_prefix}: {parent_name}",
-            processor_type='media', # 确保传递 processor 实例
+        _enqueue_persistent_webhook_task(
+            'media_process',
+            f"{task_name_prefix}: {parent_name}",
             item_id=parent_id,
-            force_full_update=False, # Webhook 触发通常不需要强制深度刷新 TMDb
-            new_episode_ids=episode_ids if episode_ids else None,
-            is_new_item=not is_already_processed
+            item_name=parent_name,
+            item_type=parent_type,
+            payload={
+                'item_id': parent_id,
+                'force_full_update': False,
+                'new_episode_ids': episode_ids if episode_ids else None,
+                'is_new_item': not is_already_processed,
+            },
         )
 
-    logger.info("  ➜ 所有 Webhook 批量任务已成功分派。")
+    logger.info("  ➜ 所有 Webhook 批量任务已进入持久化处理队列。")
 
 def _trigger_metadata_update_task(item_id, item_name):
     """触发元数据同步任务"""
     logger.info(f"  ➜ 防抖计时器到期，为 '{item_name}' (ID: {item_id}) 执行元数据缓存同步任务。")
-    task_manager.submit_task(
-        task_sync_all_metadata,
-        task_name=f"元数据同步: {item_name}",
-        processor_type='media',
+    _enqueue_persistent_webhook_task(
+        'metadata_sync',
+        f"元数据同步: {item_name}",
         item_id=item_id,
-        item_name=item_name
+        item_name=item_name,
+        payload={'item_id': item_id, 'item_name': item_name},
     )
 
 def _trigger_images_update_task(item_id, item_name, update_description, sync_timestamp_iso):
     """触发图片备份任务"""
     logger.info(f"  ➜ 防抖计时器到期，为 '{item_name}' (ID: {item_id}) 执行图片备份任务。")
-    task_manager.submit_task(
-        task_sync_images,
-        task_name=f"图片备份: {item_name}",
-        processor_type='media',
+    _enqueue_persistent_webhook_task(
+        'image_sync',
+        f"图片备份: {item_name}",
         item_id=item_id,
-        update_description=update_description,
-        sync_timestamp_iso=sync_timestamp_iso
+        item_name=item_name,
+        payload={
+            'item_id': item_id,
+            'update_description': update_description,
+            'sync_timestamp_iso': sync_timestamp_iso,
+        },
     )
 
 def _enqueue_webhook_event(item_id, item_name, item_type):

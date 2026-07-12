@@ -2,6 +2,23 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.2",
+        "published_at": "2026-07-12T21:45:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.2",
+        "changelog": """## Webhook 队列诊断
+
+### 新增
+- 高级设置新增 Webhook 队列诊断面板，集中查看待处理、处理中、重试、失败和完成数量。
+- 最近事件展示媒体名称、任务类型、尝试次数、更新时间和最终失败原因。
+- 最终失败事件可在页面手动重新入队，无需进入数据库或翻查完整容器日志。
+- 新增只读队列自检：测试事件会经过持久化入队、任务调度和完成标记，但不会调用 Emby 写接口或媒体处理流程。
+
+### 安全
+- 不修改现有 Webhook 处理内容、去重键、自动重试次数或 30 天记录保留策略。
+- 不修改 Emby 数据库、虚拟库反代、302 播放转发、封面和媒体文件。
+""",
+    },
+    {
         "version": "v7.1.1",
         "published_at": "2026-07-12T01:41:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.1",

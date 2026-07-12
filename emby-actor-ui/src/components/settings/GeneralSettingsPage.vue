@@ -638,6 +638,10 @@
                   </n-card>
                 </n-gi>
 
+                <n-gi span="1 l:2">
+                  <WebhookQueueDiagnostics />
+                </n-gi>
+
                 <!-- 卡片 2: 日志配置 (右上) -->
                 <n-gi>
                   <n-card :bordered="false" class="dashboard-card">
@@ -1015,6 +1019,7 @@ import {
   FlashOutline as FlashIcon
 } from '@vicons/ionicons5';
 import { useConfig } from '../../composables/useConfig.js';
+import WebhookQueueDiagnostics from './WebhookQueueDiagnostics.vue';
 import axios from 'axios';
 
 const promptModalVisible = ref(false);

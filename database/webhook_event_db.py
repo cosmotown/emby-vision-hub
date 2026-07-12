@@ -431,6 +431,30 @@ def list_recent_events(limit: int = 50) -> List[Dict[str, Any]]:
             return [dict(row) for row in cursor.fetchall()]
 
 
+def get_queue_summary() -> Dict[str, Any]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
+                    COUNT(*) FILTER (WHERE status = 'processing') AS processing_count,
+                    COUNT(*) FILTER (WHERE status = 'retry') AS retry_count,
+                    COUNT(*) FILTER (WHERE status = 'failed') AS failed_count,
+                    COUNT(*) FILTER (WHERE status = 'completed') AS completed_count,
+                    MIN(created_at) FILTER (
+                        WHERE status IN ('pending', 'retry')
+                    ) AS oldest_pending_at,
+                    MAX(completed_at) FILTER (
+                        WHERE status = 'completed'
+                    ) AS last_completed_at
+                FROM webhook_event_queue
+                """
+            )
+            row = cursor.fetchone() or {}
+            return dict(row)
+
+
 def has_pending_events() -> bool:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:

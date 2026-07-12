@@ -320,7 +320,9 @@ def _enqueue_persistent_webhook_task(
 def _execute_persisted_webhook_event(processor, event_id, task_kind, payload):
     payload = dict(payload or {})
     try:
-        if task_kind == 'media_process':
+        if task_kind == 'diagnostic':
+            logger.info(f"  ➜ [Webhook队列] 只读诊断事件 {event_id} 已通过完整调度链路。")
+        elif task_kind == 'media_process':
             succeeded = _handle_full_processing_flow(processor, **payload)
             if not succeeded:
                 raise RuntimeError("Emby 项目尚未准备完成或核心处理未成功")

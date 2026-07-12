@@ -1,6 +1,7 @@
 # routes/tasks.py
 
 import logging
+import uuid
 from flask import Blueprint, request, jsonify
 
 # 导入您项目中用于管理和执行任务的核心模块
@@ -84,10 +85,39 @@ def get_webhook_events():
     try:
         limit = request.args.get('limit', 50, type=int)
         events = webhook_event_db.list_recent_events(limit=limit)
-        return jsonify({"events": events}), 200
+        summary = webhook_event_db.get_queue_summary()
+        return jsonify({"events": events, "summary": summary}), 200
     except Exception as exc:
         logger.error(f"获取 Webhook 事件队列失败: {exc}", exc_info=True)
         return jsonify({"error": "无法获取 Webhook 事件队列"}), 500
+
+
+@tasks_bp.route('/webhook-events/diagnostic', methods=['POST'])
+@admin_required
+def enqueue_webhook_diagnostic():
+    try:
+        diagnostic_id = uuid.uuid4().hex
+        event_id, _ = webhook_event_db.enqueue_event(
+            dedupe_key=f"diagnostic:{diagnostic_id}",
+            event_source='diagnostic',
+            task_kind='diagnostic',
+            task_name='Webhook 队列只读自检',
+            item_id=diagnostic_id,
+            item_name='队列诊断',
+            item_type='Diagnostic',
+            payload={'read_only': True},
+            max_attempts=1,
+        )
+
+        from routes.webhook import _schedule_persistent_webhook_drain
+        _schedule_persistent_webhook_drain(delay=0)
+        return jsonify({
+            "message": "只读诊断事件已进入队列",
+            "event_id": event_id,
+        }), 202
+    except Exception as exc:
+        logger.error(f"创建 Webhook 队列诊断事件失败: {exc}", exc_info=True)
+        return jsonify({"error": "无法创建队列诊断事件"}), 500
 
 
 @tasks_bp.route('/webhook-events/<int:event_id>/retry', methods=['POST'])

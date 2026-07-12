@@ -142,6 +142,12 @@ const routes = [
     meta: { requiresAuth: true },
   },
   {
+    path: '/person-cleanup',
+    name: 'PersonCleanupPage',
+    component: () => import('../components/PersonCleanupPage.vue'),
+    meta: { requiresAuth: true, requiresAdmin: true },
+  },
+  {
     path: '/user-management',
     name: 'UserManagement',
     component: UserManagementPage,

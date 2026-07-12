@@ -8,6 +8,58 @@ import task_manager
 import config_manager
 import extensions
 logger = logging.getLogger(__name__)
+
+UPDATER_IMAGE = "containrrr/watchtower"
+UPDATER_ROLE_LABEL = "com.emby-toolkit.role"
+UPDATER_TARGET_LABEL = "com.emby-toolkit.target"
+STALE_UPDATER_STATES = {'created', 'exited', 'dead'}
+
+
+def _is_toolkit_updater(container, target_container_name):
+    attrs = container.attrs or {}
+    config = attrs.get('Config') or {}
+    labels = config.get('Labels') or {}
+    if (
+        labels.get(UPDATER_ROLE_LABEL) == 'updater'
+        and labels.get(UPDATER_TARGET_LABEL) == target_container_name
+    ):
+        return True
+
+    image_name = str(config.get('Image') or '')
+    command = [str(part) for part in (config.get('Cmd') or [])]
+    return (
+        image_name.startswith(UPDATER_IMAGE)
+        and '--run-once' in command
+        and target_container_name in command
+    )
+
+
+def cleanup_stale_updater_containers(target_container_name, client=None):
+    """Remove only stopped Toolkit one-shot updaters for the target container."""
+    own_client = client is None
+    docker_client = client or docker.from_env()
+    removed = 0
+    try:
+        for container in docker_client.containers.list(all=True):
+            try:
+                container.reload()
+                if not _is_toolkit_updater(container, target_container_name):
+                    continue
+                if container.status not in STALE_UPDATER_STATES:
+                    continue
+                container.remove(force=True)
+                removed += 1
+                logger.info(f"  ➜ 已清理更新器残留容器: {container.name}")
+            except docker.errors.NotFound:
+                continue
+            except Exception as exc:
+                logger.warning(f"清理更新器容器 '{container.name}' 失败: {exc}")
+        return removed
+    finally:
+        if own_client:
+            docker_client.close()
+
+
 def _update_process_generator(container_name, image_name_tag):
     """
     核心更新逻辑生成器。
@@ -87,7 +139,25 @@ def _update_process_generator(container_name, image_name_tag):
         yield {"status": "镜像拉取完成，准备应用更新..."}
 
         try:
-            updater_image = "containrrr/watchtower"
+            updater_image = UPDATER_IMAGE
+            updater_name = f"{container_name}-toolkit-updater"
+
+            removed = cleanup_stale_updater_containers(container_name, client=client)
+            if removed:
+                yield {"status": f"已清理 {removed} 个旧更新器残留。"}
+
+            try:
+                existing_updater = client.containers.get(updater_name)
+                existing_updater.reload()
+                if existing_updater.status in {'running', 'restarting'}:
+                    yield {
+                        "status": "已有更新任务正在运行，请稍后再试。",
+                        "event": "ERROR",
+                    }
+                    return
+                existing_updater.remove(force=True)
+            except docker.errors.NotFound:
+                pass
             
             # 确保 watchtower 镜像存在
             try:
@@ -104,8 +174,13 @@ def _update_process_generator(container_name, image_name_tag):
             client.containers.run(
                 image=updater_image,
                 command=command,
+                name=updater_name,
                 remove=True,
                 detach=True,
+                labels={
+                    UPDATER_ROLE_LABEL: 'updater',
+                    UPDATER_TARGET_LABEL: container_name,
+                },
                 volumes={'/var/run/docker.sock': {'bind': '/var/run/docker.sock', 'mode': 'rw'}}
             )
             

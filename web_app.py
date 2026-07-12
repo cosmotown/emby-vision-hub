@@ -44,8 +44,10 @@ from routes.cover_generator_config import cover_generator_config_bp
 from routes.tasks import tasks_bp
 from routes.resubscribe import resubscribe_bp
 from routes.media_cleanup import media_cleanup_bp
+from routes.person_cleanup import person_cleanup_bp
 from routes.user_management import user_management_bp
 from routes.webhook import webhook_bp, resume_persistent_webhook_queue
+from tasks.system_update import cleanup_stale_updater_containers
 from routes.unified_auth import unified_auth_bp
 from routes.user_portal import user_portal_bp
 from routes.discover import discover_bp
@@ -415,6 +417,7 @@ app.register_blueprint(cover_generator_config_bp)
 app.register_blueprint(tasks_bp)
 app.register_blueprint(resubscribe_bp)
 app.register_blueprint(media_cleanup_bp)
+app.register_blueprint(person_cleanup_bp)
 app.register_blueprint(user_management_bp)
 app.register_blueprint(webhook_bp)
 app.register_blueprint(unified_auth_bp)
@@ -440,6 +443,15 @@ def main_app_start():
         log_size = constants.DEFAULT_LOG_ROTATION_SIZE_MB
         log_backups = constants.DEFAULT_LOG_ROTATION_BACKUPS
     add_file_handler(log_directory=config_manager.LOG_DIRECTORY, log_size_mb=log_size, log_backups=log_backups)
+
+    def cleanup_update_helpers():
+        try:
+            container_name = config_manager.APP_CONFIG.get('container_name', 'emby-toolkit')
+            cleanup_stale_updater_containers(container_name)
+        except Exception as exc:
+            logger.debug(f"启动时清理更新器残留失败，不影响应用运行: {exc}")
+
+    spawn_later(2, cleanup_update_helpers)
     
     connection.init_db()
 

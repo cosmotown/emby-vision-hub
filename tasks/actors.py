@@ -8,15 +8,150 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 导入需要的底层模块和共享实例
 from database.connection import get_db_connection
-from database import actor_db
+from database import actor_db, person_cleanup_db
 import constants
 import handler.emby as emby
 import task_manager
 import utils
 from actor_utils import enrich_all_actor_aliases_task
 from handler.actor_sync import UnifiedSyncHandler
+from services.person_cleanup_safety import classify_reference_check, find_ghost_candidates
 
 logger = logging.getLogger(__name__)
+
+
+def task_scan_ghost_actor_candidates(processor):
+    task_name = "扫描幽灵人物"
+    logger.info(f"--- 开始只读任务: '{task_name}' ---")
+    task_manager.update_status_from_thread(0, "正在读取全部媒体库...")
+
+    try:
+        libraries = emby.get_all_libraries_with_paths(
+            processor.emby_url,
+            processor.emby_api_key,
+        )
+        library_ids = [lib.get('info', {}).get('Id') for lib in libraries or []]
+        library_ids = [library_id for library_id in library_ids if library_id]
+        if not library_ids:
+            raise RuntimeError("无法获取任何有效媒体库，已终止扫描")
+
+        reference_scan = emby.get_referenced_person_ids_strict(
+            processor.emby_url,
+            processor.emby_api_key,
+            library_ids,
+        )
+        if reference_scan is None:
+            raise RuntimeError("至少一个媒体库读取失败，候选列表保持不变")
+        if reference_scan['media_count'] > 0 and not reference_scan['person_ids']:
+            raise RuntimeError("媒体存在但未返回人物关联，已拒绝生成候选")
+
+        referenced_person_ids = reference_scan['person_ids']
+        logger.info(f"  ➜ 已建立 {len(referenced_person_ids)} 位在用人物的安全白名单。")
+
+        all_people = []
+        person_generator = emby.get_all_persons_from_emby(
+            base_url=processor.emby_url,
+            api_key=processor.emby_api_key,
+            user_id=processor.emby_user_id,
+            stop_event=processor.get_stop_event(),
+            force_full_scan=True,
+            update_status_callback=task_manager.update_status_from_thread,
+        )
+        for person_batch in person_generator:
+            if processor.is_stop_requested():
+                task_manager.update_status_from_thread(100, "扫描已中止，候选列表保持不变")
+                return
+            all_people.extend(person_batch)
+
+        if not all_people:
+            raise RuntimeError("未能读取 Emby 人物列表，候选列表保持不变")
+
+        candidates = find_ghost_candidates(all_people, referenced_person_ids)
+        saved_count = person_cleanup_db.replace_candidates(candidates)
+        message = f"只读扫描完成：发现 {saved_count} 位待人工复核的幽灵人物候选。"
+        logger.info(f"  ➜ {message}")
+        task_manager.update_status_from_thread(100, message)
+    except Exception as exc:
+        logger.error(f"执行 '{task_name}' 失败: {exc}", exc_info=True)
+        task_manager.update_status_from_thread(-1, f"扫描失败: {exc}")
+        raise
+
+
+def task_delete_selected_ghost_actors(processor, person_ids):
+    task_name = "删除选中幽灵人物"
+    requested_ids = sorted({str(person_id) for person_id in person_ids if person_id})
+    candidates = person_cleanup_db.get_candidates_by_ids(requested_ids)
+    candidate_map = {str(item['person_id']): item for item in candidates}
+
+    if not requested_ids or len(candidate_map) != len(requested_ids):
+        task_manager.update_status_from_thread(-1, "删除已取消：包含不在候选列表中的人物")
+        return
+
+    deleted_count = 0
+    linked_count = 0
+    failed_count = 0
+    total = len(requested_ids)
+
+    for index, person_id in enumerate(requested_ids, start=1):
+        if processor.is_stop_requested():
+            break
+        candidate = candidate_map[person_id]
+        person_name = candidate.get('person_name') or person_id
+        progress = int(((index - 1) / total) * 100)
+        task_manager.update_status_from_thread(
+            progress,
+            f"({index}/{total}) 删除前复核: {person_name}",
+        )
+
+        references = emby.get_person_media_references(
+            processor.emby_url,
+            processor.emby_api_key,
+            person_id,
+            limit=1,
+        )
+        reference_status = classify_reference_check(references)
+        if reference_status == 'verification_failed':
+            failed_count += 1
+            person_cleanup_db.mark_candidate_checked(person_id, "无法连接 Emby 完成删除前复核")
+            continue
+        if reference_status == 'linked':
+            linked_count += 1
+            person_cleanup_db.remove_candidate(person_id)
+            logger.warning(f"  ➜ 跳过 '{person_name}'：删除前发现新的媒体关联。")
+            continue
+
+        if not emby.delete_person_custom_api(
+            processor.emby_url,
+            processor.emby_api_key,
+            person_id,
+        ):
+            failed_count += 1
+            person_cleanup_db.mark_candidate_checked(person_id, "Emby 删除失败，请检查神医接口和管理员配置")
+            continue
+
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "DELETE FROM person_identity_map WHERE emby_person_id = %s",
+                        (person_id,),
+                    )
+            person_cleanup_db.remove_candidate(person_id)
+            deleted_count += 1
+        except Exception as exc:
+            failed_count += 1
+            person_cleanup_db.mark_candidate_checked(
+                person_id,
+                f"Emby 已删除，但 Toolkit 映射清理失败: {exc}",
+            )
+        time.sleep(0.2)
+
+    message = (
+        f"人物清理完成：删除 {deleted_count}，因重新发现关联跳过 {linked_count}，"
+        f"失败 {failed_count}。"
+    )
+    logger.info(f"  ➜ {message}")
+    task_manager.update_status_from_thread(100, message)
 
 # --- 同步演员映射表 ---
 def task_sync_person_map(processor):
@@ -588,7 +723,8 @@ def task_merge_duplicate_actors(processor):
         logger.error(f"执行 '{task_name}' 任务时发生严重错误: {e}", exc_info=True)
         task_manager.update_status_from_thread(-1, f"任务失败: {e}")
 
-def task_purge_ghost_actors(processor):
+def _disabled_legacy_task_purge_ghost_actors(processor):
+    raise RuntimeError("旧版直接删除幽灵人物任务已停用，请使用人物清理页面")
     """
     【高危 V2 - 命名修正版】
     - 精准打击在整个Emby服务器范围内，没有任何媒体项关联的“幽灵”演员。
@@ -713,7 +849,8 @@ def task_purge_ghost_actors(processor):
         logger.error(f"执行 '{task_name}' 任务时发生严重错误: {e}", exc_info=True)
         task_manager.update_status_from_thread(-1, f"任务失败: {e}")
 
-def task_purge_unregistered_actors(processor):
+def _disabled_legacy_task_purge_unregistered_actors(processor):
+    raise RuntimeError("删除黑户人物任务已永久停用")
     """
     【高危 V5 - 命名修正版】
     - 清理那些有关联媒体，但没有TMDb ID的“黑户”演员。

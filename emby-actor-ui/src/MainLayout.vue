@@ -460,6 +460,7 @@ const menuOptions = computed(() => {
           { label: '原生合集', key: 'Collections', icon: renderIcon(CollectionsIcon) }, 
           { label: '自建合集', key: 'CustomCollectionsManager', icon: renderIcon(CustomCollectionsIcon) }, 
           { label: '媒体去重', key: 'MediaCleanupPage', icon: renderIcon(CleanupIcon) },
+          { label: '人物清理', key: 'PersonCleanupPage', icon: renderIcon(ActorSubIcon) },
           { label: '媒体整理', key: 'ResubscribePage', icon: renderIcon(ResubscribeIcon) },
           { label: '自动标签', key: 'AutoTaggingPage', icon: renderIcon(TagIcon) },  
           { label: '手动处理', key: 'ReviewList', icon: renderIcon(ReviewListIcon) }, 

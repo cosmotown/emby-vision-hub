@@ -107,6 +107,17 @@ def init_db():
                     )
                 """)
 
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS person_cleanup_candidates (
+                        person_id TEXT PRIMARY KEY,
+                        person_name TEXT,
+                        provider_ids_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        discovered_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        last_checked_at TIMESTAMP WITH TIME ZONE,
+                        last_error TEXT
+                    )
+                """)
+
                 logger.trace("  ➜ 正在创建 'emby_users' 表...")
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS emby_users (
@@ -566,6 +577,10 @@ def init_db():
                     cursor.execute("""
                         CREATE INDEX IF NOT EXISTS idx_webhook_event_item
                         ON webhook_event_queue (item_id, created_at DESC)
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_person_cleanup_discovered
+                        ON person_cleanup_candidates (discovered_at DESC)
                     """)
 
                 except Exception as e_index:

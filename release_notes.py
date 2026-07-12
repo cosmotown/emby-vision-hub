@@ -2,6 +2,30 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.3",
+        "published_at": "2026-07-13T00:34:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.3",
+        "changelog": """## 维护与人物清理安全化
+
+### 修复
+- 网页一键更新创建的 Watchtower 使用固定名称和 Toolkit 专属标签，不再产生难以识别的随机容器名。
+- 每次更新前自动清理同目标的 `created`、`exited`、`dead` 更新器残留。
+- 新版本启动后再次清理残留，兼容旧版本创建的随机名称 `--run-once` Watchtower 容器。
+
+### 人物清理
+- 停用“删除黑户演员”：缺少 TMDb ID 不再被视为可删除依据。
+- 旧版直接删除幽灵演员任务退出自动任务链，改为独立的“人物清理”页面和只读候选扫描。
+- 删除只能处理人工勾选的当前候选，每位人物删除前都会重新查询 Emby 的电影、剧集、分集和视频关联。
+- 只有 Emby 明确返回关联数量为 `0` 才允许调用神医删除接口；查询失败、结果异常或发现任何关联都会跳过。
+- Emby 删除成功后才清理 Toolkit 的人物映射，候选和错误信息保存在独立表中便于复核。
+
+### 安全
+- 运行中或重启中的更新器不会被删除，避免中断正在执行的升级。
+- 只识别 Toolkit 专属标签，或明确以 `--run-once` 更新当前 Toolkit 容器的旧版任务；不会清理用户自行部署的 Watchtower。
+- 新增候选表不修改现有业务表；不修改 Compose、Webhook、虚拟库或 302 播放转发。
+""",
+    },
+    {
         "version": "v7.1.2",
         "published_at": "2026-07-12T21:45:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.2",

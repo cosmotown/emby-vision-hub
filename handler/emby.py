@@ -632,7 +632,7 @@ def get_emby_library_items(
     sort_by: Optional[str] = None,
     sort_order: Optional[str] = "Descending",
     limit: Optional[int] = None,
-    force_user_endpoint: bool = False
+    force_user_endpoint: bool = False,
 ) -> Optional[List[Dict[str, Any]]]:
     if not base_url or not api_key:
         logger.error("get_emby_library_items: base_url 或 api_key 未提供。")
@@ -723,6 +723,62 @@ def get_emby_library_items(
     logger.debug(f"  ➜ 总共从 {len(library_ids)} 个选定库中获取到 {len(all_items_from_selected_libraries)} 个 {media_type_in_chinese} 项目。")
     
     return all_items_from_selected_libraries
+
+
+def get_referenced_person_ids_strict(
+    base_url: str,
+    api_key: str,
+    library_ids: List[str],
+    batch_size: int = 500,
+) -> Optional[Dict[str, Any]]:
+    """Page every library and fail closed if any media/person reference request fails."""
+    referenced_person_ids = set()
+    media_count = 0
+    api_url = f"{base_url.rstrip('/')}/Items"
+
+    for library_id in library_ids:
+        start_index = 0
+        while True:
+            params = {
+                'api_key': api_key,
+                'ParentId': library_id,
+                'Recursive': 'true',
+                'IncludeItemTypes': 'Movie,Series,Episode,Video,MusicVideo',
+                'Fields': 'People',
+                'StartIndex': start_index,
+                'Limit': max(1, int(batch_size)),
+                'EnableTotalRecordCount': 'false',
+            }
+            try:
+                response = emby_client.get(api_url, params=params, timeout=60)
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict) or 'Items' not in payload:
+                    raise ValueError("Emby 响应缺少 Items")
+                items = payload.get('Items') or []
+            except Exception as exc:
+                logger.error(
+                    f"严格扫描媒体库 {library_id} 失败 (StartIndex={start_index}): {exc}",
+                    exc_info=True,
+                )
+                return None
+
+            if not items:
+                break
+            media_count += len(items)
+            for item in items:
+                for person in item.get('People') or []:
+                    if person.get('Id'):
+                        referenced_person_ids.add(str(person['Id']))
+
+            start_index += len(items)
+            if len(items) < max(1, int(batch_size)):
+                break
+
+    return {
+        'person_ids': referenced_person_ids,
+        'media_count': media_count,
+    }
 
 # ✨✨✨ 刷新Emby元数据 ✨✨✨
 def refresh_emby_item_metadata(item_emby_id: str,
@@ -1878,6 +1934,40 @@ def delete_item(item_id: str, emby_server_url: str, emby_api_key: str, user_id: 
         return False    
 
 # --- 清理幽灵演员 ---
+def get_person_media_references(
+    base_url: str,
+    api_key: str,
+    person_id: str,
+    limit: int = 1,
+) -> Optional[Dict[str, Any]]:
+    """Return current media references for a Person, or None when verification failed."""
+    if not base_url or not api_key or not person_id:
+        return None
+
+    api_url = f"{base_url.rstrip('/')}/Items"
+    params = {
+        'api_key': api_key,
+        'PersonIds': str(person_id),
+        'Recursive': 'true',
+        'IncludeItemTypes': 'Movie,Series,Episode,Video,MusicVideo',
+        'Fields': 'Id,Name,Type,SeriesName',
+        'Limit': max(1, int(limit)),
+        'EnableTotalRecordCount': 'true',
+    }
+    try:
+        response = emby_client.get(api_url, params=params, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+        items = payload.get('Items') or []
+        return {
+            'count': int(payload.get('TotalRecordCount', len(items)) or 0),
+            'items': items,
+        }
+    except Exception as exc:
+        logger.error(f"复核人物 {person_id} 的媒体关联失败: {exc}")
+        return None
+
+
 def delete_person_custom_api(base_url: str, api_key: str, person_id: str) -> bool:
     """
     【V-Final Frontier 终极版 - 同样使用账密获取令牌】

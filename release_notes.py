@@ -2,6 +2,21 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.4",
+        "published_at": "2026-07-13T19:25:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.4",
+        "changelog": """## 人物头像代理安全修复
+
+### 修复
+- Emby 人物主图不存在或上游返回 `404/500` 时，人物清理页面改为显示默认头像，不再记录大量“严重错误”和完整堆栈。
+- 图片代理保留宽度、质量等参数，并改用 `X-Emby-Token` 请求头认证；API Key 不再出现在请求 URL 或异常日志中。
+- 上游图片失败只影响头像展示，不影响只读候选扫描结果，也不会触发人物删除。
+
+### 安全
+- 不修改人物候选判定、删除前复核、Emby 数据库、Webhook、虚拟库、封面或 302 播放转发。
+""",
+    },
+    {
         "version": "v7.1.3",
         "published_at": "2026-07-13T00:34:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.3",

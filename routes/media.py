@@ -207,42 +207,59 @@ def proxy_external_image():
 def proxy_emby_image(image_path):
     """
     一个安全的、动态的 Emby 图片代理。
-    【V2 - 完整修复版】确保 api_key 作为 URL 参数传递，适用于所有图片类型。
+    认证信息仅通过请求头传递，避免出现在 URL 和异常日志中。
     """
     try:
         emby_url = extensions.media_processor_instance.emby_url.rstrip('/')
         emby_api_key = extensions.media_processor_instance.emby_api_key
 
-        # 1. 构造基础 URL，包含路径和原始查询参数
-        query_string = request.query_string.decode('utf-8')
         target_url = f"{emby_url}/{image_path}"
-        if query_string:
-            target_url += f"?{query_string}"
-        
-        # 2. ★★★ 核心修复：将 api_key 作为 URL 参数追加 ★★★
-        # 判断是使用 '?' 还是 '&' 来追加 api_key
-        separator = '&' if '?' in target_url else '?'
-        target_url_with_key = f"{target_url}{separator}api_key={emby_api_key}"
-        
-        logger.trace(f"代理图片请求 (最终URL): {target_url_with_key}")
+        query_params = [
+            (key, value)
+            for key in request.args.keys()
+            if key.lower() != 'api_key'
+            for value in request.args.getlist(key)
+        ]
 
-        # 3. 发送请求
-        emby_response = requests.get(target_url_with_key, stream=True, timeout=20)
+        logger.trace(f"代理 Emby 图片请求: {target_url}")
+
+        emby_response = requests.get(
+            target_url,
+            params=query_params,
+            headers={'X-Emby-Token': emby_api_key},
+            stream=True,
+            timeout=20,
+        )
+        if emby_response.status_code in (404, 500):
+            logger.debug(
+                "Emby 图片不可用，使用前端默认图: path=%s status=%s",
+                image_path,
+                emby_response.status_code,
+            )
+            return Response(status=404, headers={'Cache-Control': 'no-store'})
         emby_response.raise_for_status()
 
-        # 4. 将 Emby 的响应流式传输回浏览器
         return Response(
             stream_with_context(emby_response.iter_content(chunk_size=8192)),
             content_type=emby_response.headers.get('Content-Type'),
             status=emby_response.status_code
         )
-    except Exception as e:
-        logger.error(f"代理 Emby 图片时发生严重错误: {e}", exc_info=True)
-        # 返回一个1x1的透明像素点作为占位符，避免显示大的裂图图标
-        return Response(
-            b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82',
-            mimetype='image/png'
+    except requests.exceptions.RequestException as exc:
+        status_code = exc.response.status_code if exc.response is not None else None
+        logger.warning(
+            "代理 Emby 图片失败: path=%s status=%s error=%s",
+            image_path,
+            status_code or '-',
+            type(exc).__name__,
         )
+        return Response(status=404, headers={'Cache-Control': 'no-store'})
+    except Exception as exc:
+        logger.error(
+            "代理 Emby 图片发生未预期错误: path=%s error=%s",
+            image_path,
+            type(exc).__name__,
+        )
+        return Response(status=404, headers={'Cache-Control': 'no-store'})
     
 # ✨✨✨ 一键翻译 ✨✨✨
 @media_api_bp.route('/actions/translate_cast_sa', methods=['POST']) # 注意路径不同

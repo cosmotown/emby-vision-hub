@@ -22,6 +22,16 @@ class PersonCleanupSafetyTests(unittest.TestCase):
 
         self.assertEqual([person['Id'] for person in candidates], ['2'])
 
+    def test_protected_person_without_provider_ids_is_never_a_candidate(self):
+        people = [
+            {'Id': '1', 'Name': '普通幽灵人物', 'ProviderIds': {}},
+            {'Id': '2', 'Name': '保护库人物', 'ProviderIds': {}},
+        ]
+
+        candidates = find_ghost_candidates(people, set() | {'2'})
+
+        self.assertEqual([person['Id'] for person in candidates], ['1'])
+
     def test_only_explicit_zero_reference_count_is_deletable(self):
         self.assertEqual(classify_reference_check({'count': 0, 'items': []}), 'orphan')
         self.assertEqual(classify_reference_check({'count': 1, 'items': [{}]}), 'linked')
@@ -89,6 +99,26 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertIn('remove_candidate', verify_source)
         self.assertNotIn('delete_person_custom_api', verify_source)
         self.assertIn('is_verified_orphan_candidate', delete_source)
+
+    def test_protected_library_snapshots_are_merged_not_replaced(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        db_tree = ast.parse((repo_root / 'database' / 'person_cleanup_db.py').read_text())
+        functions = {
+            node.name: node
+            for node in db_tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        merge_source = ast.unparse(functions['merge_protected_people_for_library'])
+        task_source = (repo_root / 'tasks' / 'actors.py').read_text()
+        schema_source = (repo_root / 'database' / 'connection.py').read_text()
+
+        self.assertNotIn('DELETE FROM person_cleanup_protected_people', merge_source)
+        self.assertIn('ON CONFLICT', merge_source)
+        self.assertIn('merge_protected_people_for_library', task_source)
+        self.assertIn('get_protected_person_ids', task_source)
+        self.assertIn('capture_library_ids=protected_library_ids', task_source)
+        self.assertIn('person_cleanup_protected_libraries', schema_source)
+        self.assertIn('person_cleanup_protected_people', schema_source)
 
 
 if __name__ == '__main__':

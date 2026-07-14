@@ -18,7 +18,7 @@ from collections import defaultdict
 
 import config_manager
 import constants
-from typing import Optional, List, Dict, Any, Generator, Tuple, Set, Callable
+from typing import Optional, List, Dict, Any, Generator, Tuple, Set, Callable, Iterable
 import logging
 logger = logging.getLogger(__name__)
 
@@ -730,13 +730,22 @@ def get_referenced_person_ids_strict(
     api_key: str,
     library_ids: List[str],
     batch_size: int = 500,
+    capture_library_ids: Optional[Iterable[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Page every library and fail closed if any media/person reference request fails."""
     referenced_person_ids = set()
+    people_by_library = {}
+    capture_ids = {str(library_id) for library_id in (capture_library_ids or []) if library_id}
     media_count = 0
     api_url = f"{base_url.rstrip('/')}/Items"
 
     for library_id in library_ids:
+        normalized_library_id = str(library_id)
+        library_people = (
+            people_by_library.setdefault(normalized_library_id, {})
+            if normalized_library_id in capture_ids
+            else None
+        )
         start_index = 0
         while True:
             params = {
@@ -769,7 +778,10 @@ def get_referenced_person_ids_strict(
             for item in items:
                 for person in item.get('People') or []:
                     if person.get('Id'):
-                        referenced_person_ids.add(str(person['Id']))
+                        person_id = str(person['Id'])
+                        referenced_person_ids.add(person_id)
+                        if library_people is not None:
+                            library_people[person_id] = person.get('Name') or ''
 
             start_index += len(items)
             if len(items) < max(1, int(batch_size)):
@@ -777,6 +789,7 @@ def get_referenced_person_ids_strict(
 
     return {
         'person_ids': referenced_person_ids,
+        'people_by_library': people_by_library,
         'media_count': media_count,
     }
 

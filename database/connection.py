@@ -118,6 +118,24 @@ def init_db():
                     )
                 """)
 
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS person_cleanup_protected_libraries (
+                        library_id TEXT PRIMARY KEY,
+                        library_name TEXT NOT NULL,
+                        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+                    )
+                """)
+
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS person_cleanup_protected_people (
+                        library_id TEXT NOT NULL REFERENCES person_cleanup_protected_libraries(library_id) ON DELETE CASCADE,
+                        person_id TEXT NOT NULL,
+                        person_name TEXT,
+                        captured_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (library_id, person_id)
+                    )
+                """)
+
                 logger.trace("  ➜ 正在创建 'emby_users' 表...")
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS emby_users (
@@ -581,6 +599,10 @@ def init_db():
                     cursor.execute("""
                         CREATE INDEX IF NOT EXISTS idx_person_cleanup_discovered
                         ON person_cleanup_candidates (discovered_at DESC)
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_person_cleanup_protected_person
+                        ON person_cleanup_protected_people (person_id)
                     """)
 
                 except Exception as e_index:

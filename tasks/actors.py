@@ -35,10 +35,17 @@ def task_scan_ghost_actor_candidates(processor):
         if not library_ids:
             raise RuntimeError("无法获取任何有效媒体库，已终止扫描")
 
+        protected_libraries = person_cleanup_db.list_protected_libraries()
+        protected_library_ids = {
+            str(item.get('library_id'))
+            for item in protected_libraries
+            if item.get('library_id')
+        }
         reference_scan = emby.get_referenced_person_ids_strict(
             processor.emby_url,
             processor.emby_api_key,
             library_ids,
+            capture_library_ids=protected_library_ids,
         )
         if reference_scan is None:
             raise RuntimeError("至少一个媒体库读取失败，候选列表保持不变")
@@ -47,6 +54,29 @@ def task_scan_ghost_actor_candidates(processor):
 
         referenced_person_ids = reference_scan['person_ids']
         logger.info(f"  ➜ 已建立 {len(referenced_person_ids)} 位在用人物的安全白名单。")
+
+        protected_snapshots = reference_scan.get('people_by_library') or {}
+        for protected_library in protected_libraries:
+            library_id = str(protected_library.get('library_id') or '')
+            library_people = protected_snapshots.get(library_id)
+            if library_people is None:
+                logger.warning(
+                    f"  ➜ 受保护媒体库 '{protected_library.get('library_name') or library_id}' "
+                    "本次未返回人物快照，保留原保护记录。"
+                )
+                continue
+            person_cleanup_db.merge_protected_people_for_library(
+                library_id,
+                [
+                    {'person_id': person_id, 'person_name': person_name}
+                    for person_id, person_name in library_people.items()
+                ],
+            )
+
+        protected_person_ids = person_cleanup_db.get_protected_person_ids()
+        if protected_person_ids:
+            referenced_person_ids = referenced_person_ids | protected_person_ids
+            logger.info(f"  ➜ 受保护媒体库快照额外保护 {len(protected_person_ids)} 位人物。")
 
         all_people = []
         person_generator = emby.get_all_persons_from_emby(
@@ -68,7 +98,10 @@ def task_scan_ghost_actor_candidates(processor):
 
         candidates = find_ghost_candidates(all_people, referenced_person_ids)
         saved_count = person_cleanup_db.replace_candidates(candidates)
-        message = f"只读扫描完成：发现 {saved_count} 位待人工复核的幽灵人物候选。"
+        message = (
+            f"只读扫描完成：发现 {saved_count} 位待人工复核的幽灵人物候选；"
+            f"保护库快照覆盖 {len(protected_person_ids)} 位人物。"
+        )
         logger.info(f"  ➜ {message}")
         task_manager.update_status_from_thread(100, message)
     except Exception as exc:

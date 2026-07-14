@@ -36,6 +36,51 @@
       扫描只生成候选，不会删除人物。删除仅处理人工勾选项，并会在每次删除前重新查询 Emby；发现任何关联作品或复核失败都会跳过。删除接口需要神医 Pro 支持。
     </n-alert>
 
+    <section class="protected-libraries-panel">
+      <n-space justify="space-between" align="center" style="margin-bottom: 12px;">
+        <div>
+          <n-text strong>受保护（跳过清理）的媒体库</n-text>
+          <n-text depth="3" style="display:block;font-size:13px;margin-top:4px;">
+            保存后执行一次只读扫描。库中出现过的人物会持续受保护，即使没有 TMDb ID 或以后失去作品关联，也不会进入清理候选。
+          </n-text>
+        </div>
+        <n-space :wrap="false">
+          <n-button size="small" :loading="protectedLoading" @click="fetchProtectedLibraries">刷新媒体库</n-button>
+          <n-button
+            size="small"
+            type="primary"
+            :loading="protectedSaving"
+            :disabled="isBackgroundBusy"
+            @click="saveProtectedLibraries"
+          >
+            保存保护设置
+          </n-button>
+        </n-space>
+      </n-space>
+      <n-spin :show="protectedLoading">
+        <n-checkbox-group v-model:value="selectedProtectedIds">
+          <n-space v-if="protectedLibraries.length" wrap>
+            <n-checkbox
+              v-for="library in protectedLibraries"
+              :key="library.library_id"
+              :value="library.library_id"
+            >
+              <n-space align="center" :size="6">
+                <span>{{ library.library_name }}</span>
+                <n-tag v-if="library.missing" size="small" type="warning" :bordered="false">
+                  Emby 中已不存在
+                </n-tag>
+                <n-tag v-if="library.protected_person_count" size="small" :bordered="false">
+                  已保护 {{ library.protected_person_count }} 人
+                </n-tag>
+              </n-space>
+            </n-checkbox>
+          </n-space>
+          <n-empty v-else-if="!protectedLoading" description="没有读取到可保护的 Emby 媒体库" size="small" />
+        </n-checkbox-group>
+      </n-spin>
+    </section>
+
     <n-alert
       v-if="taskStatus?.last_action?.includes('幽灵人物') && taskStatus?.message"
       :type="taskStatus.progress < 0 || taskStatus.message.includes('失败') ? 'error' : 'info'"
@@ -230,6 +275,8 @@ import {
   NAlert,
   NButton,
   NCard,
+  NCheckbox,
+  NCheckboxGroup,
   NDataTable,
   NDescriptions,
   NDescriptionsItem,
@@ -264,6 +311,10 @@ const verifyLoading = ref(false);
 const verifyError = ref('');
 const verifyingCandidate = ref(null);
 const verificationResult = ref(null);
+const protectedLibraries = ref([]);
+const selectedProtectedIds = ref([]);
+const protectedLoading = ref(false);
+const protectedSaving = ref(false);
 const pagination = { pageSize: 30, showSizePicker: true, pageSizes: [20, 30, 50, 100] };
 
 const currentAction = computed(() => props.taskStatus?.current_action || '');
@@ -438,6 +489,36 @@ const fetchCandidates = async () => {
   }
 };
 
+const fetchProtectedLibraries = async () => {
+  protectedLoading.value = true;
+  try {
+    const response = await axios.get('/api/person-cleanup/protected-libraries');
+    protectedLibraries.value = response.data.libraries || [];
+    selectedProtectedIds.value = protectedLibraries.value
+      .filter((library) => library.selected)
+      .map((library) => library.library_id);
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法读取受保护媒体库');
+  } finally {
+    protectedLoading.value = false;
+  }
+};
+
+const saveProtectedLibraries = async () => {
+  protectedSaving.value = true;
+  try {
+    const response = await axios.post('/api/person-cleanup/protected-libraries', {
+      library_ids: selectedProtectedIds.value,
+    });
+    message.success(response.data.message || '保护设置已保存');
+    await fetchProtectedLibraries();
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法保存受保护媒体库');
+  } finally {
+    protectedSaving.value = false;
+  }
+};
+
 const scanCandidates = async () => {
   try {
     const response = await axios.post('/api/person-cleanup/scan');
@@ -479,11 +560,15 @@ watch(
   (isRunning, wasRunning) => {
     if (wasRunning && !isRunning && props.taskStatus?.last_action?.includes('幽灵人物')) {
       fetchCandidates();
+      fetchProtectedLibraries();
     }
   },
 );
 
-onMounted(fetchCandidates);
+onMounted(() => {
+  fetchCandidates();
+  fetchProtectedLibraries();
+});
 </script>
 
 <style scoped>
@@ -492,6 +577,13 @@ onMounted(fetchCandidates);
   min-height: 240px;
   align-items: center;
   justify-content: center;
+}
+
+.protected-libraries-panel {
+  padding: 16px;
+  margin-bottom: 16px;
+  border: 1px solid var(--n-border-color);
+  border-radius: 6px;
 }
 
 .identity-match {

@@ -2,6 +2,23 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.6",
+        "published_at": "2026-07-14T20:45:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.6",
+        "changelog": """## 人物清理受保护媒体库
+
+### 新增
+- 人物清理页可选择“受保护（跳过清理）的媒体库”，并显示每个库已保护的人物数量。
+- 下一次只读扫描会按 Emby Person ID 记录保护快照，不依赖 TMDb/IMDb；无外部 ID 的演员同样受保护。
+- 保护快照只增不减：人物曾在受保护库出现过，即使以后作品移除或关联丢失，也不会进入幽灵人物候选。
+
+### 安全
+- 扫描仍读取所有真实媒体库建立全局在用人物白名单，不通过跳过读取来制造假候选。
+- 取消某个库的保护时，只清除该库对应的保护快照；不会删除 Emby 人物、媒体或 Toolkit 人物映射。
+- 仅新增独立的保护库和人物快照表，不修改现有业务表、Webhook、虚拟库、封面或 302 播放转发。
+""",
+    },
+    {
         "version": "v7.1.5",
         "published_at": "2026-07-14T18:42:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.5",

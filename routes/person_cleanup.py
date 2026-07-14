@@ -47,6 +47,96 @@ def scan_person_cleanup_candidates():
     return jsonify({'message': '只读扫描任务已提交，不会删除任何人物'}), 202
 
 
+@person_cleanup_bp.route('/protected-libraries', methods=['GET'])
+@admin_required
+@processor_ready_required
+def get_person_cleanup_protected_libraries():
+    libraries = emby.get_all_libraries_with_paths(
+        extensions.media_processor_instance.emby_url,
+        extensions.media_processor_instance.emby_api_key,
+    )
+    if not libraries:
+        return jsonify({'error': '无法读取 Emby 媒体库，保护设置保持不变'}), 502
+    protected = {
+        str(item['library_id']): item
+        for item in person_cleanup_db.list_protected_libraries()
+    }
+    result = []
+    available_ids = set()
+    for library in libraries or []:
+        info = library.get('info') or {}
+        library_id = str(info.get('Id') or '').strip()
+        if not library_id:
+            continue
+        available_ids.add(library_id)
+        protected_info = protected.get(library_id) or {}
+        result.append({
+            'library_id': library_id,
+            'library_name': info.get('Name') or library_id,
+            'collection_type': info.get('CollectionType') or '',
+            'selected': library_id in protected,
+            'protected_person_count': int(protected_info.get('protected_person_count') or 0),
+            'missing': False,
+        })
+    for library_id, protected_info in protected.items():
+        if library_id in available_ids:
+            continue
+        result.append({
+            'library_id': library_id,
+            'library_name': protected_info.get('library_name') or library_id,
+            'collection_type': '',
+            'selected': True,
+            'protected_person_count': int(protected_info.get('protected_person_count') or 0),
+            'missing': True,
+        })
+    return jsonify({'libraries': result})
+
+
+@person_cleanup_bp.route('/protected-libraries', methods=['POST'])
+@admin_required
+@task_lock_required
+@processor_ready_required
+def save_person_cleanup_protected_libraries():
+    payload = request.get_json(silent=True) or {}
+    selected_ids = payload.get('library_ids')
+    if not isinstance(selected_ids, list):
+        return jsonify({'error': 'library_ids 必须为数组'}), 400
+    normalized_ids = {str(library_id).strip() for library_id in selected_ids if str(library_id).strip()}
+    if len(normalized_ids) > 100:
+        return jsonify({'error': '受保护媒体库数量不能超过 100'}), 400
+
+    libraries = emby.get_all_libraries_with_paths(
+        extensions.media_processor_instance.emby_url,
+        extensions.media_processor_instance.emby_api_key,
+    )
+    if not libraries:
+        return jsonify({'error': '无法读取 Emby 媒体库，保护设置未修改'}), 502
+    available = {}
+    for library in libraries or []:
+        info = library.get('info') or {}
+        library_id = str(info.get('Id') or '').strip()
+        if library_id:
+            available[library_id] = info.get('Name') or library_id
+
+    existing_protected = {
+        str(item['library_id']): item.get('library_name') or str(item['library_id'])
+        for item in person_cleanup_db.list_protected_libraries()
+    }
+    allowed = {**existing_protected, **available}
+    unknown_ids = sorted(normalized_ids - set(allowed))
+    if unknown_ids:
+        return jsonify({'error': '选择中包含已不存在的媒体库，请刷新后重试'}), 409
+
+    saved_count = person_cleanup_db.replace_protected_libraries([
+        {'library_id': library_id, 'library_name': allowed[library_id]}
+        for library_id in sorted(normalized_ids)
+    ])
+    return jsonify({
+        'message': f'已保存 {saved_count} 个受保护媒体库；请执行一次只读扫描以更新人物快照',
+        'count': saved_count,
+    })
+
+
 @person_cleanup_bp.route('/candidates/<person_id>/verify', methods=['POST'])
 @admin_required
 @processor_ready_required

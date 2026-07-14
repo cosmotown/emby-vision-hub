@@ -24,13 +24,6 @@ def classify_reference_check(result: Optional[Dict[str, Any]]) -> str:
     return 'orphan' if count == 0 else 'linked'
 
 
-def is_verified_orphan_candidate(candidate: Optional[Dict[str, Any]]) -> bool:
-    """A candidate must have a successful explicit verification before selection."""
-    if not isinstance(candidate, dict):
-        return False
-    return bool(candidate.get('last_checked_at')) and not candidate.get('last_error')
-
-
 def build_identity_provider_pairs(provider_ids: Any) -> List[str]:
     """Build Emby's exact provider filter for person identity comparison."""
     if isinstance(provider_ids, str):

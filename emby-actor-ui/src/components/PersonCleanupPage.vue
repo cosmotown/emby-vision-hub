@@ -33,7 +33,7 @@
     </n-page-header>
 
     <n-alert type="warning" title="安全说明" style="margin: 20px 0;">
-      扫描只生成候选，不会删除人物。删除仅处理人工勾选项，并会在每次删除前重新查询 Emby；发现任何关联作品或复核失败都会跳过。删除接口需要神医 Pro 支持。
+      扫描只生成候选，不会删除人物。“核对详情”用于人工参考，不是勾选前置条件。删除仅处理人工勾选项，并会在每次删除前重新查询 Emby；发现任何关联作品或复核失败都会跳过。删除接口需要神医 Pro 支持。
     </n-alert>
 
     <section class="protected-libraries-panel">
@@ -88,6 +88,11 @@
     >
       {{ taskStatus.message }}
     </n-alert>
+
+    <n-space align="center" style="margin: 16px 0 10px;">
+      <n-text strong>全服务器幽灵人物候选</n-text>
+      <n-text depth="3">已排除当前在用人物和保护库快照；候选失去关联后无法可靠反推原媒体库。</n-text>
+    </n-space>
 
     <div v-if="loading" class="center-state"><n-spin size="large" /></div>
     <n-alert v-else-if="loadError" type="error" title="加载失败">{{ loadError }}</n-alert>
@@ -331,7 +336,7 @@ const formatDate = (value) => {
 };
 
 const columns = [
-  { type: 'selection', multiple: true, disabled: (row) => !isVerifiedOrphan(row) },
+  { type: 'selection', multiple: true },
   {
     title: '头像',
     key: 'avatar',

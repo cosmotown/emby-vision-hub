@@ -12,7 +12,6 @@ from extensions import admin_required, processor_ready_required, task_lock_requi
 from services.person_cleanup_safety import (
     build_identity_provider_pairs,
     classify_reference_check,
-    is_verified_orphan_candidate,
 )
 from tasks.actors import task_delete_selected_ghost_actors, task_scan_ghost_actor_candidates
 
@@ -268,17 +267,6 @@ def delete_person_cleanup_candidates():
     candidates = person_cleanup_db.get_candidates_by_ids(normalized_ids)
     if len(candidates) != len(normalized_ids):
         return jsonify({'error': '选择中包含已失效或不在候选列表的人物，请刷新后重试'}), 409
-    unverified = [
-        item.get('person_name') or item.get('person_id')
-        for item in candidates
-        if not is_verified_orphan_candidate(item)
-    ]
-    if unverified:
-        preview = '、'.join(unverified[:5])
-        suffix = ' 等' if len(unverified) > 5 else ''
-        return jsonify({
-            'error': f'请先逐一实时核对并确认关联作品为 0：{preview}{suffix}',
-        }), 409
 
     submitted = task_manager.submit_task(
         task_delete_selected_ghost_actors,

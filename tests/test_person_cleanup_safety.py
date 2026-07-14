@@ -6,7 +6,6 @@ from services.person_cleanup_safety import (
     build_identity_provider_pairs,
     classify_reference_check,
     find_ghost_candidates,
-    is_verified_orphan_candidate,
 )
 
 
@@ -40,18 +39,6 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertEqual(classify_reference_check({'count': '0'}), 'verification_failed')
         self.assertEqual(classify_reference_check({'count': -1}), 'verification_failed')
         self.assertEqual(classify_reference_check({'count': False}), 'verification_failed')
-
-    def test_candidate_requires_successful_manual_verification(self):
-        self.assertTrue(is_verified_orphan_candidate({
-            'last_checked_at': '2026-07-14T10:00:00+08:00',
-            'last_error': None,
-        }))
-        self.assertFalse(is_verified_orphan_candidate({'last_checked_at': None, 'last_error': None}))
-        self.assertFalse(is_verified_orphan_candidate({
-            'last_checked_at': '2026-07-14T10:00:00+08:00',
-            'last_error': '核对失败',
-        }))
-        self.assertFalse(is_verified_orphan_candidate(None))
 
     def test_identity_comparison_uses_only_exact_supported_provider_ids(self):
         self.assertEqual(
@@ -98,7 +85,11 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertIn('get_person_media_references', verify_source)
         self.assertIn('remove_candidate', verify_source)
         self.assertNotIn('delete_person_custom_api', verify_source)
-        self.assertIn('is_verified_orphan_candidate', delete_source)
+        self.assertNotIn('is_verified_orphan_candidate', delete_source)
+        actor_source = (repo_root / 'tasks' / 'actors.py').read_text()
+        self.assertIn('get_person_media_references', actor_source)
+        self.assertIn("reference_status == 'verification_failed'", actor_source)
+        self.assertIn("reference_status == 'linked'", actor_source)
 
     def test_protected_library_snapshots_are_merged_not_replaced(self):
         repo_root = Path(__file__).resolve().parents[1]

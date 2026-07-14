@@ -2,6 +2,24 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.5",
+        "published_at": "2026-07-14T18:42:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.5",
+        "changelog": """## 幽灵人物人工核对
+
+### 新增
+- 人物清理候选增加“核对详情”，实时查询该人物在 Emby 中的当前关联作品数量，并展示最多 50 部作品。
+- 候选本身无关联时，使用 TMDb/IMDb ID 在本地 Emby 人物索引中精确查找同身份 Person，并展示其关联作品作为人工判断依据；不调用 TMDb API。
+- 核对结果中的人物和作品可直接跳转到 Emby；存在 TMDb 或 IMDb 身份时可跳转外部资料页。
+- 未核对的候选不能勾选；只有 Emby 明确返回关联作品为 `0` 后才解锁人工选择。
+
+### 安全
+- 候选 Person ID 自身发现关联作品时仅撤销 Toolkit 候选；同身份其他 Person 的作品只作提示，不会自动删除或撤销候选。
+- 删除提交接口同步拒绝未经核对或核对失败的候选；实际删除前仍保留原有第二次实时复核。
+- 不修改 Emby 数据库、媒体文件、Webhook、虚拟库、封面或 302 播放转发。
+""",
+    },
+    {
         "version": "v7.1.4",
         "published_at": "2026-07-13T19:25:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.4",

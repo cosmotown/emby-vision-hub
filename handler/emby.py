@@ -1946,16 +1946,20 @@ def get_person_media_references(
 
     api_url = f"{base_url.rstrip('/')}/Items"
     params = {
-        'api_key': api_key,
         'PersonIds': str(person_id),
         'Recursive': 'true',
         'IncludeItemTypes': 'Movie,Series,Episode,Video,MusicVideo',
-        'Fields': 'Id,Name,Type,SeriesName',
+        'Fields': 'SeriesName,ProductionYear',
         'Limit': max(1, int(limit)),
         'EnableTotalRecordCount': 'true',
     }
     try:
-        response = emby_client.get(api_url, params=params, timeout=20)
+        response = emby_client.get(
+            api_url,
+            headers={'X-Emby-Token': api_key},
+            params=params,
+            timeout=20,
+        )
         response.raise_for_status()
         payload = response.json()
         items = payload.get('Items') or []
@@ -1965,6 +1969,43 @@ def get_person_media_references(
         }
     except Exception as exc:
         logger.error(f"复核人物 {person_id} 的媒体关联失败: {exc}")
+        return None
+
+
+def get_people_by_provider_ids(
+    base_url: str,
+    api_key: str,
+    provider_pairs: List[str],
+    limit: int = 20,
+) -> Optional[List[Dict[str, Any]]]:
+    """Find Emby Person records with the same exact TMDb/IMDb identity."""
+    normalized_pairs = sorted({str(pair).strip() for pair in provider_pairs if str(pair).strip()})
+    if not base_url or not api_key or not normalized_pairs:
+        return []
+
+    api_url = f"{base_url.rstrip('/')}/Items"
+    params = {
+        'IncludeItemTypes': 'Person',
+        'Recursive': 'true',
+        'AnyProviderIdEquals': ','.join(normalized_pairs),
+        'Fields': 'ProviderIds',
+        'Limit': max(1, min(int(limit), 50)),
+        'EnableTotalRecordCount': 'false',
+    }
+    try:
+        response = emby_client.get(
+            api_url,
+            headers={'X-Emby-Token': api_key},
+            params=params,
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get('Items'), list):
+            raise ValueError('Emby 身份查询响应格式异常')
+        return payload['Items']
+    except Exception as exc:
+        logger.error(f"按外部身份查询 Emby 人物失败: {type(exc).__name__}")
         return None
 
 

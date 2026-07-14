@@ -2,7 +2,12 @@ import unittest
 import ast
 from pathlib import Path
 
-from services.person_cleanup_safety import classify_reference_check, find_ghost_candidates
+from services.person_cleanup_safety import (
+    build_identity_provider_pairs,
+    classify_reference_check,
+    find_ghost_candidates,
+    is_verified_orphan_candidate,
+)
 
 
 class PersonCleanupSafetyTests(unittest.TestCase):
@@ -26,6 +31,31 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertEqual(classify_reference_check({'count': -1}), 'verification_failed')
         self.assertEqual(classify_reference_check({'count': False}), 'verification_failed')
 
+    def test_candidate_requires_successful_manual_verification(self):
+        self.assertTrue(is_verified_orphan_candidate({
+            'last_checked_at': '2026-07-14T10:00:00+08:00',
+            'last_error': None,
+        }))
+        self.assertFalse(is_verified_orphan_candidate({'last_checked_at': None, 'last_error': None}))
+        self.assertFalse(is_verified_orphan_candidate({
+            'last_checked_at': '2026-07-14T10:00:00+08:00',
+            'last_error': '核对失败',
+        }))
+        self.assertFalse(is_verified_orphan_candidate(None))
+
+    def test_identity_comparison_uses_only_exact_supported_provider_ids(self):
+        self.assertEqual(
+            build_identity_provider_pairs({
+                'Tmdb': '12345',
+                'Imdb': 'nm0012345',
+                'Douban': '67890',
+                'Bad': 'value,other',
+            }),
+            ['imdb.nm0012345', 'tmdb.12345'],
+        )
+        self.assertEqual(build_identity_provider_pairs('{"Tmdb": "12345"}'), ['tmdb.12345'])
+        self.assertEqual(build_identity_provider_pairs(None), [])
+
     def test_legacy_destructive_tasks_are_disabled_and_unregistered(self):
         repo_root = Path(__file__).resolve().parents[1]
         actor_tree = ast.parse((repo_root / 'tasks' / 'actors.py').read_text())
@@ -43,6 +73,22 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         registry_source = (repo_root / 'tasks' / 'core.py').read_text()
         self.assertNotIn("'purge-ghost-actors':", registry_source)
         self.assertNotIn("'purge-unregistered-actors':", registry_source)
+
+    def test_manual_verification_never_calls_person_delete_api(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        route_tree = ast.parse((repo_root / 'routes' / 'person_cleanup.py').read_text())
+        functions = {
+            node.name: node
+            for node in route_tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        verify_source = ast.unparse(functions['verify_person_cleanup_candidate'])
+        delete_source = ast.unparse(functions['delete_person_cleanup_candidates'])
+
+        self.assertIn('get_person_media_references', verify_source)
+        self.assertIn('remove_candidate', verify_source)
+        self.assertNotIn('delete_person_custom_api', verify_source)
+        self.assertIn('is_verified_orphan_candidate', delete_source)
 
 
 if __name__ == '__main__':

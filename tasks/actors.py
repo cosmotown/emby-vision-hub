@@ -15,7 +15,11 @@ import task_manager
 import utils
 from actor_utils import enrich_all_actor_aliases_task
 from handler.actor_sync import UnifiedSyncHandler
-from services.person_cleanup_safety import classify_reference_check, find_ghost_candidates
+from services.person_cleanup_safety import (
+    classify_reference_check,
+    find_ghost_candidates,
+    normalize_person_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +78,13 @@ def task_scan_ghost_actor_candidates(processor):
             )
 
         protected_person_ids = person_cleanup_db.get_protected_person_ids()
+        protected_person_names = person_cleanup_db.get_protected_person_names()
         if protected_person_ids:
             referenced_person_ids = referenced_person_ids | protected_person_ids
-            logger.info(f"  ➜ 受保护媒体库快照额外保护 {len(protected_person_ids)} 位人物。")
+            logger.info(
+                f"  ➜ 受保护媒体库快照额外保护 {len(protected_person_ids)} 个人物 ID、"
+                f"{len(protected_person_names)} 个姓名。"
+            )
 
         all_people = []
         person_generator = emby.get_all_persons_from_emby(
@@ -96,7 +104,11 @@ def task_scan_ghost_actor_candidates(processor):
         if not all_people:
             raise RuntimeError("未能读取 Emby 人物列表，候选列表保持不变")
 
-        candidates = find_ghost_candidates(all_people, referenced_person_ids)
+        candidates = find_ghost_candidates(
+            all_people,
+            referenced_person_ids,
+            protected_person_names=protected_person_names,
+        )
         saved_count = person_cleanup_db.replace_candidates(candidates)
         message = (
             f"只读扫描完成：发现 {saved_count} 位待人工复核的幽灵人物候选；"
@@ -113,7 +125,10 @@ def task_scan_ghost_actor_candidates(processor):
 def task_delete_selected_ghost_actors(processor, person_ids):
     task_name = "删除选中幽灵人物"
     requested_ids = sorted({str(person_id) for person_id in person_ids if person_id})
-    candidates = person_cleanup_db.get_candidates_by_ids(requested_ids)
+    candidates = person_cleanup_db.get_candidates_by_ids(
+        requested_ids,
+        include_protected=True,
+    )
     candidate_map = {str(item['person_id']): item for item in candidates}
 
     if not requested_ids or len(candidate_map) != len(requested_ids):
@@ -123,13 +138,28 @@ def task_delete_selected_ghost_actors(processor, person_ids):
     deleted_count = 0
     linked_count = 0
     failed_count = 0
+    protected_count = 0
     total = len(requested_ids)
+    protected_person_ids = person_cleanup_db.get_protected_person_ids()
+    protected_person_names = {
+        normalized
+        for name in person_cleanup_db.get_protected_person_names()
+        if (normalized := normalize_person_name(name))
+    }
 
     for index, person_id in enumerate(requested_ids, start=1):
         if processor.is_stop_requested():
             break
         candidate = candidate_map[person_id]
         person_name = candidate.get('person_name') or person_id
+        if (
+            person_id in protected_person_ids
+            or normalize_person_name(person_name) in protected_person_names
+        ):
+            protected_count += 1
+            person_cleanup_db.remove_candidate(person_id)
+            logger.warning(f"  ➜ 跳过 '{person_name}'：命中受保护媒体库人物快照。")
+            continue
         progress = int(((index - 1) / total) * 100)
         task_manager.update_status_from_thread(
             progress,
@@ -180,7 +210,8 @@ def task_delete_selected_ghost_actors(processor, person_ids):
         time.sleep(0.2)
 
     message = (
-        f"人物清理完成：删除 {deleted_count}，因重新发现关联跳过 {linked_count}，"
+        f"人物清理完成：删除 {deleted_count}，保护跳过 {protected_count}，"
+        f"因重新发现关联跳过 {linked_count}，"
         f"失败 {failed_count}。"
     )
     logger.info(f"  ➜ {message}")

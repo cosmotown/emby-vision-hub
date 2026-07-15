@@ -6,6 +6,7 @@ from services.person_cleanup_safety import (
     build_identity_provider_pairs,
     classify_reference_check,
     find_ghost_candidates,
+    normalize_person_name,
 )
 
 
@@ -30,6 +31,22 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         candidates = find_ghost_candidates(people, set() | {'2'})
 
         self.assertEqual([person['Id'] for person in candidates], ['1'])
+
+    def test_protected_person_name_excludes_duplicate_emby_person_ids(self):
+        people = [
+            {'Id': '1', 'Name': '普通幽灵人物'},
+            {'Id': '2', 'Name': ' 保护库 人物 '},
+            {'Id': '3', 'Name': '保护库 人物'},
+        ]
+
+        candidates = find_ghost_candidates(
+            people,
+            referenced_person_ids={'2'},
+            protected_person_names={'保护库  人物'},
+        )
+
+        self.assertEqual([person['Id'] for person in candidates], ['1'])
+        self.assertEqual(normalize_person_name('  Alice  SMITH '), 'alice smith')
 
     def test_only_explicit_zero_reference_count_is_deletable(self):
         self.assertEqual(classify_reference_check({'count': 0, 'items': []}), 'orphan')
@@ -107,7 +124,11 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertIn('ON CONFLICT', merge_source)
         self.assertIn('merge_protected_people_for_library', task_source)
         self.assertIn('get_protected_person_ids', task_source)
+        self.assertIn('get_protected_person_names', task_source)
         self.assertIn('capture_library_ids=protected_library_ids', task_source)
+        self.assertIn('include_protected=True', task_source)
+        self.assertIn('person_id in protected_person_ids', task_source)
+        self.assertIn('normalize_person_name(person_name) in protected_person_names', task_source)
         self.assertIn('person_cleanup_protected_libraries', schema_source)
         self.assertIn('person_cleanup_protected_people', schema_source)
 

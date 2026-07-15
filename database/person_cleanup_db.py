@@ -2,6 +2,22 @@ import json
 from typing import Any, Dict, Iterable, List, Optional
 
 from .connection import get_db_connection
+from services.person_cleanup_safety import normalize_person_name
+
+
+def _exclude_protected_candidates(candidates: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    protected_ids = get_protected_person_ids()
+    protected_names = {
+        normalized
+        for name in get_protected_person_names()
+        if (normalized := normalize_person_name(name))
+    }
+    return [
+        candidate
+        for candidate in candidates
+        if str(candidate.get('person_id') or '') not in protected_ids
+        and normalize_person_name(candidate.get('person_name')) not in protected_names
+    ]
 
 
 def replace_candidates(candidates: Iterable[Dict[str, Any]]) -> int:
@@ -43,10 +59,14 @@ def list_candidates() -> List[Dict[str, Any]]:
                 ORDER BY person_name ASC, person_id ASC
                 """
             )
-            return [dict(row) for row in cursor.fetchall()]
+            candidates = [dict(row) for row in cursor.fetchall()]
+    return _exclude_protected_candidates(candidates)
 
 
-def get_candidates_by_ids(person_ids: Iterable[str]) -> List[Dict[str, Any]]:
+def get_candidates_by_ids(
+    person_ids: Iterable[str],
+    include_protected: bool = False,
+) -> List[Dict[str, Any]]:
     normalized = sorted({str(person_id).strip() for person_id in person_ids if str(person_id).strip()})
     if not normalized:
         return []
@@ -61,7 +81,8 @@ def get_candidates_by_ids(person_ids: Iterable[str]) -> List[Dict[str, Any]]:
                 """,
                 (normalized,),
             )
-            return [dict(row) for row in cursor.fetchall()]
+            candidates = [dict(row) for row in cursor.fetchall()]
+    return candidates if include_protected else _exclude_protected_candidates(candidates)
 
 
 def remove_candidate(person_id: str) -> None:
@@ -169,3 +190,16 @@ def get_protected_person_ids() -> set[str]:
         with conn.cursor() as cursor:
             cursor.execute("SELECT DISTINCT person_id FROM person_cleanup_protected_people")
             return {str(row['person_id']) for row in cursor.fetchall() if row.get('person_id')}
+
+
+def get_protected_person_names() -> set[str]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT DISTINCT person_name
+                FROM person_cleanup_protected_people
+                WHERE NULLIF(BTRIM(person_name), '') IS NOT NULL
+                """
+            )
+            return {str(row['person_name']) for row in cursor.fetchall() if row.get('person_name')}

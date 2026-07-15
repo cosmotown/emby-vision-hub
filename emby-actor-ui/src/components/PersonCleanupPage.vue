@@ -41,7 +41,7 @@
         <div>
           <n-text strong>受保护（跳过清理）的媒体库</n-text>
           <n-text depth="3" style="display:block;font-size:13px;margin-top:4px;">
-            保存后执行一次只读扫描。库中出现过的人物会持续受保护，即使没有 TMDb ID 或以后失去作品关联，也不会进入清理候选。
+            保存后必须执行一次只读扫描建立快照。库中出现过的人物及其同名重复记录会持续受保护，即使没有 TMDb ID 或以后失去作品关联，也不会进入清理候选。
           </n-text>
         </div>
         <n-space :wrap="false">
@@ -91,7 +91,7 @@
 
     <n-space align="center" style="margin: 16px 0 10px;">
       <n-text strong>全服务器幽灵人物候选</n-text>
-      <n-text depth="3">已排除当前在用人物和保护库快照；候选失去关联后无法可靠反推原媒体库。</n-text>
+      <n-text depth="3">已排除当前在用人物，以及保护库快照中 ID 或姓名匹配的人物。</n-text>
     </n-space>
 
     <div v-if="loading" class="center-state"><n-spin size="large" /></div>

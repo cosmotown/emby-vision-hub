@@ -2,6 +2,23 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.8",
+        "published_at": "2026-07-15T01:30:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.8",
+        "changelog": """## 保护库重复人物修复
+
+### 修复
+- 保护库人物除 Emby Person ID 外，新增标准化姓名保护；同一演员因 Emby 重复建档而产生不同 Person ID 时，也不会再进入幽灵人物候选。
+- 候选读取接口同步过滤保护快照，升级后已有快照中的人物会立即从旧候选列表隐藏。
+- 删除任务再次核对保护 ID 和姓名，命中保护快照时撤销候选并跳过删除。
+
+### 安全
+- 姓名保护采用保守策略；极少数完全同名的不同人物可能一并保留，但不会因此误删。
+- 新选择的保护库仍需执行一次只读扫描建立首次人物快照。
+- 实际删除前的 Emby 媒体关联复查保持不变；不修改 Emby 数据库、媒体文件、Webhook、虚拟库、封面或 302 播放转发。
+""",
+    },
+    {
         "version": "v7.1.7",
         "published_at": "2026-07-14T23:30:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.7",

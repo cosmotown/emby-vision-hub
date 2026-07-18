@@ -974,22 +974,22 @@ def notify_media_paths_updated(
     return success
 
 
-def is_media_path_indexed(
+def _query_media_item_by_path(
     file_path: str,
     base_url: str,
     api_key: str,
-) -> Optional[bool]:
-    """Return True/False for an exact Emby path lookup, or None on query failure."""
+) -> tuple[Optional[bool], Optional[Dict[str, Any]]]:
+    """Return exact path match state and item data without exposing the API key."""
     normalized_target = os.path.normcase(os.path.normpath(str(file_path or '')))
     if not normalized_target:
-        return False
+        return False, None
 
     api_url = f"{base_url.rstrip('/')}/Items"
     params = {
         "Path": str(file_path),
         "Recursive": "false",
         "Limit": 10,
-        "Fields": "Path,MediaSources",
+        "Fields": "Id,Name,Type,SeriesId,SeriesName,Path,MediaSources",
     }
     try:
         response = emby_client.get(
@@ -1000,7 +1000,7 @@ def is_media_path_indexed(
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, dict):
-            return None
+            return None, None
         for item in payload.get("Items") or []:
             candidate_paths = [item.get("Path")]
             candidate_paths.extend(
@@ -1013,11 +1013,31 @@ def is_media_path_indexed(
                     continue
                 normalized_candidate = os.path.normcase(os.path.normpath(str(candidate)))
                 if normalized_candidate == normalized_target:
-                    return True
-        return False
+                    return True, item
+        return False, None
     except Exception as exc:
         logger.warning(f"  ⚠️ 无法确认 Emby 是否已收录路径 '{file_path}': {exc}")
-        return None
+        return None, None
+
+
+def is_media_path_indexed(
+    file_path: str,
+    base_url: str,
+    api_key: str,
+) -> Optional[bool]:
+    """Return True/False for an exact Emby path lookup, or None on query failure."""
+    matched, _ = _query_media_item_by_path(file_path, base_url, api_key)
+    return matched
+
+
+def get_media_item_by_path(
+    file_path: str,
+    base_url: str,
+    api_key: str,
+) -> Optional[Dict[str, Any]]:
+    """Return the exact Emby item represented by a filesystem path."""
+    matched, item = _query_media_item_by_path(file_path, base_url, api_key)
+    return item if matched is True else None
 
 # --- 最近锚点强制刷新版 ---
 def refresh_library_by_path(file_path: str, base_url: str, api_key: str) -> bool:

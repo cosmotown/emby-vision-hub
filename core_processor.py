@@ -31,7 +31,7 @@ from cachetools import TTLCache
 from ai_translator import AITranslator
 from watchlist_processor import WatchlistProcessor
 from handler.douban import DoubanApi
-from services.emby_ingest import refresh_and_verify_paths
+from services.emby_ingest import get_confirmed_media_items, refresh_and_verify_paths
 
 logger = logging.getLogger(__name__)
 try:
@@ -739,6 +739,37 @@ class MediaProcessor:
         else:
             logger.info(f"  ✅ [实时监控] 已确认 Emby 收录 {result.get('indexed', 0)} 个文件。")
 
+        self.enqueue_confirmed_ingest_postprocessing(result.get('confirmed_paths') or [])
+
+    def enqueue_confirmed_ingest_postprocessing(self, file_paths: List[str]) -> int:
+        """Repair missed webhook events after Emby confirms exact indexed paths."""
+        items = get_confirmed_media_items(
+            file_paths,
+            self.emby_url,
+            self.emby_api_key,
+        )
+        if not items:
+            return 0
+
+        from routes.webhook import enqueue_verified_ingest_item
+
+        queued = 0
+        for item in items:
+            item_id = str(item.get('Id') or '').strip()
+            if not item_id or media_db.is_emby_id_in_library(item_id):
+                continue
+            if enqueue_verified_ingest_item(
+                item_id,
+                item.get('Name'),
+                item.get('Type'),
+                series_id=item.get('SeriesId'),
+                series_name=item.get('SeriesName'),
+            ):
+                queued += 1
+        if queued:
+            logger.info(f"  🔁 [入库补偿] 已将 {queued} 个 Emby 确认条目补入 Toolkit 持久队列。")
+        return queued
+
     # --- 内部私有方法：单文件数据库清理逻辑 ---
     def _cleanup_local_db_for_deleted_file(self, filename: str, file_path: Optional[str] = None) -> bool:
         """
@@ -844,6 +875,30 @@ class MediaProcessor:
 
         except Exception as e:
             logger.error(f"  🚫 [文件删除] 处理失败: {e}", exc_info=True)
+
+    def cleanup_file_deletion_records(self, file_paths: List[str]) -> int:
+        """Clean Toolkit state only; never delete files or call external deletion chains."""
+        cleaned_count = 0
+        for file_path in file_paths or []:
+            try:
+                if self._cleanup_local_db_for_deleted_file(
+                    os.path.basename(file_path),
+                    file_path=file_path,
+                ):
+                    cleaned_count += 1
+            except Exception as exc:
+                logger.error(f"  🚫 [本地清理] 处理文件 '{file_path}' 时出错: {exc}")
+
+        if cleaned_count > 0 and config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_PROXY_ENABLED) and config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_AI_VECTOR):
+            try:
+                threading.Thread(target=RecommendationEngine.refresh_cache).start()
+            except Exception:
+                pass
+        logger.info(
+            f"  🧹 [本地清理] 已清理 {cleaned_count}/{len(file_paths or [])} 个 Toolkit 记录；"
+            "未调用任何文件、网盘或 MoviePilot 删除接口。"
+        )
+        return cleaned_count
 
     # --- 实时监控：处理文件删除 (批量版) ---
     def process_file_deletion_batch(self, file_paths: List[str]):

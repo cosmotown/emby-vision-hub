@@ -115,6 +115,35 @@ def check_indexed_paths(
     return indexed, missing, failed
 
 
+def get_confirmed_media_items(
+    file_paths: Iterable[str],
+    base_url: str,
+    api_key: str,
+    max_workers: int = 5,
+) -> List[Dict[str, object]]:
+    """Resolve exact indexed paths to Emby items and deduplicate by item ID."""
+    paths = normalize_paths(file_paths)
+    if not paths or not base_url or not api_key:
+        return []
+
+    items_by_id: Dict[str, Dict[str, object]] = {}
+    worker_count = max(1, min(int(max_workers), len(paths), 8))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(emby.get_media_item_by_path, path, base_url, api_key): path
+            for path in paths
+        }
+        for future in as_completed(futures):
+            try:
+                item = future.result()
+            except Exception:
+                item = None
+            item_id = str((item or {}).get('Id') or '').strip()
+            if item_id:
+                items_by_id[item_id] = item
+    return list(items_by_id.values())
+
+
 def _refresh_parent_targets(
     file_paths: Iterable[str],
     base_url: str,
@@ -164,6 +193,7 @@ def refresh_and_verify_paths(
     result: Dict[str, object] = {
         'requested': len(paths),
         'indexed': 0,
+        'confirmed_paths': [],
         'pending': [],
         'query_failed': [],
         'refresh_ok': True,
@@ -213,6 +243,7 @@ def refresh_and_verify_paths(
 
         result.update({
             'indexed': len(paths) - len(pending),
+            'confirmed_paths': sorted(set(paths) - pending),
             'pending': sorted(pending),
             'query_failed': sorted(query_failed & pending),
             'refresh_ok': refresh_ok,
@@ -274,6 +305,7 @@ def reconcile_recent_paths(
     refresh_result = refresh_and_verify_paths(stable_pending, base_url, api_key) if stable_pending else {
         'requested': 0,
         'indexed': 0,
+        'confirmed_paths': [],
         'pending': [],
         'query_failed': [],
         'refresh_ok': True,
@@ -281,6 +313,7 @@ def reconcile_recent_paths(
     return {
         'scanned': len(paths),
         'already_indexed': len(indexed),
+        'confirmed_paths': sorted(indexed | set(refresh_result.get('confirmed_paths') or [])),
         'missing_before_refresh': len(pending),
         'unstable': len(unstable),
         'refresh': refresh_result,

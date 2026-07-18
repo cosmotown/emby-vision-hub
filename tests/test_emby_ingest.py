@@ -128,6 +128,7 @@ class EmbyIngestTests(unittest.TestCase):
             )
 
         self.assertEqual(1, result["indexed"])
+        self.assertEqual([path], result["confirmed_paths"])
         self.assertEqual([], result["pending"])
         self.assertEqual(2, notify_paths.call_count)
         self.assertEqual([mock.call(8), mock.call(12)], sleep.call_args_list)
@@ -136,6 +137,81 @@ class EmbyIngestTests(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / "monitor_service.py").read_text(encoding="utf-8")
         self.assertIn("args=(processor, files_to_scrape)", source)
         self.assertNotIn("args=(processor, representative_files)", source)
+
+    @mock.patch("services.emby_ingest.emby.get_media_item_by_path")
+    def test_confirmed_items_are_deduplicated_by_emby_id(self, get_item):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self._make_strm_files(directory, 2)
+            get_item.side_effect = [
+                {"Id": "episode-1", "Name": "E01", "Type": "Episode"},
+                {"Id": "episode-1", "Name": "E01", "Type": "Episode"},
+            ]
+            items = emby_ingest.get_confirmed_media_items(
+                paths,
+                "http://emby",
+                "token",
+            )
+
+        self.assertEqual(1, len(items))
+        self.assertEqual("episode-1", items[0]["Id"])
+
+    @mock.patch("services.emby_ingest.refresh_and_verify_paths")
+    @mock.patch("services.emby_ingest.wait_for_paths_stable")
+    @mock.patch("services.emby_ingest.check_indexed_paths")
+    @mock.patch("services.emby_ingest.collect_recent_media_paths")
+    def test_reconcile_returns_old_and_new_confirmed_paths(
+        self,
+        collect_paths,
+        check_paths,
+        wait_stable,
+        refresh_paths,
+    ):
+        collect_paths.return_value = ["/media/a.strm", "/media/b.strm"]
+        check_paths.return_value = ({"/media/a.strm"}, {"/media/b.strm"}, set())
+        wait_stable.return_value = (["/media/b.strm"], [])
+        refresh_paths.return_value = {
+            "requested": 1,
+            "indexed": 1,
+            "confirmed_paths": ["/media/b.strm"],
+            "pending": [],
+            "query_failed": [],
+            "refresh_ok": True,
+        }
+
+        result = emby_ingest.reconcile_recent_paths(
+            ["/media"],
+            [".strm"],
+            0,
+            "http://emby",
+            "token",
+        )
+
+        self.assertEqual(["/media/a.strm", "/media/b.strm"], result["confirmed_paths"])
+
+    def test_excluded_delete_path_keeps_external_deletion_ownership(self):
+        root = Path(__file__).resolve().parents[1]
+        processor_source = (root / "core_processor.py").read_text(encoding="utf-8")
+        monitor_source = (root / "monitor_service.py").read_text(encoding="utf-8")
+
+        cleanup_method = processor_source.split(
+            "def cleanup_file_deletion_records", 1
+        )[1].split("def process_file_deletion_batch", 1)[0]
+        self.assertIn("_cleanup_local_db_for_deleted_file", cleanup_method)
+        self.assertNotIn("deep.delete", cleanup_method)
+        self.assertNotIn("delete_file", cleanup_method)
+        self.assertIn("processor.cleanup_file_deletion_records(file_paths)", monitor_source)
+
+    def test_confirmed_ingest_bypasses_thread_local_webhook_debounce(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "routes" / "webhook.py"
+        ).read_text(encoding="utf-8")
+        method = source.split(
+            "def enqueue_verified_ingest_item", 1
+        )[1].split("def _wait_for_stream_data_and_enqueue", 1)[0]
+
+        self.assertIn("_enqueue_persistent_webhook_task", method)
+        self.assertNotIn("_enqueue_webhook_event", method)
+        self.assertIn("'new_episode_ids': episode_ids", method)
 
 
 class EmbyHttpValidationTests(unittest.TestCase):
@@ -174,6 +250,32 @@ class EmbyHttpValidationTests(unittest.TestCase):
         for call in get.call_args_list:
             self.assertNotIn("api_key", call.kwargs.get("params") or {})
             self.assertEqual("token", call.kwargs["headers"]["X-Emby-Token"])
+
+    @mock.patch("handler.emby.emby_client.get")
+    def test_exact_path_lookup_returns_matching_emby_item(self, get):
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "Items": [
+                {
+                    "Id": "episode-1",
+                    "Name": "E01",
+                    "Type": "Episode",
+                    "Path": "/media/show/S01E01.strm",
+                }
+            ]
+        }
+        get.return_value = response
+
+        item = emby.get_media_item_by_path(
+            "/media/show/S01E01.strm",
+            "http://emby",
+            "token",
+        )
+
+        self.assertEqual("episode-1", item["Id"])
+        self.assertNotIn("api_key", get.call_args.kwargs["params"])
+        self.assertEqual("token", get.call_args.kwargs["headers"]["X-Emby-Token"])
 
 
 if __name__ == "__main__":

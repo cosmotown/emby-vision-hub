@@ -582,6 +582,63 @@ def _enqueue_webhook_event(item_id, item_name, item_type):
         else:
             logger.debug("  ➜ [队列] 批量处理计时器运行中，等待合并。")
 
+
+def enqueue_verified_ingest_item(
+    item_id,
+    item_name,
+    item_type,
+    series_id=None,
+    series_name=None,
+):
+    """Persist an Emby-confirmed item without relying on a thread-local debounce hub."""
+    normalized_type = str(item_type or '').strip()
+    normalized_id = str(item_id or '').strip()
+    if not normalized_id or normalized_type not in {'Movie', 'Episode', 'Series'}:
+        return False
+
+    parent_id = normalized_id
+    parent_name = str(item_name or normalized_id)
+    parent_type = normalized_type
+    episode_ids = None
+    if normalized_type == 'Episode':
+        parent_id = str(series_id or '').strip()
+        if not parent_id:
+            parent_id = emby.get_series_id_from_child_id(
+                normalized_id,
+                extensions.media_processor_instance.emby_url,
+                extensions.media_processor_instance.emby_api_key,
+                extensions.media_processor_instance.emby_user_id,
+                item_name=parent_name,
+            )
+        if not parent_id:
+            logger.warning(f"  ➜ [入库补偿] 分集 '{parent_name}' 无法定位所属剧集，跳过。")
+            return False
+        parent_name = str(series_name or parent_name)
+        parent_type = 'Series'
+        episode_ids = [normalized_id]
+
+    processor = extensions.media_processor_instance
+    is_already_processed = parent_id in processor.processed_items_cache
+    if is_already_processed and not media_db.is_emby_id_in_library(parent_id):
+        processor.processed_items_cache.pop(parent_id, None)
+        is_already_processed = False
+
+    task_name_prefix = "Webhook追更" if is_already_processed and episode_ids else "Webhook入库"
+    _enqueue_persistent_webhook_task(
+        'media_process',
+        f"{task_name_prefix}: {parent_name}",
+        item_id=parent_id,
+        item_name=parent_name,
+        item_type=parent_type,
+        payload={
+            'item_id': parent_id,
+            'force_full_update': False,
+            'new_episode_ids': episode_ids,
+            'is_new_item': not is_already_processed,
+        },
+    )
+    return True
+
 def _wait_for_stream_data_and_enqueue(item_id, item_name, item_type):
     """
     预检视频流数据。

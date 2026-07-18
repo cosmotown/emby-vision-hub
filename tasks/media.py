@@ -1676,6 +1676,7 @@ def task_scan_monitor_folders(processor):
     )
     candidates = sorted(missing | query_failed)
     if not candidates:
+        processor.enqueue_confirmed_ingest_postprocessing(sorted(indexed))
         task_manager.update_status_from_thread(100, f"扫描完成，{len(indexed)} 个文件均已入库")
         return
 
@@ -1733,6 +1734,10 @@ def task_scan_monitor_folders(processor):
         ))
 
     confirmed = sum(int(result.get('indexed', 0)) for result in results)
+    confirmed_paths = set(indexed)
+    for result in results:
+        confirmed_paths.update(result.get('confirmed_paths') or [])
+    processor.enqueue_confirmed_ingest_postprocessing(sorted(confirmed_paths))
     pending = sum(len(result.get('pending') or []) for result in results)
     logger.info(
         f"  ➜ 监控目录查漏完成。近期 {len(recent_paths)}，"

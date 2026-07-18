@@ -190,7 +190,7 @@ def process_batch_queue():
     # 2. 仅刷新流程
     if files_to_refresh_only:
         logger.info(f"  🚀 [实时监控] 发现 {len(files_to_refresh_only)} 个文件命中排除路径，将跳过刮削直接刷新 Emby。")
-        threading.Thread(target=_handle_batch_refresh_only_task, args=(files_to_refresh_only,)).start()
+        threading.Thread(target=_handle_batch_refresh_only_task, args=(processor, files_to_refresh_only)).start()
 
 def process_delete_batch_queue():
     """
@@ -231,7 +231,7 @@ def process_delete_batch_queue():
     # 2. 排除路径逻辑：仅刷新 Emby (移除条目)
     if files_to_refresh_only:
         logger.info(f"  🗑️ [实时监控] 聚合处理删除事件: {len(files_to_refresh_only)} 个排除路径文件 (仅刷新)")
-        threading.Thread(target=_handle_batch_delete_refresh_only, args=(files_to_refresh_only,)).start()
+        threading.Thread(target=_handle_batch_delete_refresh_only, args=(processor, files_to_refresh_only)).start()
 
 def _handle_batch_file_task(processor, file_paths: List[str]):
     """批量处理新增文件任务 (刮削模式)"""
@@ -241,7 +241,7 @@ def _handle_batch_file_task(processor, file_paths: List[str]):
     if not valid_files: return
     processor.process_file_actively_batch(valid_files)
 
-def _handle_batch_refresh_only_task(file_paths: List[str]):
+def _handle_batch_refresh_only_task(processor, file_paths: List[str]):
     """批量处理仅刷新任务 (新增/修改)"""
     valid_files, skipped_files = wait_for_paths_stable(file_paths)
     if skipped_files:
@@ -263,8 +263,9 @@ def _handle_batch_refresh_only_task(file_paths: List[str]):
         )
     else:
         logger.info(f"  ✅ [实时监控] 已确认 Emby 收录 {result.get('indexed', 0)} 个文件。")
+    processor.enqueue_confirmed_ingest_postprocessing(result.get('confirmed_paths') or [])
 
-def _handle_batch_delete_refresh_only(file_paths: List[str]):
+def _handle_batch_delete_refresh_only(processor, file_paths: List[str]):
     """
     批量处理仅刷新任务 (删除)
     注意：删除不需要等待文件稳定，因为文件已经没了。
@@ -272,6 +273,7 @@ def _handle_batch_delete_refresh_only(file_paths: List[str]):
     config = config_manager.APP_CONFIG
     if not config.get(constants.CONFIG_OPTION_MONITOR_ENABLED, False):
         return
+    processor.cleanup_file_deletion_records(file_paths)
     base_url = config.get(constants.CONFIG_OPTION_EMBY_SERVER_URL)
     api_key = config.get(constants.CONFIG_OPTION_EMBY_API_KEY)
     delay_seconds = config.get(constants.CONFIG_OPTION_MONITOR_EXCLUDE_REFRESH_DELAY, 0)
@@ -375,6 +377,9 @@ class MonitorService:
                     strm_only=True,
                 )
                 refresh_result = result.get('refresh') or {}
+                self.processor.enqueue_confirmed_ingest_postprocessing(
+                    result.get('confirmed_paths') or []
+                )
                 unresolved = bool(
                     result.get('unstable', 0)
                     or refresh_result.get('pending')

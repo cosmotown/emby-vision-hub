@@ -880,7 +880,6 @@ def find_nearest_library_anchor(file_path: str, base_url: str, api_key: str) -> 
         # 使用 /Items 接口按 Path 精确查询
         query_url = f"{base_url.rstrip('/')}/Items"
         params = {
-            "api_key": api_key,
             "Path": current_path,
             "Limit": 1,
             "Recursive": "false",
@@ -888,7 +887,11 @@ def find_nearest_library_anchor(file_path: str, base_url: str, api_key: str) -> 
         }
         
         try:
-            response = emby_client.get(query_url, params=params)
+            response = emby_client.get(
+                query_url,
+                params=params,
+                headers={"X-Emby-Token": api_key},
+            )
             if response.status_code == 200:
                 data = response.json()
                 if data.get("Items"):
@@ -911,7 +914,6 @@ def refresh_item_by_id(item_id: str, base_url: str, api_key: str) -> bool:
     """
     refresh_url = f"{base_url.rstrip('/')}/Items/{item_id}/Refresh"
     refresh_params = {
-        "api_key": api_key,
         "Recursive": "true", 
         "ImageRefreshMode": "Default",
         "MetadataRefreshMode": "Default",
@@ -920,11 +922,102 @@ def refresh_item_by_id(item_id: str, base_url: str, api_key: str) -> bool:
     }
     
     try:
-        emby_client.post(refresh_url, params=refresh_params)
+        response = emby_client.post(
+            refresh_url,
+            params=refresh_params,
+            headers={"X-Emby-Token": api_key},
+        )
+        response.raise_for_status()
         return True
     except Exception as e:
         logger.error(f"  ❌ 刷新请求失败 (ID: {item_id}): {e}")
         return False
+
+
+def notify_media_paths_updated(
+    file_paths: Iterable[str],
+    base_url: str,
+    api_key: str,
+    update_type: str = "Created",
+    chunk_size: int = 100,
+) -> bool:
+    """Notify Emby about exact filesystem paths and validate every response."""
+    normalized_paths = sorted({
+        os.path.normpath(str(path))
+        for path in file_paths
+        if str(path or '').strip()
+    })
+    if not normalized_paths:
+        return True
+
+    api_url = f"{base_url.rstrip('/')}/Library/Media/Updated"
+    success = True
+    safe_chunk_size = max(1, min(int(chunk_size), 500))
+    for index in range(0, len(normalized_paths), safe_chunk_size):
+        chunk = normalized_paths[index:index + safe_chunk_size]
+        payload = {
+            "Updates": [
+                {"Path": path, "UpdateType": update_type}
+                for path in chunk
+            ]
+        }
+        try:
+            response = emby_client.post(
+                api_url,
+                json=payload,
+                headers={"X-Emby-Token": api_key},
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            success = False
+            logger.error(f"  ❌ 通知 Emby 媒体路径更新失败 ({len(chunk)} 项): {exc}")
+    return success
+
+
+def is_media_path_indexed(
+    file_path: str,
+    base_url: str,
+    api_key: str,
+) -> Optional[bool]:
+    """Return True/False for an exact Emby path lookup, or None on query failure."""
+    normalized_target = os.path.normcase(os.path.normpath(str(file_path or '')))
+    if not normalized_target:
+        return False
+
+    api_url = f"{base_url.rstrip('/')}/Items"
+    params = {
+        "Path": str(file_path),
+        "Recursive": "false",
+        "Limit": 10,
+        "Fields": "Path,MediaSources",
+    }
+    try:
+        response = emby_client.get(
+            api_url,
+            params=params,
+            headers={"X-Emby-Token": api_key},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return None
+        for item in payload.get("Items") or []:
+            candidate_paths = [item.get("Path")]
+            candidate_paths.extend(
+                source.get("Path")
+                for source in item.get("MediaSources") or []
+                if isinstance(source, dict)
+            )
+            for candidate in candidate_paths:
+                if not candidate:
+                    continue
+                normalized_candidate = os.path.normcase(os.path.normpath(str(candidate)))
+                if normalized_candidate == normalized_target:
+                    return True
+        return False
+    except Exception as exc:
+        logger.warning(f"  ⚠️ 无法确认 Emby 是否已收录路径 '{file_path}': {exc}")
+        return None
 
 # --- 最近锚点强制刷新版 ---
 def refresh_library_by_path(file_path: str, base_url: str, api_key: str) -> bool:
@@ -945,9 +1038,15 @@ def refresh_library_by_path(file_path: str, base_url: str, api_key: str) -> bool
         api_url = f"{base_url.rstrip('/')}/Library/Media/Updated"
         payload = {"Updates": [{"Path": file_path, "UpdateType": "Modified"}]}
         try:
-            emby_client.post(api_url, params={"api_key": api_key}, json=payload)
+            response = emby_client.post(
+                api_url,
+                json=payload,
+                headers={"X-Emby-Token": api_key},
+            )
+            response.raise_for_status()
             return True
-        except:
+        except Exception as exc:
+            logger.error(f"  ❌ Emby 系统通知接口刷新失败: {exc}")
             return False
 
 # ✨✨✨ 分批次地从 Emby 获取所有 Person 条目 ✨✨✨
@@ -1744,8 +1843,10 @@ def get_all_libraries_with_paths(base_url: str, api_key: str) -> List[Dict[str, 
     logger.debug("  ➜ 正在实时获取所有媒体库及其源文件夹路径...")
     try:
         folders_url = f"{base_url.rstrip('/')}/Library/VirtualFolders"
-        params = {"api_key": api_key}
-        response = emby_client.get(folders_url, params=params)
+        response = emby_client.get(
+            folders_url,
+            headers={"X-Emby-Token": api_key},
+        )
         response.raise_for_status()
         virtual_folders_data = response.json()
 

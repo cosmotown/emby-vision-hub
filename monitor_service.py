@@ -5,7 +5,7 @@ import re
 import time
 import logging
 import threading
-from typing import List, Optional, Any, Set
+from typing import List, Optional, Any
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from gevent import spawn_later
@@ -14,6 +14,11 @@ import constants
 import config_manager
 import handler.emby as emby
 import utils
+from services.emby_ingest import (
+    reconcile_recent_paths,
+    refresh_and_verify_paths,
+    wait_for_paths_stable,
+)
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -170,19 +175,17 @@ def process_batch_queue():
                 grouped_files[parent_dir] = []
             grouped_files[parent_dir].append(file_path)
 
-        representative_files = []
         logger.info(f"  🚀 [实时监控] 准备刮削 {len(files_to_scrape)} 个文件，聚合为 {len(grouped_files)} 个任务组。")
 
         for parent_dir, files in grouped_files.items():
             rep_file = files[0]
-            representative_files.append(rep_file)
             folder_name = os.path.basename(parent_dir)
             if len(files) > 1:
                 logger.info(f"    ├─ [刮削] 目录 '{folder_name}' 含 {len(files)} 个文件，选取代表: {os.path.basename(rep_file)}")
             else:
                 logger.info(f"    ├─ [刮削] 目录 '{folder_name}' 单文件: {os.path.basename(rep_file)}")
 
-        threading.Thread(target=_handle_batch_file_task, args=(processor, representative_files)).start()
+        threading.Thread(target=_handle_batch_file_task, args=(processor, files_to_scrape)).start()
 
     # 2. 仅刷新流程
     if files_to_refresh_only:
@@ -232,113 +235,62 @@ def process_delete_batch_queue():
 
 def _handle_batch_file_task(processor, file_paths: List[str]):
     """批量处理新增文件任务 (刮削模式)"""
-    valid_files = _wait_for_files_stability(file_paths)
+    valid_files, skipped_files = wait_for_paths_stable(file_paths)
+    if skipped_files:
+        logger.warning(f"  ⚠️ [实时监控] {len(skipped_files)} 个文件未在时限内稳定，交给自动查漏重试。")
     if not valid_files: return
     processor.process_file_actively_batch(valid_files)
 
 def _handle_batch_refresh_only_task(file_paths: List[str]):
     """批量处理仅刷新任务 (新增/修改)"""
-    valid_files = _wait_for_files_stability(file_paths)
+    valid_files, skipped_files = wait_for_paths_stable(file_paths)
+    if skipped_files:
+        logger.warning(f"  ⚠️ [实时监控] {len(skipped_files)} 个文件未在时限内稳定，交给自动查漏重试。")
     if not valid_files: return
 
-    parent_dirs = set()
-    for f in valid_files:
-        parent_dirs.add(os.path.dirname(f))
-    
-    _refresh_parent_dirs(parent_dirs, "新增/修改")
+    config = config_manager.APP_CONFIG
+    result = refresh_and_verify_paths(
+        valid_files,
+        config.get(constants.CONFIG_OPTION_EMBY_SERVER_URL),
+        config.get(constants.CONFIG_OPTION_EMBY_API_KEY),
+        initial_delay_seconds=config.get(constants.CONFIG_OPTION_MONITOR_EXCLUDE_REFRESH_DELAY, 0),
+    )
+    pending = result.get('pending') or []
+    if pending:
+        logger.warning(
+            f"  ⚠️ [实时监控] {len(pending)}/{result.get('requested', 0)} 个文件尚未被 Emby 收录，"
+            "自动查漏将在下一轮继续处理。"
+        )
+    else:
+        logger.info(f"  ✅ [实时监控] 已确认 Emby 收录 {result.get('indexed', 0)} 个文件。")
 
 def _handle_batch_delete_refresh_only(file_paths: List[str]):
     """
     批量处理仅刷新任务 (删除)
     注意：删除不需要等待文件稳定，因为文件已经没了。
     """
-    parent_dirs = set()
-    for f in file_paths:
-        parent_dirs.add(os.path.dirname(f))
-    
-    _refresh_parent_dirs(parent_dirs, "删除")
-
-def _refresh_parent_dirs(parent_dirs: Set[str], action_type: str):
-    """
-    辅助函数：执行目录刷新
-    ★★★ 新增：支持延迟刷新逻辑 ★★★
-    """
     config = config_manager.APP_CONFIG
-    
-    # 再次检查开关，防止在延迟等待期间用户关闭了监控
     if not config.get(constants.CONFIG_OPTION_MONITOR_ENABLED, False):
         return
-
     base_url = config.get(constants.CONFIG_OPTION_EMBY_SERVER_URL)
     api_key = config.get(constants.CONFIG_OPTION_EMBY_API_KEY)
-    
-    # 获取延迟时间配置
     delay_seconds = config.get(constants.CONFIG_OPTION_MONITOR_EXCLUDE_REFRESH_DELAY, 0)
-
     if not base_url or not api_key:
-        logger.error(f"  ❌ [实时监控-{action_type}] 无法执行刷新：Emby 配置缺失。")
+        logger.error("  ❌ [实时监控-删除] 无法执行刷新：Emby 配置缺失。")
         return
-
-    # ★★★ 延迟逻辑 ★★★
     if delay_seconds > 0:
-        logger.info(f"  ⏳ [实时监控-{action_type}] 命中排除路径，等待 {delay_seconds} 秒后通知 Emby 刷新 (等待其他工具处理)...")
+        logger.info(f"  ⏳ [实时监控-删除] 等待 {delay_seconds} 秒后通知 Emby...")
         time.sleep(delay_seconds)
-        
-        # 等待结束后再次检查开关，如果用户中途关闭了监控，则取消刷新
         if not config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_MONITOR_ENABLED, False):
-            logger.info(f"  🛑 [实时监控] 监控已关闭，取消挂起的刷新任务。")
+            logger.info("  🛑 [实时监控] 监控已关闭，取消挂起的删除通知。")
             return
-
-    logger.info(f"  🔄 [实时监控-{action_type}] 正在通知 Emby 刷新 {len(parent_dirs)} 个排除目录...")
-    for folder_path in parent_dirs:
-        try:
-            emby.refresh_library_by_path(folder_path, base_url, api_key)
-            logger.info(f"    └─ 已通知刷新: {folder_path}")
-        except Exception as e:
-            logger.error(f"    ❌ 刷新目录失败 {folder_path}: {e}")
-
-def _wait_for_files_stability(file_paths: List[str]) -> List[str]:
-    """
-    辅助函数：等待文件列表中的文件大小不再变化（拷贝完成）
-    """
-    valid_files = []
-    for file_path in file_paths:
-        if not os.path.exists(file_path):
-            continue
-            
-        stable_count = 0
-        last_size = -1
-        is_stable = False
-        
-        # 最多等待 60秒
-        for _ in range(60): 
-            try:
-                if not os.path.exists(file_path): 
-                    break # 文件中途消失
-                
-                size = os.path.getsize(file_path)
-                if size > 0 and size == last_size:
-                    stable_count += 1
-                else:
-                    stable_count = 0
-                
-                last_size = size
-                
-                # 连续 3秒 大小不变，认为拷贝完成
-                if stable_count >= 3: 
-                    is_stable = True
-                    break
-                
-                time.sleep(1)
-            except: 
-                pass
-        
-        if is_stable:
-            valid_files.append(file_path)
-        else:
-            logger.warning(f"  ⚠️ [实时监控] 文件不稳定或超时，跳过处理: {os.path.basename(file_path)}")
-    
-    return valid_files
+    if emby.notify_media_paths_updated(
+        file_paths,
+        base_url,
+        api_key,
+        update_type="Deleted",
+    ):
+        logger.info(f"  ✅ [实时监控-删除] 已通知 Emby {len(file_paths)} 个精确删除路径。")
 
 class MonitorService:
     processor_instance = None
@@ -353,6 +305,21 @@ class MonitorService:
         self.paths = self.config.get(constants.CONFIG_OPTION_MONITOR_PATHS, [])
         self.extensions = self.config.get(constants.CONFIG_OPTION_MONITOR_EXTENSIONS, constants.DEFAULT_MONITOR_EXTENSIONS)
         self.exclude_dirs = self.config.get(constants.CONFIG_OPTION_MONITOR_EXCLUDE_DIRS, constants.DEFAULT_MONITOR_EXCLUDE_DIRS)
+        self.reconcile_interval_minutes = max(
+            0,
+            int(self.config.get(
+                constants.CONFIG_OPTION_MONITOR_RECONCILE_INTERVAL_MINUTES,
+                constants.DEFAULT_MONITOR_RECONCILE_INTERVAL_MINUTES,
+            ) or 0),
+        )
+        self._reconcile_stop = threading.Event()
+        self._reconcile_thread = None
+        lookback_days = max(0, int(self.config.get(
+            constants.CONFIG_OPTION_MONITOR_SCAN_LOOKBACK_DAYS,
+            constants.DEFAULT_MONITOR_SCAN_LOOKBACK_DAYS,
+        ) or 0))
+        initial_lookback_seconds = min(max(lookback_days * 86400, 3600), 86400)
+        self._reconcile_since = time.time() - initial_lookback_seconds
 
     def start(self):
         if not self.enabled:
@@ -380,12 +347,57 @@ class MonitorService:
         if started_paths:
             self.observer.start()
             logger.info(f"  👀 实时监控服务已启动，正在监听 {len(started_paths)} 个目录: {started_paths}")
+            if self.reconcile_interval_minutes > 0 and self.exclude_dirs:
+                self._reconcile_thread = threading.Thread(
+                    target=self._run_reconcile_loop,
+                    name="strm-ingest-reconcile",
+                    daemon=True,
+                )
+                self._reconcile_thread.start()
+                logger.info(
+                    f"  🧭 STRM 自动查漏已启动，每 {self.reconcile_interval_minutes} 分钟检查排除路径。"
+                )
         else:
             logger.warning("  ➜ 没有有效的监控目录，实时监控服务未启动。")
 
+    def _run_reconcile_loop(self):
+        if self._reconcile_stop.wait(60):
+            return
+        while not self._reconcile_stop.is_set():
+            scan_started = time.time()
+            try:
+                result = reconcile_recent_paths(
+                    self.exclude_dirs,
+                    self.extensions,
+                    self._reconcile_since,
+                    self.config.get(constants.CONFIG_OPTION_EMBY_SERVER_URL),
+                    self.config.get(constants.CONFIG_OPTION_EMBY_API_KEY),
+                    strm_only=True,
+                )
+                refresh_result = result.get('refresh') or {}
+                unresolved = bool(
+                    result.get('unstable', 0)
+                    or refresh_result.get('pending')
+                    or refresh_result.get('query_failed')
+                )
+                if not unresolved:
+                    self._reconcile_since = scan_started - 60
+                logger.info(
+                    f"  🧭 STRM 自动查漏完成：检查 {result.get('scanned', 0)}，"
+                    f"刷新前缺失 {result.get('missing_before_refresh', 0)}，"
+                    f"未稳定 {result.get('unstable', 0)}。"
+                )
+            except Exception as exc:
+                logger.error(f"  ❌ STRM 自动查漏失败，将在下一轮重试: {exc}", exc_info=True)
+            if self._reconcile_stop.wait(self.reconcile_interval_minutes * 60):
+                return
+
     def stop(self):
+        self._reconcile_stop.set()
         if self.observer:
             logger.info("  ➜ 正在停止实时监控服务...")
             self.observer.stop()
             self.observer.join()
             logger.info("  ➜ 实时监控服务已停止。")
+        if self._reconcile_thread and self._reconcile_thread.is_alive():
+            self._reconcile_thread.join(timeout=5)

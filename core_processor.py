@@ -31,6 +31,7 @@ from cachetools import TTLCache
 from ai_translator import AITranslator
 from watchlist_processor import WatchlistProcessor
 from handler.douban import DoubanApi
+from services.emby_ingest import refresh_and_verify_paths
 
 logger = logging.getLogger(__name__)
 try:
@@ -711,53 +712,32 @@ class MediaProcessor:
 
         logger.info(f"  📥 [实时监控] 收到 {len(file_paths)} 个新任务，开始批量预处理...")
         
-        folders_to_check = set()
-        
-        # 1. 循环处理每个文件 (只生成缓存，不刷新)
-        for i, file_path in enumerate(file_paths):
+        # 1. 同一目录只选一个代表做 Toolkit 预处理，Emby 仍接收全部路径。
+        representatives = {}
+        for file_path in file_paths:
+            representatives.setdefault(os.path.dirname(file_path), file_path)
+        representative_files = list(representatives.values())
+        for i, file_path in enumerate(representative_files):
             try:
-                logger.info(f"  ➜ [实时监控] ({i+1}/{len(file_paths)}) 正在处理: {os.path.basename(file_path)}")
-                # process_file_actively 返回的是建议刷新的父目录路径
-                folder = self.process_file_actively(file_path, skip_refresh=True)
-                if folder:
-                    folders_to_check.add(folder)
+                logger.info(f"  ➜ [实时监控] ({i+1}/{len(representative_files)}) 正在处理: {os.path.basename(file_path)}")
+                self.process_file_actively(file_path, skip_refresh=True)
             except Exception as e:
                 logger.error(f"  🚫 [实时监控] 处理文件 '{file_path}' 失败: {e}")
 
-        # 2. ★★★ ID 级别去重与刷新 ★★★
-        if folders_to_check:
-            logger.info(f"  🔍 [实时监控] 预处理完成。正在解析 {len(folders_to_check)} 个路径对应的 Emby 锚点...")
-            
-            unique_anchor_map = {} # ID -> Name
-            fallback_paths = []
-
-            # A. 解析路径到 ID
-            for folder_path in folders_to_check:
-                anchor_id, anchor_name = emby.find_nearest_library_anchor(folder_path, self.emby_url, self.emby_api_key)
-                if anchor_id:
-                    if anchor_id not in unique_anchor_map:
-                        unique_anchor_map[anchor_id] = anchor_name
-                        logger.debug(f"    ├─ 路径 '{os.path.basename(folder_path)}' -> 锚点 '{anchor_name}' (ID: {anchor_id})")
-                else:
-                    fallback_paths.append(folder_path)
-
-            # B. 刷新唯一的 ID
-            if unique_anchor_map:
-                logger.info(f"  🚀 [实时监控] 聚合完成，正在刷新 {len(unique_anchor_map)} 个 Emby 锚点...")
-                for anchor_id, anchor_name in unique_anchor_map.items():
-                    logger.info(f"  ➜ 正在刷新: '{anchor_name}' (ID: {anchor_id})")
-                    emby.refresh_item_by_id(anchor_id, self.emby_url, self.emby_api_key)
-                    time.sleep(0.2) # 稍微间隔
-
-            # C. 处理无法解析 ID 的路径 (回退到旧方法)
-            if fallback_paths:
-                logger.warning(f"  ⚠️ [实时监控] 有 {len(fallback_paths)} 个路径无法解析锚点，使用回退刷新...")
-                for path in fallback_paths:
-                    emby.refresh_library_by_path(path, self.emby_url, self.emby_api_key)
-
-            logger.info(f"  ✅ [实时监控] 批量预处理完成，等待Emby入库更新媒体资产数据...")
+        # 2. 预处理是否成功都不阻断 Emby 入库；统一通知、刷新、确认并重试。
+        result = refresh_and_verify_paths(
+            file_paths,
+            self.emby_url,
+            self.emby_api_key,
+        )
+        pending = result.get('pending') or []
+        if pending:
+            logger.warning(
+                f"  ⚠️ [实时监控] 仍有 {len(pending)}/{result.get('requested', 0)} 个文件未被 Emby 收录，"
+                "自动查漏将在下一轮继续处理。"
+            )
         else:
-            logger.warning(f"  ⚠️ [实时监控] 未收集到有效的刷新目录，任务结束。")
+            logger.info(f"  ✅ [实时监控] 已确认 Emby 收录 {result.get('indexed', 0)} 个文件。")
 
     # --- 内部私有方法：单文件数据库清理逻辑 ---
     def _cleanup_local_db_for_deleted_file(self, filename: str, file_path: Optional[str] = None) -> bool:

@@ -82,7 +82,9 @@
 | `monitor_paths` | 监控目录列表 |
 | `monitor_extensions` | 扩展名列表 |
 | `monitor_scan_lookback_days` | 回溯扫描天数 |
+| `monitor_reconcile_interval_minutes` | 排除路径 STRM 自动查漏间隔，0 为关闭 |
 | `monitor_exclude_dirs` | 排除路径 |
+| `monitor_exclude_refresh_delay` | 排除路径的入库通知延迟秒数 |
 
 ## LocalDataSource
 

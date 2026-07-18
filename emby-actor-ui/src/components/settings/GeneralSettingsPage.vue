@@ -120,7 +120,8 @@
                       />
                       <template #feedback>
                         <n-text depth="3" style="font-size:0.8em;">
-                          命中这些路径的文件将<b>跳过刮削流程</b>，仅刷新。<br/>
+                          命中这些路径的文件将<b>跳过 Toolkit 刮削</b>，仅协调 Emby 入库与删除。<br/>
+                          MP 生成的 STRM 根目录建议同时填入“监控路径”和“排除路径”。
                         </n-text>
                       </template>
                     </n-form-item>
@@ -157,6 +158,24 @@
                       <template #feedback>
                         <n-text depth="3" style="font-size:0.8em;">
                           仅检查最近 N 天内创建或修改过的文件，设为 0 则全量扫描。
+                        </n-text>
+                      </template>
+                    </n-form-item>
+
+                    <n-form-item label="STRM 自动查漏间隔" path="monitor_reconcile_interval_minutes">
+                      <n-input-number
+                        v-model:value="configModel.monitor_reconcile_interval_minutes"
+                        :min="0"
+                        :max="1440"
+                        :step="5"
+                        placeholder="15"
+                        style="width: 100%"
+                      >
+                        <template #suffix>分钟</template>
+                      </n-input-number>
+                      <template #feedback>
+                        <n-text depth="3" style="font-size:0.8em;">
+                          自动检查排除路径中遗漏的 STRM，默认 15 分钟；设为 0 关闭。首次最多回溯 1 天，失败时不会跳过时间水位。
                         </n-text>
                       </template>
                     </n-form-item>

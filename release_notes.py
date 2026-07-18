@@ -2,6 +2,28 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.9",
+        "published_at": "2026-07-18T03:30:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.9",
+        "changelog": """## STRM 精确入库与自动查漏
+
+### 新增
+- 对 MP 等工具生成的 STRM 文件提供实时入库协调：精确通知 Emby 文件及父目录，并在限定时间内确认每个路径是否已收录。
+- 新增“STRM 自动查漏间隔”，默认每 15 分钟检查排除路径中的最近 STRM，可设为 0 关闭。
+- 定时“扫描监控目录”改为直接向 Emby 核对精确路径，不再依赖 Toolkit 数据库或 TMDb ID 猜测入库状态。
+
+### 修复
+- 批量 STRM 的文件稳定检查改为并行，避免每集串行等待导致入库前卡住数分钟。
+- 保留整批集数给 Emby，Toolkit 元数据预处理才按目录选一个代表，避免一部剧只通知第一集。
+- 刷新 HTTP 请求现在检查返回状态；Emby 未确认入库时会重试，而不再仅凭请求发出就报成功。
+
+### 安全边界
+- 新增入库任务永不递归刷新媒体库根目录；只允许刷新已确认的剧集/季等近端锚点。无法识别根 ID 时仅发送精确路径通知。
+- 排除路径的含义是“跳过 Toolkit 刮削、仅协调 Emby 入库”，适合直接管理 MP STRM 根目录。
+- 不修改 Emby 数据库、媒体文件、Webhook 处理、虚拟库、封面或 302 播放转发。
+""",
+    },
+    {
         "version": "v7.1.8",
         "published_at": "2026-07-15T01:30:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.8",

@@ -927,6 +927,38 @@ def is_emby_id_in_library(emby_id: str) -> bool:
         logger.error(f"检查 Emby ID {emby_id} 在库状态时出错: {e}", exc_info=True)
         return False
 
+def get_in_library_emby_ids(emby_ids: List[str]) -> set:
+    """Return existing in-library IDs with one database connection and query."""
+    normalized_ids = sorted({
+        str(emby_id).strip()
+        for emby_id in emby_ids or []
+        if str(emby_id or '').strip()
+    })
+    if not normalized_ids:
+        return set()
+
+    sql = """
+        SELECT DISTINCT ids.emby_id
+        FROM media_metadata m
+        CROSS JOIN LATERAL jsonb_array_elements_text(
+            COALESCE(m.emby_item_ids_json, '[]'::jsonb)
+        ) AS ids(emby_id)
+        WHERE m.in_library = TRUE
+          AND ids.emby_id = ANY(%s)
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, (normalized_ids,))
+                return {
+                    str(row['emby_id'])
+                    for row in cursor.fetchall()
+                    if row.get('emby_id') is not None
+                }
+    except Exception as e:
+        logger.error("批量检查 Emby ID 在库状态时出错: %s", e, exc_info=True)
+        return set()
+
 # 根据 TMDb ID 获取已知文件名集合    
 def get_known_filenames_by_tmdb_id(tmdb_id: str) -> set:
     """
@@ -979,10 +1011,33 @@ def _path_suffixes_for_match(path: str) -> List[str]:
     normalized = _normalize_asset_path(path)
     parts = [part for part in normalized.split("/") if part]
     suffixes = []
-    for depth in (4, 3, 2, 1):
+    # A filename alone is not enough evidence for destructive cleanup. Docker
+    # mount prefixes may differ, but the immediate parent directory must match.
+    for depth in (4, 3):
         if len(parts) >= depth:
             suffixes.append("/".join(parts[-depth:]))
     return suffixes
+
+def _select_unique_media_path_match(
+    rows: List[Dict[str, Any]],
+    file_path: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Select one asset conservatively; ambiguous same-name paths are never guessed."""
+    if not rows:
+        return None
+    if not file_path:
+        return rows[0] if len(rows) == 1 else None
+
+    for suffix in _path_suffixes_for_match(file_path):
+        matches = [
+            row for row in rows
+            if _normalize_asset_path(row.get('asset_path', '')).endswith(suffix)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return None
+    return None
 
 def get_media_info_by_filename(filename: str, file_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
@@ -1029,23 +1084,14 @@ def get_media_info_by_filename(filename: str, file_path: Optional[str] = None) -
                 cursor.execute(sql, (f"%{filename}",))
                 rows = [dict(row) for row in cursor.fetchall()]
 
-                if file_path and rows:
-                    target_suffixes = _path_suffixes_for_match(file_path)
-                    for suffix in target_suffixes:
-                        matches = [
-                            row for row in rows
-                            if _normalize_asset_path(row.get('asset_path', '')).endswith(suffix)
-                        ]
-                        if len(matches) == 1:
-                            return matches[0]
-                        if len(matches) > 1:
-                            logger.warning(f"DB: 文件路径 '{file_path}' 命中多条媒体记录，已回退到文件名匹配。")
-                            break
-
+                selected = _select_unique_media_path_match(rows, file_path)
+                if selected:
+                    return selected
                 if rows:
-                    if len(rows) > 1:
-                        logger.warning(f"DB: 文件名 '{filename}' 命中 {len(rows)} 条媒体记录，使用第一条结果。建议检查是否存在跨库同名文件。")
-                    return rows[0]
+                    logger.warning(
+                        f"DB: 文件 '{file_path or filename}' 命中 {len(rows)} 条同名媒体记录，"
+                        "但路径无法唯一确认；为避免误清理，本次跳过。"
+                    )
                 return None
     except Exception as e:
         logger.error(f"DB: 根据文件名反查精确媒体信息失败 ({filename}): {e}")

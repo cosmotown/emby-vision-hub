@@ -316,6 +316,7 @@ class MonitorService:
         )
         self._reconcile_stop = threading.Event()
         self._reconcile_thread = None
+        self._reconcile_retry_paths = set()
         lookback_days = max(0, int(self.config.get(
             constants.CONFIG_OPTION_MONITOR_SCAN_LOOKBACK_DAYS,
             constants.DEFAULT_MONITOR_SCAN_LOOKBACK_DAYS,
@@ -375,22 +376,17 @@ class MonitorService:
                     self.config.get(constants.CONFIG_OPTION_EMBY_SERVER_URL),
                     self.config.get(constants.CONFIG_OPTION_EMBY_API_KEY),
                     strm_only=True,
+                    retry_paths=self._reconcile_retry_paths,
                 )
-                refresh_result = result.get('refresh') or {}
                 self.processor.enqueue_confirmed_ingest_postprocessing(
                     result.get('confirmed_paths') or []
                 )
-                unresolved = bool(
-                    result.get('unstable', 0)
-                    or refresh_result.get('pending')
-                    or refresh_result.get('query_failed')
-                )
-                if not unresolved:
-                    self._reconcile_since = scan_started - 60
+                self._reconcile_retry_paths = set(result.get('unresolved_paths') or [])
+                self._reconcile_since = scan_started - 60
                 logger.info(
                     f"  🧭 STRM 自动查漏完成：检查 {result.get('scanned', 0)}，"
                     f"刷新前缺失 {result.get('missing_before_refresh', 0)}，"
-                    f"未稳定 {result.get('unstable', 0)}。"
+                    f"留待重试 {len(self._reconcile_retry_paths)}。"
                 )
             except Exception as exc:
                 logger.error(f"  ❌ STRM 自动查漏失败，将在下一轮重试: {exc}", exc_info=True)

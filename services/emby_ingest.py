@@ -292,13 +292,15 @@ def reconcile_recent_paths(
     base_url: str,
     api_key: str,
     strm_only: bool = False,
+    retry_paths: Iterable[str] = (),
 ) -> Dict[str, object]:
-    paths = collect_recent_media_paths(
+    recent_paths = collect_recent_media_paths(
         root_paths,
         extensions,
         cutoff_timestamp,
         strm_only=strm_only,
     )
+    paths = sorted(set(recent_paths) | set(normalize_paths(retry_paths)))
     indexed, missing, failed = check_indexed_paths(paths, base_url, api_key)
     pending = sorted(missing | failed)
     stable_pending, unstable = wait_for_paths_stable(pending) if pending else ([], [])
@@ -310,10 +312,16 @@ def reconcile_recent_paths(
         'query_failed': [],
         'refresh_ok': True,
     }
+    unresolved_paths = sorted(
+        set(unstable)
+        | set(refresh_result.get('pending') or [])
+        | set(refresh_result.get('query_failed') or [])
+    )
     return {
         'scanned': len(paths),
         'already_indexed': len(indexed),
         'confirmed_paths': sorted(indexed | set(refresh_result.get('confirmed_paths') or [])),
+        'unresolved_paths': unresolved_paths,
         'missing_before_refresh': len(pending),
         'unstable': len(unstable),
         'refresh': refresh_result,

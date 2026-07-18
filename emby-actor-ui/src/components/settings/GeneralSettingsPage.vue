@@ -120,7 +120,8 @@
                       />
                       <template #feedback>
                         <n-text depth="3" style="font-size:0.8em;">
-                          命中这些路径的文件将<b>跳过 Toolkit 刮削</b>，仅协调 Emby 入库与删除。<br/>
+                          命中后将<b>跳过入库前的 Toolkit 文件预处理</b>，仅协调 Emby 入库与删除。<br/>
+                          Emby 确认入库后，仍会执行已配置的 Webhook 后处理。<br/>
                           MP 生成的 STRM 根目录建议同时填入“监控路径”和“排除路径”。
                         </n-text>
                       </template>
@@ -175,7 +176,7 @@
                       </n-input-number>
                       <template #feedback>
                         <n-text depth="3" style="font-size:0.8em;">
-                          自动检查排除路径中遗漏的 STRM，默认 15 分钟；设为 0 关闭。首次最多回溯 1 天，失败时不会跳过时间水位。
+                          自动检查排除路径中遗漏的 STRM，默认 15 分钟；设为 0 关闭。首次最多回溯 1 天，失败路径会单独保留重试，不会重复扫描整段历史窗口。
                         </n-text>
                       </template>
                     </n-form-item>

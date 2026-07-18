@@ -3,6 +3,8 @@ import sys
 import tempfile
 import time
 import types
+import ast
+import typing
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -188,6 +190,44 @@ class EmbyIngestTests(unittest.TestCase):
 
         self.assertEqual(["/media/a.strm", "/media/b.strm"], result["confirmed_paths"])
 
+    @mock.patch("services.emby_ingest.refresh_and_verify_paths")
+    @mock.patch("services.emby_ingest.wait_for_paths_stable")
+    @mock.patch("services.emby_ingest.check_indexed_paths")
+    @mock.patch("services.emby_ingest.collect_recent_media_paths")
+    def test_reconcile_keeps_failed_paths_separate_from_time_window(
+        self,
+        collect_paths,
+        check_paths,
+        wait_stable,
+        refresh_paths,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            old_path, new_path = self._make_strm_files(directory, 2)
+            collect_paths.return_value = [new_path]
+            check_paths.return_value = (set(), {old_path, new_path}, set())
+            wait_stable.return_value = ([new_path], [old_path])
+            refresh_paths.return_value = {
+                "requested": 1,
+                "indexed": 0,
+                "confirmed_paths": [],
+                "pending": [new_path],
+                "query_failed": [],
+                "refresh_ok": True,
+            }
+
+            result = emby_ingest.reconcile_recent_paths(
+                [directory],
+                [".strm"],
+                time.time(),
+                "http://emby",
+                "token",
+                retry_paths=[old_path],
+            )
+
+        checked_paths = check_paths.call_args.args[0]
+        self.assertEqual({old_path, new_path}, set(checked_paths))
+        self.assertEqual([old_path, new_path], result["unresolved_paths"])
+
     def test_excluded_delete_path_keeps_external_deletion_ownership(self):
         root = Path(__file__).resolve().parents[1]
         processor_source = (root / "core_processor.py").read_text(encoding="utf-8")
@@ -212,6 +252,54 @@ class EmbyIngestTests(unittest.TestCase):
         self.assertIn("_enqueue_persistent_webhook_task", method)
         self.assertNotIn("_enqueue_webhook_event", method)
         self.assertIn("'new_episode_ids': episode_ids", method)
+
+    def test_confirmed_ingest_checks_existing_ids_in_one_batch(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "core_processor.py"
+        ).read_text(encoding="utf-8")
+        method = source.split(
+            "def enqueue_confirmed_ingest_postprocessing", 1
+        )[1].split("def _cleanup_local_db_for_deleted_file", 1)[0]
+
+        self.assertIn("media_db.get_in_library_emby_ids(item_ids)", method)
+        self.assertNotIn("media_db.is_emby_id_in_library(item_id)", method)
+
+    def test_ambiguous_same_name_deletion_is_never_guessed(self):
+        source_path = Path(__file__).resolve().parents[1] / "database" / "media_db.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        helper_names = {
+            "_normalize_asset_path",
+            "_path_suffixes_for_match",
+            "_select_unique_media_path_match",
+        }
+        helpers = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in helper_names
+        ]
+        namespace = {
+            "os": os,
+            "List": typing.List,
+            "Dict": typing.Dict,
+            "Optional": typing.Optional,
+            "Any": typing.Any,
+        }
+        exec(compile(ast.Module(body=helpers, type_ignores=[]), str(source_path), "exec"), namespace)
+        select_match = namespace["_select_unique_media_path_match"]
+        rows = [
+            {"asset_path": "/data/tv/Show A/Season 01/S01E01.strm", "target_emby_id": "1"},
+            {"asset_path": "/data/tv/Show B/Season 01/S01E01.strm", "target_emby_id": "2"},
+        ]
+
+        selected = select_match(rows, "/mnt/tv/Show A/Season 01/S01E01.strm")
+        ambiguous = select_match(rows, "/mnt/tv/Show C/Season 01/S01E01.strm")
+        wrong_single_path = select_match(
+            [rows[0]],
+            "/mnt/tv/Show C/Season 01/S01E01.strm",
+        )
+
+        self.assertEqual("1", selected["target_emby_id"])
+        self.assertIsNone(ambiguous)
+        self.assertIsNone(wrong_single_path)
 
 
 class EmbyHttpValidationTests(unittest.TestCase):
@@ -275,6 +363,7 @@ class EmbyHttpValidationTests(unittest.TestCase):
 
         self.assertEqual("episode-1", item["Id"])
         self.assertNotIn("api_key", get.call_args.kwargs["params"])
+        self.assertEqual("true", get.call_args.kwargs["params"]["Recursive"])
         self.assertEqual("token", get.call_args.kwargs["headers"]["X-Emby-Token"])
 
 

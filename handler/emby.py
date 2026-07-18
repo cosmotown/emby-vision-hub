@@ -987,7 +987,9 @@ def _query_media_item_by_path(
     api_url = f"{base_url.rstrip('/')}/Items"
     params = {
         "Path": str(file_path),
-        "Recursive": "false",
+        # Emby 4.9.5.0 only applies the Path filter to media descendants when
+        # recursive lookup is enabled. Exact equality is still enforced below.
+        "Recursive": "true",
         "Limit": 10,
         "Fields": "Id,Name,Type,SeriesId,SeriesName,Path,MediaSources",
     }

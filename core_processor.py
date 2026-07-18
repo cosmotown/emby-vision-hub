@@ -753,10 +753,16 @@ class MediaProcessor:
 
         from routes.webhook import enqueue_verified_ingest_item
 
+        item_ids = [
+            str(item.get('Id') or '').strip()
+            for item in items
+            if str(item.get('Id') or '').strip()
+        ]
+        existing_item_ids = media_db.get_in_library_emby_ids(item_ids)
         queued = 0
         for item in items:
             item_id = str(item.get('Id') or '').strip()
-            if not item_id or media_db.is_emby_id_in_library(item_id):
+            if not item_id or item_id in existing_item_ids:
                 continue
             if enqueue_verified_ingest_item(
                 item_id,

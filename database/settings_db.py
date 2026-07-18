@@ -25,6 +25,11 @@ def get_setting(setting_key: str) -> Optional[Any]:
             cursor.execute("SELECT value_json FROM app_settings WHERE setting_key = %s", (setting_key,))
             row = cursor.fetchone()
             return row['value_json'] if row else None
+    except psycopg2.errors.UndefinedTable:
+        # Fresh installations load bootstrap configuration before init_db creates
+        # app_settings. Treat only that expected state as an empty settings store.
+        logger.debug("DB: app_settings 表尚未创建，按首次启动空配置处理。")
+        return None
     except Exception as e:
         logger.error(f"DB: 获取设置 '{setting_key}' 时失败: {e}", exc_info=True)
         raise

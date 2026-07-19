@@ -120,7 +120,7 @@ export default defineConfig({
     },
 
     editLink: {
-      pattern: 'https://github.com/hbq0405/emby-toolkit/edit/main/docs/:path',
+      pattern: 'https://github.com/cosmotown/emby-toolkit/edit/based-on-6.8.9/docs/:path',
       text: '在 GitHub 上编辑此页'
     },
 

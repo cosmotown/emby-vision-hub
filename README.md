@@ -1,7 +1,7 @@
 # Emby ToolKit (Emby 增强管理工具)
 
-[![中文文档](https://img.shields.io/badge/docs-read%20now-blue)](https://hbq0405.github.io/emby-toolkit/)
-[![GitHub license](https://img.shields.io/github/license/hbq0405/emby-toolkit.svg)](https://github.com/hbq0405/emby-toolkit/blob/main/LICENSE)
+[![中文文档](https://img.shields.io/badge/docs-read%20now-blue)](https://github.com/cosmotown/emby-toolkit/tree/based-on-6.8.9/docs/zh)
+[![GitHub license](https://img.shields.io/github/license/cosmotown/emby-toolkit.svg)](https://github.com/cosmotown/emby-toolkit/blob/based-on-6.8.9/LICENSE)
 <!-- 你可以添加更多的徽章，例如构建状态、Docker Hub 拉取次数等 -->
 
 一个用于处理和增强 Emby 媒体库的工具，包括但不限于演员/角色名称翻译、信息补全（从豆瓣、TMDb等）、合集检查及订阅、智能追剧、演员订阅、自建合集、虚拟库。
@@ -11,7 +11,7 @@
 *   **演员信息处理**：自动翻译演员名、角色名、优先使用豆瓣角色名，没有的调用ai在线翻译。
 *   **外部数据源集成**：从豆瓣获取Tmdb缺失的演员，补充进演员表。
 *   **定时任务**：支持定时自动化按设置的顺序执行后台任务。
-*   **实时处理新入库资源**：自动处理Emby新入库资源，需先在后台「高级」-「安全设置」配置 Webhook Token，再配置 webhook:http://ip:5257/webhook/emby?token=你的Token 请求内容类型：application/json 勾选：【新媒体已添加】、【媒体删除】以及神医插件才有的【按剧集和专辑对通知进行分组】、【媒体元数据更新】、【媒体图像更新】。
+*   **实时处理新入库资源**：按精确路径协调 STRM 新增、修改、移动与删除；未确认入库的路径进入有限重试队列，默认每日低频校准一次路径库存。需先在后台「高级」-「安全设置」配置 Webhook Token，再配置 `http://ip:5257/webhook/emby?token=你的Token`，请求内容类型选择 `application/json`。
 *   **合集检查**：扫描库存合集，检查缺失并订阅（需配置MoviePilot）。
 *   **智能追剧**：监控媒体库所有剧集，智能判断并更新状态，对缺失的季以及新出的季进行订阅操作（需配置MoviePilot）。
 *   **演员订阅**：追踪喜欢的演员，按配置订阅过去以及将来的资源（需配置MoviePilot）。
@@ -45,8 +45,7 @@
     services:
       # --- 1. Emby-Toolkit 主程序 ---
       emby-toolkit:
-        image: hbq0405/emby-toolkit:latest 
-        #image: hbq0405/emby-toolkit:arm              # ARM用这个镜像
+        image: tzyzero186/emby-toolkit:latest
         container_name: emby-toolkit
         network_mode: bridge                          # 网络模式
         ports:
@@ -54,7 +53,7 @@
           - "8097:8097"                               # 反代端口，虚拟库用，冒号前面是实际访问端口，冒号后面是管理后台设置的反代监听端口
         volumes:
           - /path/emby-toolkit:/config                # 将宿主机的数据目录挂载到容器的 /config 目录
-          - /path/media:/media                        # 映射Emby媒体目录，用以实时监控，替代Emby刮削。
+          - /path/STRM:/STRM:ro                       # 映射 STRM 根目录供实时监控；容器内路径需与监控设置一致
           - /path/tmdb:/tmdb                          # 映射神医本地TMDB目录，非神医Pro用户可以留空
           - /var/run/docker.sock:/var/run/docker.sock # 一键更新用，不需要可以不配置
         environment:
@@ -69,7 +68,7 @@
           - DB_PASSWORD=embytoolkit                   # !!! (必填) 请修改为一个强密码 !!!
           - DB_NAME=embytoolkit                       # !!! (可选) 修改为你自己的数据库名
           - CONTAINER_NAME=emby-toolkit               # 以下两项都是一键更新用，不需要可以不配置
-          - DOCKER_IMAGE_NAME=hbq0405/emby-toolkit:latest
+          - DOCKER_IMAGE_NAME=tzyzero186/emby-toolkit:latest
         restart: unless-stopped
         depends_on:                                   # 确保主程序只在数据库健康检查通过后才启动 
           db:

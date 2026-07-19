@@ -108,6 +108,39 @@ def init_db():
                 """)
 
                 cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS strm_ingest_retry_queue (
+                        id BIGSERIAL PRIMARY KEY,
+                        file_path TEXT NOT NULL UNIQUE,
+                        operation TEXT NOT NULL DEFAULT 'ingest',
+                        source TEXT NOT NULL DEFAULT 'realtime',
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        max_attempts INTEGER NOT NULL DEFAULT 3,
+                        next_attempt_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        file_size BIGINT,
+                        file_mtime DOUBLE PRECISION,
+                        last_error TEXT,
+                        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        last_checked_at TIMESTAMP WITH TIME ZONE,
+                        completed_at TIMESTAMP WITH TIME ZONE
+                    )
+                """)
+
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS strm_ingest_inventory_roots (
+                        root_path TEXT PRIMARY KEY,
+                        initialized_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        last_scan_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+                    )
+                """)
+
+                cursor.execute("""
+                    ALTER TABLE strm_ingest_retry_queue
+                    ADD COLUMN IF NOT EXISTS operation TEXT NOT NULL DEFAULT 'ingest'
+                """)
+
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS person_cleanup_candidates (
                         person_id TEXT PRIMARY KEY,
                         person_name TEXT,
@@ -595,6 +628,10 @@ def init_db():
                     cursor.execute("""
                         CREATE INDEX IF NOT EXISTS idx_webhook_event_item
                         ON webhook_event_queue (item_id, created_at DESC)
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_strm_ingest_retry_runnable
+                        ON strm_ingest_retry_queue (status, next_attempt_at, id)
                     """)
                     cursor.execute("""
                         CREATE INDEX IF NOT EXISTS idx_person_cleanup_discovered

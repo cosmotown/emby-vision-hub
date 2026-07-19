@@ -44,6 +44,15 @@ class EmbyIngestTests(unittest.TestCase):
     def test_empty_config_path_never_becomes_current_directory(self):
         self.assertEqual([], emby_ingest.normalize_paths(["", "  ", None], require_existing=False))
 
+    def test_strm_inventory_tracks_each_exact_path_and_fingerprint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = self._make_strm_files(directory, 2)
+            inventory = emby_ingest.collect_strm_inventory(directory)
+
+            self.assertEqual({first, second}, set(inventory))
+            self.assertGreater(inventory[first][0], 0)
+            self.assertIsInstance(inventory[first][1], float)
+
     @mock.patch("services.emby_ingest.emby.refresh_item_by_id")
     @mock.patch("services.emby_ingest.emby.find_nearest_library_anchor")
     @mock.patch("services.emby_ingest.emby.get_all_libraries_with_paths")
@@ -157,6 +166,33 @@ class EmbyIngestTests(unittest.TestCase):
         self.assertEqual(1, len(items))
         self.assertEqual("episode-1", items[0]["Id"])
 
+    @mock.patch("services.emby_ingest.verify_deleted_paths")
+    @mock.patch("services.emby_ingest.emby.refresh_item_by_id", return_value=True)
+    @mock.patch("services.emby_ingest.emby.notify_media_paths_updated", return_value=True)
+    @mock.patch("services.emby_ingest.get_confirmed_media_items")
+    def test_deleted_path_refreshes_only_its_exact_emby_item(
+        self,
+        get_items,
+        notify_paths,
+        refresh_item,
+        verify_paths,
+    ):
+        path = "/media/Movies/Example/Example.strm"
+        get_items.return_value = [{"Id": "movie-1", "Type": "Movie", "Path": path}]
+        verify_paths.return_value = {
+            "requested": 1,
+            "confirmed_paths": [path],
+            "pending": [],
+            "query_failed": [],
+        }
+
+        result = emby_ingest.delete_and_verify_paths([path], "http://emby", "token")
+
+        self.assertEqual([path], result["confirmed_paths"])
+        refresh_item.assert_called_once_with("movie-1", "http://emby", "token")
+        self.assertEqual("Deleted", notify_paths.call_args_list[0].kwargs["update_type"])
+        self.assertEqual("Modified", notify_paths.call_args_list[1].kwargs["update_type"])
+
     @mock.patch("services.emby_ingest.refresh_and_verify_paths")
     @mock.patch("services.emby_ingest.wait_for_paths_stable")
     @mock.patch("services.emby_ingest.check_indexed_paths")
@@ -240,6 +276,21 @@ class EmbyIngestTests(unittest.TestCase):
         self.assertNotIn("deep.delete", cleanup_method)
         self.assertNotIn("delete_file", cleanup_method)
         self.assertIn("processor.cleanup_file_deletion_records(file_paths)", monitor_source)
+
+    def test_realtime_monitor_handles_same_path_content_replacement(self):
+        source = (Path(__file__).resolve().parents[1] / "monitor_service.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        handler = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "MediaFileHandler"
+        )
+        method_names = {
+            node.name for node in handler.body if isinstance(node, ast.FunctionDef)
+        }
+
+        self.assertIn("on_modified", method_names)
+        self.assertIn("on_moved", method_names)
+        self.assertIn("on_deleted", method_names)
 
     def test_confirmed_ingest_bypasses_thread_local_webhook_debounce(self):
         source = (

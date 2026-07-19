@@ -13,7 +13,7 @@ mkdir -p /path/emby-toolkit
 ```yaml
 services:
   emby-toolkit:
-    image: hbq0405/emby-toolkit:latest
+    image: tzyzero186/emby-toolkit:latest
     container_name: emby-toolkit
     network_mode: bridge
     ports:
@@ -36,7 +36,7 @@ services:
       - DB_PASSWORD=embytoolkit
       - DB_NAME=embytoolkit
       - CONTAINER_NAME=emby-toolkit
-      - DOCKER_IMAGE_NAME=hbq0405/emby-toolkit:latest
+      - DOCKER_IMAGE_NAME=tzyzero186/emby-toolkit:latest
     restart: unless-stopped
     depends_on:
       db:

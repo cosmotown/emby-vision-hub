@@ -3,6 +3,7 @@
 from flask import Blueprint, jsonify, request, Response, stream_with_context
 import logging
 import json
+import os
 import re
 import requests
 import docker
@@ -72,6 +73,40 @@ def api_get_config():
     except Exception as e:
         logger.error(f"API /api/config (GET) 获取配置时发生错误: {e}", exc_info=True)
         return jsonify({"error": "获取配置信息时发生服务器内部错误"}), 500
+
+
+@system_bp.route('/directories', methods=['GET'])
+@admin_required
+def api_list_directories():
+    """Browse directories visible inside the Toolkit container."""
+    requested_path = str(request.args.get('path') or '/').strip()
+    current_path = os.path.abspath(os.path.normpath(requested_path))
+    if not os.path.isdir(current_path):
+        return jsonify({'error': '目录不存在或容器不可访问'}), 404
+    try:
+        directories = []
+        with os.scandir(current_path) as entries:
+            for entry in entries:
+                if entry.name.startswith('.'):
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        directories.append({
+                            'name': entry.name,
+                            'path': os.path.join(current_path, entry.name),
+                        })
+                except OSError:
+                    continue
+        directories.sort(key=lambda item: item['name'].casefold())
+        parent_path = os.path.dirname(current_path) if current_path != '/' else None
+        return jsonify({
+            'path': current_path,
+            'parent': parent_path,
+            'directories': directories,
+        }), 200
+    except OSError as exc:
+        logger.warning(f"读取容器目录 '{current_path}' 失败: {exc}")
+        return jsonify({'error': '目录无法读取，请检查卷映射和权限'}), 403
 
 # --- AI 测试 ---
 @system_bp.route('/ai/test', methods=['POST'])

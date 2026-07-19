@@ -120,9 +120,10 @@ def get_confirmed_media_items(
     base_url: str,
     api_key: str,
     max_workers: int = 5,
+    require_existing: bool = True,
 ) -> List[Dict[str, object]]:
     """Resolve exact indexed paths to Emby items and deduplicate by item ID."""
-    paths = normalize_paths(file_paths)
+    paths = normalize_paths(file_paths, require_existing=require_existing)
     if not paths or not base_url or not api_key:
         return []
 
@@ -142,6 +143,95 @@ def get_confirmed_media_items(
             if item_id:
                 items_by_id[item_id] = item
     return list(items_by_id.values())
+
+
+def verify_deleted_paths(
+    file_paths: Iterable[str],
+    base_url: str,
+    api_key: str,
+    verify_delays: Sequence[int] = (3, 8, 15),
+) -> Dict[str, object]:
+    """Confirm that exact Emby paths disappeared without touching the library root."""
+    paths = normalize_paths(file_paths, require_existing=False)
+    remaining = set(paths)
+    query_failed: Set[str] = set()
+    previous_deadline = 0
+    for deadline_seconds in verify_delays:
+        wait_seconds = max(1, int(deadline_seconds) - previous_deadline)
+        previous_deadline = int(deadline_seconds)
+        time.sleep(wait_seconds)
+        worker_count = max(1, min(len(remaining), 8))
+        states: Dict[str, Optional[bool]] = {}
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(emby.is_media_path_indexed, path, base_url, api_key): path
+                for path in remaining
+            }
+            for future in as_completed(futures):
+                path = futures[future]
+                try:
+                    states[path] = future.result()
+                except Exception:
+                    states[path] = None
+        removed = {path for path, state in states.items() if state is False}
+        query_failed = {path for path, state in states.items() if state is None}
+        remaining -= removed
+        if not remaining:
+            break
+    return {
+        'requested': len(paths),
+        'confirmed_paths': sorted(set(paths) - remaining),
+        'pending': sorted(remaining),
+        'query_failed': sorted(query_failed & remaining),
+    }
+
+
+def delete_and_verify_paths(
+    file_paths: Iterable[str],
+    base_url: str,
+    api_key: str,
+    verify_delays: Sequence[int] = (3, 8, 15),
+) -> Dict[str, object]:
+    """Notify exact deletions, refresh only known season/series anchors, then verify."""
+    paths = normalize_paths(file_paths, require_existing=False)
+    result: Dict[str, object] = {
+        'requested': len(paths),
+        'confirmed_paths': [],
+        'pending': paths,
+        'query_failed': [],
+        'refresh_ok': True,
+    }
+    if not paths or not base_url or not api_key:
+        result['refresh_ok'] = False
+        return result
+
+    known_items = get_confirmed_media_items(
+        paths,
+        base_url,
+        api_key,
+        require_existing=False,
+    )
+    # Refresh only the exact catalog objects that referenced the removed paths.
+    # This works for root-level movies and multi-version items without scanning a
+    # whole library; duplicate item IDs are deliberately collapsed.
+    safe_anchor_ids = {
+        str(item.get('Id'))
+        for item in known_items
+        if item.get('Id')
+    }
+    refresh_ok = emby.notify_media_paths_updated(paths, base_url, api_key, update_type='Deleted')
+    refresh_ok = emby.notify_media_paths_updated(
+        {os.path.dirname(path) for path in paths},
+        base_url,
+        api_key,
+        update_type='Modified',
+    ) and refresh_ok
+    for anchor_id in sorted(safe_anchor_ids):
+        refresh_ok = emby.refresh_item_by_id(anchor_id, base_url, api_key) and refresh_ok
+
+    result.update(verify_deleted_paths(paths, base_url, api_key, verify_delays=verify_delays))
+    result['refresh_ok'] = refresh_ok
+    return result
 
 
 def _refresh_parent_targets(
@@ -285,22 +375,34 @@ def collect_recent_media_paths(
     return sorted(set(paths))
 
 
-def reconcile_recent_paths(
-    root_paths: Iterable[str],
-    extensions: Iterable[str],
-    cutoff_timestamp: float,
+def collect_strm_inventory(root_path: str) -> Dict[str, Tuple[int, float]]:
+    """Return exact STRM paths and fingerprints for one low-frequency inventory pass."""
+    root = os.path.normpath(str(root_path or '').strip())
+    if not root or not os.path.isdir(root):
+        return {}
+    inventory: Dict[str, Tuple[int, float]] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if not name.startswith('.')]
+        for filename in filenames:
+            if filename.startswith('.') or not filename.lower().endswith('.strm'):
+                continue
+            path = os.path.normpath(os.path.join(dirpath, filename))
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            if stat.st_size > 0:
+                inventory[path] = (int(stat.st_size), float(stat.st_mtime))
+    return inventory
+
+
+def reconcile_paths(
+    file_paths: Iterable[str],
     base_url: str,
     api_key: str,
-    strm_only: bool = False,
-    retry_paths: Iterable[str] = (),
 ) -> Dict[str, object]:
-    recent_paths = collect_recent_media_paths(
-        root_paths,
-        extensions,
-        cutoff_timestamp,
-        strm_only=strm_only,
-    )
-    paths = sorted(set(recent_paths) | set(normalize_paths(retry_paths)))
+    """Check exact paths, refresh only missing entries, and return unresolved paths."""
+    paths = normalize_paths(file_paths)
     indexed, missing, failed = check_indexed_paths(paths, base_url, api_key)
     pending = sorted(missing | failed)
     stable_pending, unstable = wait_for_paths_stable(pending) if pending else ([], [])
@@ -326,3 +428,22 @@ def reconcile_recent_paths(
         'unstable': len(unstable),
         'refresh': refresh_result,
     }
+
+
+def reconcile_recent_paths(
+    root_paths: Iterable[str],
+    extensions: Iterable[str],
+    cutoff_timestamp: float,
+    base_url: str,
+    api_key: str,
+    strm_only: bool = False,
+    retry_paths: Iterable[str] = (),
+) -> Dict[str, object]:
+    recent_paths = collect_recent_media_paths(
+        root_paths,
+        extensions,
+        cutoff_timestamp,
+        strm_only=strm_only,
+    )
+    paths = sorted(set(recent_paths) | set(normalize_paths(retry_paths)))
+    return reconcile_paths(paths, base_url, api_key)

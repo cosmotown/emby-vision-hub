@@ -91,15 +91,18 @@
                     </n-form-item>
 
                     <n-form-item label="监控路径" path="monitor_paths">
-                      <n-select
-                        v-model:value="configModel.monitor_paths"
-                        multiple
-                        filterable
-                        tag
-                        :show-arrow="false"
-                        placeholder="输入路径并回车"
-                        :options="[]" 
-                      />
+                      <div class="path-picker-row">
+                        <n-select
+                          v-model:value="configModel.monitor_paths"
+                          multiple
+                          filterable
+                          tag
+                          :show-arrow="false"
+                          placeholder="选择目录或手动输入"
+                          :options="[]"
+                        />
+                        <n-button @click="openDirectoryPicker('monitor')">选择</n-button>
+                      </div>
                       <template #feedback>
                         <n-text depth="3" style="font-size:0.8em;">
                           输入路径后<b>按回车</b>添加。请保持和 Emby 媒体库路径映射一致。
@@ -109,15 +112,18 @@
 
                     <!-- 排除路径 -->
                     <n-form-item label="排除路径" path="monitor_exclude_dirs">
-                      <n-select
-                        v-model:value="configModel.monitor_exclude_dirs"
-                        multiple
-                        filterable
-                        tag
-                        :show-arrow="false"
-                        placeholder="输入路径并回车"
-                        :options="[]" 
-                      />
+                      <div class="path-picker-row">
+                        <n-select
+                          v-model:value="configModel.monitor_exclude_dirs"
+                          multiple
+                          filterable
+                          tag
+                          :show-arrow="false"
+                          placeholder="选择目录或手动输入"
+                          :options="[]"
+                        />
+                        <n-button @click="openDirectoryPicker('exclude')">选择</n-button>
+                      </div>
                       <template #feedback>
                         <n-text depth="3" style="font-size:0.8em;">
                           命中后将<b>跳过入库前的 Toolkit 文件预处理</b>，仅协调 Emby 入库与删除。<br/>
@@ -149,8 +155,8 @@
                     <n-form-item label="定时扫描回溯" path="monitor_scan_lookback_days">
                       <n-input-number 
                         v-model:value="configModel.monitor_scan_lookback_days" 
-                        :min="0" 
-                        :max="365" 
+                        :min="1"
+                        :max="7"
                         placeholder="1" 
                         style="width: 100%" 
                       >
@@ -158,25 +164,25 @@
                       </n-input-number>
                       <template #feedback>
                         <n-text depth="3" style="font-size:0.8em;">
-                          仅检查最近 N 天内创建或修改过的文件，设为 0 则全量扫描。
+                          首次建立路径库存时，仅对最近 N 天发生变化的 STRM 做 Emby 精确入库核对；范围为 1 至 7 天。
                         </n-text>
                       </template>
                     </n-form-item>
 
-                    <n-form-item label="STRM 自动查漏间隔" path="monitor_reconcile_interval_minutes">
+                    <n-form-item label="全目录查漏间隔" path="monitor_full_scan_interval_hours">
                       <n-input-number
-                        v-model:value="configModel.monitor_reconcile_interval_minutes"
+                        v-model:value="configModel.monitor_full_scan_interval_hours"
                         :min="0"
-                        :max="1440"
-                        :step="5"
-                        placeholder="15"
+                        :max="168"
+                        :step="6"
+                        placeholder="24"
                         style="width: 100%"
                       >
-                        <template #suffix>分钟</template>
+                        <template #suffix>小时</template>
                       </n-input-number>
                       <template #feedback>
                         <n-text depth="3" style="font-size:0.8em;">
-                          自动检查排除路径中遗漏的 STRM，默认 15 分钟；设为 0 关闭。首次最多回溯 1 天，失败路径会单独保留重试，不会重复扫描整段历史窗口。
+                          默认每天低频核对一次 STRM 路径库存；设为 0 关闭。失败路径由独立持久队列按约 10、30、60 分钟有限重试，不依赖此间隔。
                         </n-text>
                       </template>
                     </n-form-item>
@@ -643,7 +649,6 @@
                 <n-gi>
                   <n-card :bordered="false" class="dashboard-card">
                     <template #header><span class="card-title">网络代理</span></template>
-                    <template #header-extra><a href="https://api-flowercloud.com/aff.php?aff=8652" target="_blank" style="font-size: 0.85em; color: var(--n-primary-color); text-decoration: underline;">推荐机场</a></template>
                     <n-form-item-grid-item label="启用网络代理" path="network_proxy_enabled">
                       <n-switch v-model:value="configModel.network_proxy_enabled" />
                       <template #feedback><n-text depth="3" style="font-size:0.8em;">为 TMDb 等外部API请求启用 HTTP/HTTPS 代理。</n-text></template>
@@ -660,6 +665,10 @@
 
                 <n-gi span="1 l:2">
                   <WebhookQueueDiagnostics />
+                </n-gi>
+
+                <n-gi span="1 l:2">
+                  <StrmIngestDiagnostics />
                 </n-gi>
 
                 <!-- 卡片 2: 日志配置 (右上) -->
@@ -1016,6 +1025,11 @@
       </n-space>
     </template>
   </n-modal>
+  <DirectoryPickerModal
+    v-model:show="directoryPickerVisible"
+    :initial-path="directoryPickerInitialPath"
+    @select="handleDirectorySelected"
+  />
 </template>
 
 <script setup>
@@ -1040,7 +1054,36 @@ import {
 } from '@vicons/ionicons5';
 import { useConfig } from '../../composables/useConfig.js';
 import WebhookQueueDiagnostics from './WebhookQueueDiagnostics.vue';
+import DirectoryPickerModal from './DirectoryPickerModal.vue';
+import StrmIngestDiagnostics from './StrmIngestDiagnostics.vue';
 import axios from 'axios';
+
+const directoryPickerVisible = ref(false);
+const directoryPickerTarget = ref('monitor');
+const directoryPickerInitialPath = ref('/');
+
+const commonDirectoryParent = (paths) => {
+  const value = Array.isArray(paths) && paths.length ? paths[paths.length - 1] : '/';
+  const normalized = String(value || '/').replace(/\/+$/, '') || '/';
+  const index = normalized.lastIndexOf('/');
+  return index > 0 ? normalized.slice(0, index) : '/';
+};
+
+const openDirectoryPicker = (target) => {
+  directoryPickerTarget.value = target;
+  const paths = target === 'exclude'
+    ? configModel.value?.monitor_exclude_dirs
+    : configModel.value?.monitor_paths;
+  directoryPickerInitialPath.value = commonDirectoryParent(paths);
+  directoryPickerVisible.value = true;
+};
+
+const handleDirectorySelected = (path) => {
+  if (!configModel.value || !path) return;
+  const key = directoryPickerTarget.value === 'exclude' ? 'monitor_exclude_dirs' : 'monitor_paths';
+  const current = Array.isArray(configModel.value[key]) ? configModel.value[key] : [];
+  if (!current.includes(path)) configModel.value[key] = [...current, path];
+};
 
 const promptModalVisible = ref(false);
 const loadingPrompts = ref(false);
@@ -1718,5 +1761,12 @@ onUnmounted(() => {
   cursor: help;
   font-size: 16px;
   vertical-align: middle;
+}
+.path-picker-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  width: 100%;
+  align-items: start;
 }
 </style>

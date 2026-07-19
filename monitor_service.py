@@ -14,8 +14,11 @@ import constants
 import config_manager
 import handler.emby as emby
 import utils
+from database import strm_ingest_db
 from services.emby_ingest import (
-    reconcile_recent_paths,
+    collect_strm_inventory,
+    delete_and_verify_paths,
+    reconcile_paths,
     refresh_and_verify_paths,
     wait_for_paths_stable,
 )
@@ -74,12 +77,36 @@ class MediaFileHandler(FileSystemEventHandler):
         if not event.is_directory and self._is_valid_media_file(event.src_path):
             self._enqueue_file(event.src_path)
 
+    def on_modified(self, event):
+        if not event.is_directory and self._is_valid_media_file(event.src_path):
+            self._enqueue_file(event.src_path)
+
     def on_moved(self, event):
-        if not event.is_directory and self._is_valid_media_file(event.dest_path):
+        if event.is_directory:
+            try:
+                for old_path in strm_ingest_db.list_active_paths_under(event.src_path):
+                    self._enqueue_delete(old_path)
+                for dirpath, _, filenames in os.walk(event.dest_path):
+                    for filename in filenames:
+                        new_path = os.path.join(dirpath, filename)
+                        if self._is_valid_media_file(new_path):
+                            self._enqueue_file(new_path)
+            except Exception as exc:
+                logger.warning(f"  ⚠️ 无法立即展开目录移动事件，将由全目录查漏补偿: {exc}")
+            return
+
+        if self._is_valid_media_file(event.src_path):
+            self._enqueue_delete(event.src_path)
+        if self._is_valid_media_file(event.dest_path):
             self._enqueue_file(event.dest_path)
 
     def on_deleted(self, event):
         if event.is_directory:
+            try:
+                for file_path in strm_ingest_db.list_active_paths_under(event.src_path):
+                    self._enqueue_delete(file_path)
+            except Exception as exc:
+                logger.warning(f"  ⚠️ 无法立即展开目录删除事件，将由全目录查漏补偿: {exc}")
             return
         
         _, ext = os.path.splitext(event.src_path)
@@ -257,13 +284,20 @@ def _handle_batch_refresh_only_task(processor, file_paths: List[str]):
     )
     pending = result.get('pending') or []
     if pending:
+        queue_result = strm_ingest_db.enqueue_paths(
+            pending,
+            source='realtime',
+            last_error='Emby 在首次精确通知后仍未确认入库',
+        )
         logger.warning(
             f"  ⚠️ [实时监控] {len(pending)}/{result.get('requested', 0)} 个文件尚未被 Emby 收录，"
-            "自动查漏将在下一轮继续处理。"
+            f"已加入有限重试队列（新增 {queue_result.get('queued', 0)}）。"
         )
     else:
         logger.info(f"  ✅ [实时监控] 已确认 Emby 收录 {result.get('indexed', 0)} 个文件。")
-    processor.enqueue_confirmed_ingest_postprocessing(result.get('confirmed_paths') or [])
+    confirmed_paths = result.get('confirmed_paths') or []
+    strm_ingest_db.mark_completed(confirmed_paths)
+    processor.enqueue_confirmed_ingest_postprocessing(confirmed_paths)
 
 def _handle_batch_delete_refresh_only(processor, file_paths: List[str]):
     """
@@ -286,13 +320,23 @@ def _handle_batch_delete_refresh_only(processor, file_paths: List[str]):
         if not config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_MONITOR_ENABLED, False):
             logger.info("  🛑 [实时监控] 监控已关闭，取消挂起的删除通知。")
             return
-    if emby.notify_media_paths_updated(
-        file_paths,
-        base_url,
-        api_key,
-        update_type="Deleted",
-    ):
-        logger.info(f"  ✅ [实时监控-删除] 已通知 Emby {len(file_paths)} 个精确删除路径。")
+    result = delete_and_verify_paths(file_paths, base_url, api_key)
+    confirmed_paths = result.get('confirmed_paths') or []
+    pending_paths = result.get('pending') or []
+    strm_ingest_db.mark_deleted(confirmed_paths)
+    if confirmed_paths:
+        logger.info(f"  ✅ [实时监控-删除] 已确认 Emby 移除 {len(confirmed_paths)} 个精确路径。")
+    if pending_paths:
+        queue_result = strm_ingest_db.enqueue_paths(
+            pending_paths,
+            operation='delete',
+            source='realtime_delete',
+            last_error='Emby 在首次精确删除通知后仍保留该路径',
+        )
+        logger.warning(
+            f"  ⚠️ [实时监控-删除] {len(pending_paths)} 个路径尚未从 Emby 消失，"
+            f"已加入有限删除重试（新增 {queue_result.get('queued', 0)}）。"
+        )
 
 class MonitorService:
     processor_instance = None
@@ -307,21 +351,21 @@ class MonitorService:
         self.paths = self.config.get(constants.CONFIG_OPTION_MONITOR_PATHS, [])
         self.extensions = self.config.get(constants.CONFIG_OPTION_MONITOR_EXTENSIONS, constants.DEFAULT_MONITOR_EXTENSIONS)
         self.exclude_dirs = self.config.get(constants.CONFIG_OPTION_MONITOR_EXCLUDE_DIRS, constants.DEFAULT_MONITOR_EXCLUDE_DIRS)
-        self.reconcile_interval_minutes = max(
+        self.full_scan_interval_hours = max(
             0,
             int(self.config.get(
-                constants.CONFIG_OPTION_MONITOR_RECONCILE_INTERVAL_MINUTES,
-                constants.DEFAULT_MONITOR_RECONCILE_INTERVAL_MINUTES,
+                constants.CONFIG_OPTION_MONITOR_FULL_SCAN_INTERVAL_HOURS,
+                constants.DEFAULT_MONITOR_FULL_SCAN_INTERVAL_HOURS,
             ) or 0),
         )
         self._reconcile_stop = threading.Event()
         self._reconcile_thread = None
-        self._reconcile_retry_paths = set()
+        self._retry_thread = None
         lookback_days = max(0, int(self.config.get(
             constants.CONFIG_OPTION_MONITOR_SCAN_LOOKBACK_DAYS,
             constants.DEFAULT_MONITOR_SCAN_LOOKBACK_DAYS,
         ) or 0))
-        initial_lookback_seconds = min(max(lookback_days * 86400, 3600), 86400)
+        initial_lookback_seconds = min(max(lookback_days * 86400, 3600), 7 * 86400)
         self._reconcile_since = time.time() - initial_lookback_seconds
 
     def start(self):
@@ -350,15 +394,28 @@ class MonitorService:
         if started_paths:
             self.observer.start()
             logger.info(f"  👀 实时监控服务已启动，正在监听 {len(started_paths)} 个目录: {started_paths}")
-            if self.reconcile_interval_minutes > 0 and self.exclude_dirs:
+            if self.exclude_dirs:
+                recovered = strm_ingest_db.recover_processing()
+                if recovered:
+                    logger.info(f"  🔁 已恢复 {recovered} 个中断的 STRM 入库重试任务。")
+                strm_ingest_db.prune_completed(retention_days=30)
+                self._retry_thread = threading.Thread(
+                    target=self._run_retry_loop,
+                    name="strm-ingest-retry",
+                    daemon=True,
+                )
+                self._retry_thread.start()
+                logger.info("  🔁 STRM 有限重试队列已启动，失败路径将在约 10、30、60 分钟重试。")
+
+            if self.full_scan_interval_hours > 0 and self.exclude_dirs:
                 self._reconcile_thread = threading.Thread(
                     target=self._run_reconcile_loop,
-                    name="strm-ingest-reconcile",
+                    name="strm-ingest-full-scan",
                     daemon=True,
                 )
                 self._reconcile_thread.start()
                 logger.info(
-                    f"  🧭 STRM 自动查漏已启动，每 {self.reconcile_interval_minutes} 分钟检查排除路径。"
+                    f"  🧭 STRM 全目录查漏已启动，每 {self.full_scan_interval_hours} 小时检查一次。"
                 )
         else:
             logger.warning("  ➜ 没有有效的监控目录，实时监控服务未启动。")
@@ -369,28 +426,146 @@ class MonitorService:
         while not self._reconcile_stop.is_set():
             scan_started = time.time()
             try:
-                result = reconcile_recent_paths(
-                    self.exclude_dirs,
-                    self.extensions,
-                    self._reconcile_since,
-                    self.config.get(constants.CONFIG_OPTION_EMBY_SERVER_URL),
-                    self.config.get(constants.CONFIG_OPTION_EMBY_API_KEY),
-                    strm_only=True,
-                    retry_paths=self._reconcile_retry_paths,
-                )
-                self.processor.enqueue_confirmed_ingest_postprocessing(
-                    result.get('confirmed_paths') or []
-                )
-                self._reconcile_retry_paths = set(result.get('unresolved_paths') or [])
+                total_paths = 0
+                total_added = 0
+                total_changed = 0
+                total_removed = 0
+                total_queued = 0
+                total_seeded = 0
+                for root_path in self.exclude_dirs:
+                    inventory = collect_strm_inventory(root_path)
+                    total_paths += len(inventory)
+                    diff = strm_ingest_db.reconcile_inventory(root_path, inventory)
+                    total_seeded += int(diff.get('seeded') or 0)
+                    if diff.get('initialized'):
+                        candidate_paths = sorted(
+                            set(diff.get('added') or []) | set(diff.get('changed') or [])
+                        )
+                    else:
+                        candidate_paths = sorted(
+                            path for path, fingerprint in inventory.items()
+                            if fingerprint[1] >= self._reconcile_since
+                        )
+
+                    removed_paths = diff.get('removed') or []
+                    if removed_paths:
+                        _handle_batch_delete_refresh_only(self.processor, removed_paths)
+                    total_removed += len(removed_paths)
+                    total_added += len(diff.get('added') or [])
+                    total_changed += len(diff.get('changed') or [])
+
+                    result = reconcile_paths(
+                        candidate_paths,
+                        self.config.get(constants.CONFIG_OPTION_EMBY_SERVER_URL),
+                        self.config.get(constants.CONFIG_OPTION_EMBY_API_KEY),
+                    )
+                    confirmed_paths = result.get('confirmed_paths') or []
+                    strm_ingest_db.mark_completed(confirmed_paths)
+                    self.processor.enqueue_confirmed_ingest_postprocessing(confirmed_paths)
+                    queue_result = strm_ingest_db.enqueue_paths(
+                        result.get('unresolved_paths') or [],
+                        source='full_scan',
+                        last_error='全目录查漏发现 Emby 尚未收录该 STRM',
+                    )
+                    total_queued += int(queue_result.get('queued') or 0)
+
                 self._reconcile_since = scan_started - 60
                 logger.info(
-                    f"  🧭 STRM 自动查漏完成：检查 {result.get('scanned', 0)}，"
-                    f"刷新前缺失 {result.get('missing_before_refresh', 0)}，"
-                    f"留待重试 {len(self._reconcile_retry_paths)}。"
+                    f"  🧭 STRM 全目录查漏完成：库存 {total_paths}，基线 {total_seeded}，"
+                    f"新增 {total_added}，变化 {total_changed}，删除 {total_removed}，"
+                    f"新增有限重试 {total_queued}。"
                 )
             except Exception as exc:
                 logger.error(f"  ❌ STRM 自动查漏失败，将在下一轮重试: {exc}", exc_info=True)
-            if self._reconcile_stop.wait(self.reconcile_interval_minutes * 60):
+            if self._reconcile_stop.wait(self.full_scan_interval_hours * 3600):
+                return
+
+    def _run_retry_loop(self):
+        while not self._reconcile_stop.is_set():
+            events = []
+            try:
+                events = strm_ingest_db.claim_due_paths(limit=20)
+                if not events:
+                    if self._reconcile_stop.wait(60):
+                        return
+                    continue
+
+                ingest_events = [event for event in events if event.get('operation') != 'delete']
+                delete_events = [event for event in events if event.get('operation') == 'delete']
+                ingest_paths = [event['file_path'] for event in ingest_events]
+                existing_paths = [path for path in ingest_paths if os.path.isfile(path)]
+                missing_paths = sorted(set(ingest_paths) - set(existing_paths))
+                if missing_paths:
+                    strm_ingest_db.enqueue_paths(
+                        missing_paths,
+                        operation='delete',
+                        source='ingest_disappeared',
+                        last_error='等待入库期间 STRM 已被删除',
+                        initial_delay_seconds=0,
+                    )
+
+                if existing_paths:
+                    result = refresh_and_verify_paths(
+                        existing_paths,
+                        self.config.get(constants.CONFIG_OPTION_EMBY_SERVER_URL),
+                        self.config.get(constants.CONFIG_OPTION_EMBY_API_KEY),
+                    )
+                    confirmed_paths = result.get('confirmed_paths') or []
+                    unresolved_paths = sorted(
+                        set(result.get('pending') or [])
+                        | set(result.get('query_failed') or [])
+                    )
+                    strm_ingest_db.mark_completed(confirmed_paths)
+                    self.processor.enqueue_confirmed_ingest_postprocessing(confirmed_paths)
+                    retry_result = strm_ingest_db.mark_failed_attempts(
+                        unresolved_paths,
+                        'Emby 在有限重试后仍未确认入库',
+                    )
+                    if retry_result.get('failed'):
+                        logger.warning(
+                            f"  🚨 {retry_result['failed']} 个 STRM 达到重试上限，"
+                            "已停止自动刷新，请在 STRM 入库诊断中人工处理。"
+                        )
+
+                if delete_events:
+                    delete_paths = [event['file_path'] for event in delete_events]
+                    reappeared_paths = [path for path in delete_paths if os.path.isfile(path)]
+                    missing_delete_paths = sorted(set(delete_paths) - set(reappeared_paths))
+                    if reappeared_paths:
+                        strm_ingest_db.enqueue_paths(
+                            reappeared_paths,
+                            operation='ingest',
+                            source='delete_reappeared',
+                            last_error='等待删除期间 STRM 重新出现',
+                            initial_delay_seconds=0,
+                        )
+                    if missing_delete_paths:
+                        result = delete_and_verify_paths(
+                            missing_delete_paths,
+                            self.config.get(constants.CONFIG_OPTION_EMBY_SERVER_URL),
+                            self.config.get(constants.CONFIG_OPTION_EMBY_API_KEY),
+                        )
+                        confirmed_paths = result.get('confirmed_paths') or []
+                        unresolved_paths = result.get('pending') or []
+                        strm_ingest_db.mark_deleted(confirmed_paths)
+                        retry_result = strm_ingest_db.mark_failed_attempts(
+                            unresolved_paths,
+                            'Emby 在有限删除重试后仍保留该 STRM 路径',
+                        )
+                        if retry_result.get('failed'):
+                            logger.warning(
+                                f"  🚨 {retry_result['failed']} 个 STRM 删除达到重试上限，"
+                                "已停止自动刷新，请在 STRM 入库诊断中人工处理。"
+                            )
+            except Exception as exc:
+                if events:
+                    strm_ingest_db.mark_failed_attempts(
+                        [event['file_path'] for event in events],
+                        f"STRM 重试任务异常: {exc}",
+                    )
+                logger.error(f"  ❌ STRM 有限重试任务失败: {exc}", exc_info=True)
+
+            if self._reconcile_stop.wait(30):
                 return
 
     def stop(self):
@@ -402,3 +577,5 @@ class MonitorService:
             logger.info("  ➜ 实时监控服务已停止。")
         if self._reconcile_thread and self._reconcile_thread.is_alive():
             self._reconcile_thread.join(timeout=5)
+        if self._retry_thread and self._retry_thread.is_alive():
+            self._retry_thread.join(timeout=5)

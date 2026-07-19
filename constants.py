@@ -4,7 +4,7 @@ import os
 # ==============================================================================
 # ✨ 应用基础信息 (Application Basics)
 # ==============================================================================
-APP_VERSION = "7.1.9"  # 更新版本号
+APP_VERSION = "7.1.10"  # 更新版本号
 GITHUB_REPO_OWNER = "cosmotown"  # 您的 GitHub 用户名
 GITHUB_REPO_NAME = "emby-toolkit" # 您的 GitHub 仓库名
 DEFAULT_DOCKER_IMAGE_NAME = "tzyzero186/emby-toolkit:latest"
@@ -43,6 +43,8 @@ CONFIG_OPTION_MONITOR_SCAN_LOOKBACK_DAYS = "monitor_scan_lookback_days" # 定时
 DEFAULT_MONITOR_SCAN_LOOKBACK_DAYS = 1  # 默认回溯扫描天数
 CONFIG_OPTION_MONITOR_RECONCILE_INTERVAL_MINUTES = "monitor_reconcile_interval_minutes"
 DEFAULT_MONITOR_RECONCILE_INTERVAL_MINUTES = 15
+CONFIG_OPTION_MONITOR_FULL_SCAN_INTERVAL_HOURS = "monitor_full_scan_interval_hours"
+DEFAULT_MONITOR_FULL_SCAN_INTERVAL_HOURS = 24
 CONFIG_OPTION_MONITOR_EXCLUDE_DIRS = "monitor_exclude_dirs" 
 DEFAULT_MONITOR_EXCLUDE_DIRS = [] # 默认排除路径列表
 CONFIG_OPTION_MONITOR_EXCLUDE_REFRESH_DELAY = "monitor_exclude_refresh_delay"

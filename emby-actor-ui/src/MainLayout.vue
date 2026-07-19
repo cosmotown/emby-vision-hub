@@ -406,7 +406,7 @@ const handleUserSelect = async (key) => {
       onPositiveClick: triggerRestart, 
     });
   } else if (key === 'help-docs') {
-    window.open('https://hbq0405.github.io/emby-toolkit/zh/', '_blank');
+    window.open('https://github.com/cosmotown/emby-toolkit', '_blank');
   } else if (key === 'logout') {
     await authStore.logout();
     router.push({ name: 'Login' }); 

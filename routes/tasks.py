@@ -7,7 +7,7 @@ from flask import Blueprint, request, jsonify
 # 导入您项目中用于管理和执行任务的核心模块
 import task_manager 
 from extensions import admin_required, processor_ready_required, task_lock_required
-from database import webhook_event_db
+from database import strm_ingest_db, webhook_event_db
 # ★★★ 导入任务注册表，这是“翻译”的关键 ★★★
 from tasks.core import get_task_registry
 
@@ -133,3 +133,41 @@ def retry_webhook_event(event_id):
     except Exception as exc:
         logger.error(f"重试 Webhook 事件 {event_id} 失败: {exc}", exc_info=True)
         return jsonify({"error": "无法重试 Webhook 事件"}), 500
+
+
+@tasks_bp.route('/strm-ingest-events', methods=['GET'])
+@admin_required
+def get_strm_ingest_events():
+    try:
+        limit = request.args.get('limit', 100, type=int)
+        return jsonify({
+            'events': strm_ingest_db.list_recent(limit=limit),
+            'summary': strm_ingest_db.get_summary(),
+        }), 200
+    except Exception as exc:
+        logger.error(f"获取 STRM 入库诊断失败: {exc}", exc_info=True)
+        return jsonify({'error': '无法获取 STRM 入库诊断'}), 500
+
+
+@tasks_bp.route('/strm-ingest-events/<int:event_id>/retry', methods=['POST'])
+@admin_required
+def retry_strm_ingest_event(event_id):
+    try:
+        if not strm_ingest_db.retry_path(event_id):
+            return jsonify({'error': '记录不存在或当前状态不可重试'}), 409
+        return jsonify({'message': 'STRM 已重新加入入库队列', 'event_id': event_id}), 202
+    except Exception as exc:
+        logger.error(f"重试 STRM 入库记录 {event_id} 失败: {exc}", exc_info=True)
+        return jsonify({'error': '无法重试 STRM 入库记录'}), 500
+
+
+@tasks_bp.route('/strm-ingest-events/<int:event_id>/ignore', methods=['POST'])
+@admin_required
+def ignore_strm_ingest_event(event_id):
+    try:
+        if not strm_ingest_db.ignore_path(event_id):
+            return jsonify({'error': '记录不存在或当前状态不可忽略'}), 409
+        return jsonify({'message': 'STRM 入库异常已忽略', 'event_id': event_id}), 200
+    except Exception as exc:
+        logger.error(f"忽略 STRM 入库记录 {event_id} 失败: {exc}", exc_info=True)
+        return jsonify({'error': '无法忽略 STRM 入库记录'}), 500

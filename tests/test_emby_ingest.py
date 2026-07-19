@@ -54,7 +54,7 @@ class EmbyIngestTests(unittest.TestCase):
             self.assertIsInstance(inventory[first][1], float)
 
     @mock.patch("services.emby_ingest.emby.refresh_item_by_id")
-    @mock.patch("services.emby_ingest.emby.find_nearest_library_anchor")
+    @mock.patch("services.emby_ingest.emby.find_nearest_library_anchor_details")
     @mock.patch("services.emby_ingest.emby.get_all_libraries_with_paths")
     def test_library_root_is_never_refreshed_recursively(
         self,
@@ -63,7 +63,12 @@ class EmbyIngestTests(unittest.TestCase):
         refresh_item,
     ):
         get_libraries.return_value = [{"info": {"Id": "library-root"}, "paths": ["/media/tv"]}]
-        find_anchor.return_value = ("library-root", "TV")
+        find_anchor.return_value = {
+            "Id": "source-folder",
+            "Name": "TV",
+            "Type": "Folder",
+            "Path": "/media/tv",
+        }
 
         result = emby_ingest._refresh_parent_targets(
             ["/media/tv/New Show/Season 01/S01E01.strm"],
@@ -75,7 +80,7 @@ class EmbyIngestTests(unittest.TestCase):
         refresh_item.assert_not_called()
 
     @mock.patch("services.emby_ingest.emby.refresh_item_by_id", return_value=True)
-    @mock.patch("services.emby_ingest.emby.find_nearest_library_anchor")
+    @mock.patch("services.emby_ingest.emby.find_nearest_library_anchor_details")
     @mock.patch(
         "services.emby_ingest.emby.get_all_libraries_with_paths",
         return_value=[{"info": {"Id": "library-root"}, "paths": ["/media/tv"]}],
@@ -86,7 +91,12 @@ class EmbyIngestTests(unittest.TestCase):
         find_anchor,
         refresh_item,
     ):
-        find_anchor.return_value = ("series-1", "New Show")
+        find_anchor.return_value = {
+            "Id": "series-1",
+            "Name": "New Show",
+            "Type": "Series",
+            "Path": "/media/tv/New Show",
+        }
         paths = [
             "/media/tv/New Show/Season 01/S01E01.strm",
             "/media/tv/New Show/Season 01/S01E02.strm",
@@ -96,7 +106,7 @@ class EmbyIngestTests(unittest.TestCase):
         refresh_item.assert_called_once_with("series-1", "http://emby", "token")
 
     @mock.patch("services.emby_ingest.emby.refresh_item_by_id")
-    @mock.patch("services.emby_ingest.emby.find_nearest_library_anchor")
+    @mock.patch("services.emby_ingest.emby.find_nearest_library_anchor_details")
     @mock.patch("services.emby_ingest.emby.get_all_libraries_with_paths", return_value=[])
     def test_unknown_library_roots_disable_recursive_refresh(
         self,
@@ -104,7 +114,12 @@ class EmbyIngestTests(unittest.TestCase):
         find_anchor,
         refresh_item,
     ):
-        find_anchor.return_value = ("unknown-anchor", "Unknown")
+        find_anchor.return_value = {
+            "Id": "unknown-anchor",
+            "Name": "Unknown",
+            "Type": "Series",
+            "Path": "/media/tv/New Show",
+        }
 
         self.assertTrue(emby_ingest._refresh_parent_targets(
             ["/media/tv/New Show/Season 01/S01E01.strm"],
@@ -142,6 +157,7 @@ class EmbyIngestTests(unittest.TestCase):
         self.assertEqual([path], result["confirmed_paths"])
         self.assertEqual([], result["pending"])
         self.assertEqual(2, notify_paths.call_count)
+        _refresh_targets.assert_called_once_with([path], "http://emby", "token")
         self.assertEqual([mock.call(8), mock.call(12)], sleep.call_args_list)
 
     def test_realtime_queue_keeps_all_paths_for_emby(self):
@@ -167,18 +183,15 @@ class EmbyIngestTests(unittest.TestCase):
         self.assertEqual("episode-1", items[0]["Id"])
 
     @mock.patch("services.emby_ingest.verify_deleted_paths")
-    @mock.patch("services.emby_ingest.emby.refresh_item_by_id", return_value=True)
+    @mock.patch("services.emby_ingest.emby.get_catalog_item_by_path", return_value=None)
     @mock.patch("services.emby_ingest.emby.notify_media_paths_updated", return_value=True)
-    @mock.patch("services.emby_ingest.get_confirmed_media_items")
-    def test_deleted_path_refreshes_only_its_exact_emby_item(
+    def test_deleted_path_notifies_once_without_refreshing_stale_item(
         self,
-        get_items,
         notify_paths,
-        refresh_item,
+        _get_catalog_item,
         verify_paths,
     ):
         path = "/media/Movies/Example/Example.strm"
-        get_items.return_value = [{"Id": "movie-1", "Type": "Movie", "Path": path}]
         verify_paths.return_value = {
             "requested": 1,
             "confirmed_paths": [path],
@@ -189,9 +202,45 @@ class EmbyIngestTests(unittest.TestCase):
         result = emby_ingest.delete_and_verify_paths([path], "http://emby", "token")
 
         self.assertEqual([path], result["confirmed_paths"])
-        refresh_item.assert_called_once_with("movie-1", "http://emby", "token")
+        verify_paths.assert_called_once_with(
+            [path],
+            "http://emby",
+            "token",
+            verify_delays=(10,),
+        )
         self.assertEqual("Deleted", notify_paths.call_args_list[0].kwargs["update_type"])
         self.assertEqual("Modified", notify_paths.call_args_list[1].kwargs["update_type"])
+
+    @mock.patch("services.emby_ingest.verify_deleted_paths")
+    @mock.patch("services.emby_ingest.emby.refresh_item_by_id")
+    @mock.patch("services.emby_ingest.emby.get_catalog_item_by_path")
+    @mock.patch("services.emby_ingest.emby.notify_media_paths_updated", return_value=True)
+    def test_whole_series_delete_refreshes_series_only_once(
+        self,
+        notify_paths,
+        get_catalog_item,
+        refresh_item,
+        verify_paths,
+    ):
+        paths = [f"/media/tv/Show/Season 01/S01E{index:02d}.strm" for index in range(1, 40)]
+        get_catalog_item.return_value = {
+            "Id": "episode-1",
+            "Type": "Episode",
+            "SeriesId": "series-1",
+        }
+        verify_paths.return_value = {
+            "requested": len(paths),
+            "confirmed_paths": paths,
+            "pending": [],
+            "query_failed": [],
+        }
+
+        result = emby_ingest.delete_and_verify_paths(paths, "http://emby", "token")
+
+        self.assertEqual(39, result["requested"])
+        refresh_item.assert_called_once_with("series-1", "http://emby", "token")
+        self.assertEqual(2, notify_paths.call_count)
+        self.assertEqual(paths, notify_paths.call_args_list[0].args[0])
 
     @mock.patch("services.emby_ingest.refresh_and_verify_paths")
     @mock.patch("services.emby_ingest.wait_for_paths_stable")
@@ -391,6 +440,63 @@ class EmbyHttpValidationTests(unittest.TestCase):
             self.assertEqual("token", call.kwargs["headers"]["X-Emby-Token"])
 
     @mock.patch("handler.emby.emby_client.get")
+    def test_safe_anchor_stops_before_physical_library_source_path(self, get):
+        response = mock.Mock()
+        response.status_code = 200
+        response.json.return_value = {"Items": []}
+        get.return_value = response
+
+        item = emby.find_nearest_library_anchor_details(
+            "/media/tv/New Show/Season 01",
+            "http://emby",
+            "token",
+            allowed_types=("Series", "Season"),
+            blocked_paths=("/media/tv",),
+        )
+
+        self.assertIsNone(item)
+        self.assertEqual(2, get.call_count)
+        queried_paths = [call.kwargs["params"]["Path"] for call in get.call_args_list]
+        self.assertEqual(
+            ["/media/tv/New Show/Season 01", "/media/tv/New Show"],
+            queried_paths,
+        )
+
+    @mock.patch("handler.emby.emby_client.get")
+    def test_safe_anchor_accepts_series_but_rejects_generic_folder(self, get):
+        folder_response = mock.Mock()
+        folder_response.status_code = 200
+        folder_response.json.return_value = {
+            "Items": [{
+                "Id": "folder-1",
+                "Name": "Season Folder",
+                "Type": "Folder",
+                "Path": "/media/tv/New Show/Season 01",
+            }]
+        }
+        series_response = mock.Mock()
+        series_response.status_code = 200
+        series_response.json.return_value = {
+            "Items": [{
+                "Id": "series-1",
+                "Name": "New Show",
+                "Type": "Series",
+                "Path": "/media/tv/New Show",
+            }]
+        }
+        get.side_effect = [folder_response, series_response]
+
+        item = emby.find_nearest_library_anchor_details(
+            "/media/tv/New Show/Season 01",
+            "http://emby",
+            "token",
+            allowed_types=("Series", "Season"),
+            blocked_paths=("/media/tv",),
+        )
+
+        self.assertEqual("series-1", item["Id"])
+
+    @mock.patch("handler.emby.emby_client.get")
     def test_exact_path_lookup_returns_matching_emby_item(self, get):
         response = mock.Mock()
         response.raise_for_status.return_value = None
@@ -416,6 +522,29 @@ class EmbyHttpValidationTests(unittest.TestCase):
         self.assertNotIn("api_key", get.call_args.kwargs["params"])
         self.assertEqual("true", get.call_args.kwargs["params"]["Recursive"])
         self.assertEqual("token", get.call_args.kwargs["headers"]["X-Emby-Token"])
+
+    @mock.patch("handler.emby.emby_client.get")
+    def test_catalog_lookup_does_not_request_media_sources(self, get):
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "Items": [{
+                "Id": "episode-1",
+                "Type": "Episode",
+                "SeriesId": "series-1",
+                "Path": "/media/show/S01E01.strm",
+            }]
+        }
+        get.return_value = response
+
+        item = emby.get_catalog_item_by_path(
+            "/media/show/S01E01.strm",
+            "http://emby",
+            "token",
+        )
+
+        self.assertEqual("episode-1", item["Id"])
+        self.assertNotIn("MediaSources", get.call_args.kwargs["params"]["Fields"])
 
 
 if __name__ == "__main__":

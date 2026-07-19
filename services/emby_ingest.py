@@ -164,7 +164,7 @@ def verify_deleted_paths(
         states: Dict[str, Optional[bool]] = {}
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {
-                executor.submit(emby.is_media_path_indexed, path, base_url, api_key): path
+                executor.submit(emby.is_catalog_path_indexed, path, base_url, api_key): path
                 for path in remaining
             }
             for future in as_completed(futures):
@@ -190,9 +190,9 @@ def delete_and_verify_paths(
     file_paths: Iterable[str],
     base_url: str,
     api_key: str,
-    verify_delays: Sequence[int] = (3, 8, 15),
+    verify_delays: Sequence[int] = (10,),
 ) -> Dict[str, object]:
-    """Notify exact deletions, refresh only known season/series anchors, then verify."""
+    """Notify exact deletions and refresh each affected TV series at most once."""
     paths = normalize_paths(file_paths, require_existing=False)
     result: Dict[str, object] = {
         'requested': len(paths),
@@ -205,20 +205,27 @@ def delete_and_verify_paths(
         result['refresh_ok'] = False
         return result
 
-    known_items = get_confirmed_media_items(
-        paths,
-        base_url,
-        api_key,
-        require_existing=False,
-    )
-    # Refresh only the exact catalog objects that referenced the removed paths.
-    # This works for root-level movies and multi-version items without scanning a
-    # whole library; duplicate item IDs are deliberately collapsed.
-    safe_anchor_ids = {
-        str(item.get('Id'))
-        for item in known_items
-        if item.get('Id')
-    }
+    # Read only catalog fields before notifying Emby. Requesting MediaSources
+    # here makes Emby reopen every STRM which has already disappeared.
+    series_ids: Set[str] = set()
+    worker_count = max(1, min(len(paths), 4))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(emby.get_catalog_item_by_path, path, base_url, api_key): path
+            for path in paths
+        }
+        for future in as_completed(futures):
+            try:
+                item = future.result() or {}
+            except Exception:
+                item = {}
+            series_id = str(item.get('SeriesId') or '').strip()
+            if series_id:
+                series_ids.add(series_id)
+
+    # The exact Deleted notification is authoritative. A single recursive
+    # refresh per deduplicated Series lets Emby discard missing children while
+    # avoiding the old one-refresh-per-episode storm and any library-root scan.
     refresh_ok = emby.notify_media_paths_updated(paths, base_url, api_key, update_type='Deleted')
     refresh_ok = emby.notify_media_paths_updated(
         {os.path.dirname(path) for path in paths},
@@ -226,9 +233,8 @@ def delete_and_verify_paths(
         api_key,
         update_type='Modified',
     ) and refresh_ok
-    for anchor_id in sorted(safe_anchor_ids):
-        refresh_ok = emby.refresh_item_by_id(anchor_id, base_url, api_key) and refresh_ok
-
+    for series_id in sorted(series_ids):
+        refresh_ok = emby.refresh_item_by_id(series_id, base_url, api_key) and refresh_ok
     result.update(verify_deleted_paths(paths, base_url, api_key, verify_delays=verify_delays))
     result['refresh_ok'] = refresh_ok
     return result
@@ -246,6 +252,12 @@ def _refresh_parent_targets(
         for library in libraries
         if (library.get('info') or {}).get('Id')
     }
+    library_root_paths = {
+        os.path.normcase(os.path.normpath(str(path)))
+        for library in libraries
+        for path in (library.get('paths') or [])
+        if str(path or '').strip()
+    }
     if not library_root_ids:
         logger.warning(
             "  ⚠️ 无法确认 Emby 媒体库根 ID，本轮只发送精确路径通知，"
@@ -254,8 +266,27 @@ def _refresh_parent_targets(
         return True
     anchors: Dict[str, str] = {}
     for parent_dir in parent_dirs:
-        anchor_id, anchor_name = emby.find_nearest_library_anchor(parent_dir, base_url, api_key)
-        if anchor_id and str(anchor_id) not in library_root_ids:
+        anchor = emby.find_nearest_library_anchor_details(
+            parent_dir,
+            base_url,
+            api_key,
+            allowed_types=('Series', 'Season'),
+            blocked_paths=library_root_paths,
+        )
+        anchor_id = str((anchor or {}).get('Id') or '')
+        anchor_name = str((anchor or {}).get('Name') or '')
+        anchor_type = str((anchor or {}).get('Type') or '').lower()
+        anchor_path = str((anchor or {}).get('Path') or '')
+        normalized_anchor_path = (
+            os.path.normcase(os.path.normpath(anchor_path))
+            if anchor_path else ''
+        )
+        if (
+            anchor_id
+            and anchor_id not in library_root_ids
+            and anchor_type in {'series', 'season'}
+            and normalized_anchor_path not in library_root_paths
+        ):
             anchors[str(anchor_id)] = anchor_name or str(anchor_id)
         else:
             logger.info(
@@ -329,7 +360,6 @@ def refresh_and_verify_paths(
                     base_url,
                     api_key,
                 ) and refresh_ok
-                refresh_ok = _refresh_parent_targets(retry_paths, base_url, api_key) and refresh_ok
 
         result.update({
             'indexed': len(paths) - len(pending),

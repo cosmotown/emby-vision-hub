@@ -2,6 +2,24 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.11",
+        "published_at": "2026-07-20T02:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.11",
+        "changelog": """## STRM 整库刷新保护热修复
+
+### 修复
+- 同时识别 Emby 虚拟媒体库 ID 和实际源目录路径；即使两者 ID 不同，也绝不把 `/STRM/电视剧` 等媒体库源目录作为递归刷新锚点。
+- 入库锚点严格限制为已确认的 `Series` 或 `Season`；新剧尚未建档时只发送精确路径通知，不回退整库刷新。
+- 同一批 STRM 在确认重试阶段不再重复递归刷新锚点，避免 Emby 异步刷新任务持续堆积。
+- 整部电视剧目录删除改为一次批量 `Deleted` 通知、同一部剧仅刷新一次 `Series` 和单轮轻量核对；不再逐集刷新或读取已经消失的 STRM 媒体源。
+- 删除后仍未移除的路径继续进入 10、30、60 分钟有限重试，但每轮只做精确通知与核对，不触发媒体库根刷新。
+
+### 安全边界
+- 不修改 Emby 数据库、媒体文件、MoviePilot、115 网盘或插件数据。
+- 不改变现有 PostgreSQL 表结构；升级和回退均无需修改 Compose。
+""",
+    },
+    {
         "version": "v7.1.10",
         "published_at": "2026-07-19T10:30:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.10",

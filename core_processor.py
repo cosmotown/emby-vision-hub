@@ -943,9 +943,24 @@ class MediaProcessor:
         
         unique_anchor_map = {}
         fallback_paths = []
+        libraries = emby.get_all_libraries_with_paths(self.emby_url, self.emby_api_key)
+        library_source_paths = {
+            os.path.normcase(os.path.normpath(str(path)))
+            for library in libraries
+            for path in (library.get('paths') or [])
+            if str(path or '').strip()
+        }
 
         for folder_path in folders_to_check:
-            anchor_id, anchor_name = emby.find_nearest_library_anchor(folder_path, self.emby_url, self.emby_api_key)
+            anchor = emby.find_nearest_library_anchor_details(
+                folder_path,
+                self.emby_url,
+                self.emby_api_key,
+                allowed_types=('Series', 'Season'),
+                blocked_paths=library_source_paths,
+            )
+            anchor_id = (anchor or {}).get('Id')
+            anchor_name = (anchor or {}).get('Name')
             if anchor_id:
                 unique_anchor_map[anchor_id] = anchor_name
             else:

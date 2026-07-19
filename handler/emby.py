@@ -863,29 +863,49 @@ def refresh_emby_item_metadata(item_emby_id: str,
         logger.error(f"  - 刷新请求时发生网络错误: {e}")
         return False
 
-# --- 仅查找路径对应的最近 Emby 锚点 ID，不刷新 ---
-def find_nearest_library_anchor(file_path: str, base_url: str, api_key: str) -> tuple[Optional[str], Optional[str]]:
-    """
-    向上递归查找路径中“最近的一个已存在于 Emby 数据库的文件夹”。
-    返回: (Item Id, Item Name) 或 (None, None)
-    """
+# --- 仅查找路径对应的最近 Emby 锚点，不刷新 ---
+def find_nearest_library_anchor_details(
+    file_path: str,
+    base_url: str,
+    api_key: str,
+    allowed_types: Optional[Iterable[str]] = None,
+    blocked_paths: Optional[Iterable[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return the nearest indexed ancestor while enforcing refresh boundaries."""
     if not all([file_path, base_url, api_key]):
-        return None, None
-    
-    norm_path = os.path.normpath(file_path)
-    current_path = norm_path
-    
-    # 尝试最多向上找 10 层
+        return None
+
+    allowed = {
+        str(item_type).strip().lower()
+        for item_type in (allowed_types or [])
+        if str(item_type or '').strip()
+    }
+    blocked = {
+        os.path.normcase(os.path.normpath(str(path)))
+        for path in (blocked_paths or [])
+        if str(path or '').strip()
+    }
+    current_path = os.path.normpath(file_path)
+
+    # Try at most ten ancestors. A configured library source path is a hard
+    # boundary: it must never be returned as a recursive refresh target even
+    # when its Emby item ID differs from the VirtualFolder ItemId.
     for _ in range(10):
-        # 使用 /Items 接口按 Path 精确查询
+        normalized_current = os.path.normcase(os.path.normpath(current_path))
+        if normalized_current in blocked:
+            break
+
         query_url = f"{base_url.rstrip('/')}/Items"
         params = {
             "Path": current_path,
             "Limit": 1,
-            "Recursive": "false",
-            "Fields": "Id,Name"
+            # Emby 4.9.5.0 only applies Path filtering to Series/Season
+            # descendants when recursive lookup is enabled. Exact equality is
+            # enforced below before an item can become a refresh anchor.
+            "Recursive": "true",
+            "Fields": "Id,Name,Type,Path,ParentId,SeriesId",
         }
-        
+
         try:
             response = emby_client.get(
                 query_url,
@@ -894,18 +914,43 @@ def find_nearest_library_anchor(file_path: str, base_url: str, api_key: str) -> 
             )
             if response.status_code == 200:
                 data = response.json()
-                if data.get("Items"):
-                    item = data["Items"][0]
-                    return item["Id"], item["Name"]
+                for item in data.get("Items") or []:
+                    item_path = str(item.get("Path") or '').strip()
+                    normalized_item_path = (
+                        os.path.normcase(os.path.normpath(item_path))
+                        if item_path else normalized_current
+                    )
+                    if normalized_item_path in blocked:
+                        return None
+                    # Guard against an unexpected descendant returned by the
+                    # Path filter. Only the exact ancestor being inspected is
+                    # eligible to become an anchor.
+                    if item_path and normalized_item_path != normalized_current:
+                        continue
+                    item_type = str(item.get("Type") or '').strip().lower()
+                    if allowed and item_type not in allowed:
+                        continue
+                    return item
         except Exception:
-            pass 
-            
+            pass
+
         parent = os.path.dirname(current_path)
-        if parent == current_path: # 到达根目录
+        if parent == current_path:
             break
         current_path = parent
-        
-    return None, None
+
+    return None
+
+
+def find_nearest_library_anchor(file_path: str, base_url: str, api_key: str) -> tuple[Optional[str], Optional[str]]:
+    """
+    向上递归查找路径中“最近的一个已存在于 Emby 数据库的文件夹”。
+    返回: (Item Id, Item Name) 或 (None, None)
+    """
+    item = find_nearest_library_anchor_details(file_path, base_url, api_key)
+    if not item:
+        return None, None
+    return item.get("Id"), item.get("Name")
 
 # --- 仅根据 ID 强制刷新 ---
 def refresh_item_by_id(item_id: str, base_url: str, api_key: str) -> bool:
@@ -978,6 +1023,7 @@ def _query_media_item_by_path(
     file_path: str,
     base_url: str,
     api_key: str,
+    include_media_sources: bool = True,
 ) -> tuple[Optional[bool], Optional[Dict[str, Any]]]:
     """Return exact path match state and item data without exposing the API key."""
     normalized_target = os.path.normcase(os.path.normpath(str(file_path or '')))
@@ -985,13 +1031,16 @@ def _query_media_item_by_path(
         return False, None
 
     api_url = f"{base_url.rstrip('/')}/Items"
+    fields = "Id,Name,Type,SeriesId,SeriesName,Path"
+    if include_media_sources:
+        fields += ",MediaSources"
     params = {
         "Path": str(file_path),
         # Emby 4.9.5.0 only applies the Path filter to media descendants when
         # recursive lookup is enabled. Exact equality is still enforced below.
         "Recursive": "true",
         "Limit": 10,
-        "Fields": "Id,Name,Type,SeriesId,SeriesName,Path,MediaSources",
+        "Fields": fields,
     }
     try:
         response = emby_client.get(
@@ -1005,11 +1054,12 @@ def _query_media_item_by_path(
             return None, None
         for item in payload.get("Items") or []:
             candidate_paths = [item.get("Path")]
-            candidate_paths.extend(
-                source.get("Path")
-                for source in item.get("MediaSources") or []
-                if isinstance(source, dict)
-            )
+            if include_media_sources:
+                candidate_paths.extend(
+                    source.get("Path")
+                    for source in item.get("MediaSources") or []
+                    if isinstance(source, dict)
+                )
             for candidate in candidate_paths:
                 if not candidate:
                     continue
@@ -1041,14 +1091,59 @@ def get_media_item_by_path(
     matched, item = _query_media_item_by_path(file_path, base_url, api_key)
     return item if matched is True else None
 
+
+def is_catalog_path_indexed(
+    file_path: str,
+    base_url: str,
+    api_key: str,
+) -> Optional[bool]:
+    """Check only Emby's catalog path, without reopening a deleted media source."""
+    matched, _ = _query_media_item_by_path(
+        file_path,
+        base_url,
+        api_key,
+        include_media_sources=False,
+    )
+    return matched
+
+
+def get_catalog_item_by_path(
+    file_path: str,
+    base_url: str,
+    api_key: str,
+) -> Optional[Dict[str, Any]]:
+    """Return an exact catalog item without asking Emby to inspect MediaSources."""
+    matched, item = _query_media_item_by_path(
+        file_path,
+        base_url,
+        api_key,
+        include_media_sources=False,
+    )
+    return item if matched is True else None
+
 # --- 最近锚点强制刷新版 ---
 def refresh_library_by_path(file_path: str, base_url: str, api_key: str) -> bool:
     """
     最近锚点强制刷新版
     """
-    # 1. 查找锚点
+    # 1. 只查找安全的 Series/Season 锚点，媒体库源目录是硬边界。
     logger.info(f"  🔍 [智能刷新] 正在为路径寻找最近的 Emby 锚点: {file_path}")
-    found_id, found_name = find_nearest_library_anchor(file_path, base_url, api_key)
+    libraries = get_all_libraries_with_paths(base_url, api_key)
+    library_source_paths = {
+        os.path.normcase(os.path.normpath(str(path)))
+        for library in libraries
+        for path in (library.get("paths") or [])
+        if str(path or '').strip()
+    }
+    anchor = find_nearest_library_anchor_details(
+        file_path,
+        base_url,
+        api_key,
+        allowed_types=("Series", "Season"),
+        blocked_paths=library_source_paths,
+    )
+    found_id = (anchor or {}).get("Id")
+    found_name = (anchor or {}).get("Name")
 
     # 2. 执行刷新
     if found_id:
@@ -1056,7 +1151,7 @@ def refresh_library_by_path(file_path: str, base_url: str, api_key: str) -> bool
         return refresh_item_by_id(found_id, base_url, api_key)
     else:
         # 回退逻辑
-        logger.warning(f"  ⚠️ 未找到任何在库的父级目录，回退到系统通知接口...")
+        logger.warning(f"  ⚠️ 未找到安全的剧集/季锚点，仅发送精确路径通知...")
         api_url = f"{base_url.rstrip('/')}/Library/Media/Updated"
         payload = {"Updates": [{"Path": file_path, "UpdateType": "Modified"}]}
         try:

@@ -953,13 +953,18 @@ def find_nearest_library_anchor(file_path: str, base_url: str, api_key: str) -> 
     return item.get("Id"), item.get("Name")
 
 # --- 仅根据 ID 强制刷新 ---
-def refresh_item_by_id(item_id: str, base_url: str, api_key: str) -> bool:
+def refresh_item_by_id(
+    item_id: str,
+    base_url: str,
+    api_key: str,
+    recursive: bool = True,
+) -> bool:
     """
     对指定 ID 执行强制递归刷新
     """
     refresh_url = f"{base_url.rstrip('/')}/Items/{item_id}/Refresh"
     refresh_params = {
-        "Recursive": "true", 
+        "Recursive": "true" if recursive else "false",
         "ImageRefreshMode": "Default",
         "MetadataRefreshMode": "Default",
         "ReplaceAllMetadata": "false",
@@ -1120,6 +1125,34 @@ def get_catalog_item_by_path(
         include_media_sources=False,
     )
     return item if matched is True else None
+
+
+def get_catalog_item_by_id(
+    item_id: str,
+    base_url: str,
+    api_key: str,
+) -> Optional[Dict[str, Any]]:
+    """Return lightweight catalog fields for one exact Emby item ID."""
+    normalized_id = str(item_id or '').strip()
+    if not normalized_id or not base_url or not api_key:
+        return None
+    try:
+        response = emby_client.get(
+            f"{base_url.rstrip('/')}/Items",
+            params={
+                "Ids": normalized_id,
+                "Limit": 1,
+                "Fields": "Id,Name,Type,Path,ParentId,SeriesId",
+            },
+            headers={"X-Emby-Token": api_key},
+        )
+        response.raise_for_status()
+        for item in (response.json() or {}).get("Items") or []:
+            if str(item.get("Id") or '').strip() == normalized_id:
+                return item
+    except Exception:
+        return None
+    return None
 
 # --- 最近锚点强制刷新版 ---
 def refresh_library_by_path(file_path: str, base_url: str, api_key: str) -> bool:

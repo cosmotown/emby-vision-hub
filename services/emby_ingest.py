@@ -41,6 +41,47 @@ def _notification_paths(file_paths: Iterable[str]) -> List[str]:
     return sorted(paths)
 
 
+def _deletion_notification_paths(
+    file_paths: Iterable[str],
+    base_url: str,
+    api_key: str,
+    libraries: Optional[Sequence[Dict[str, object]]] = None,
+) -> Tuple[List[str], List[str]]:
+    """Split vanished paths from the nearest surviving parent directories."""
+    paths = normalize_paths(file_paths, require_existing=False)
+    libraries = list(libraries) if libraries is not None else emby.get_all_libraries_with_paths(
+        base_url,
+        api_key,
+    )
+    library_roots = {
+        os.path.normcase(os.path.normpath(str(path)))
+        for library in libraries
+        for path in (library.get('paths') or [])
+        if str(path or '').strip()
+    }
+    if not library_roots:
+        return paths, sorted({os.path.dirname(path) for path in paths})
+
+    deleted = set(paths)
+    modified: Set[str] = set()
+    for path in paths:
+        current = os.path.dirname(path)
+        for _ in range(12):
+            normalized = os.path.normcase(os.path.normpath(current))
+            if normalized in library_roots:
+                modified.add(current)
+                break
+            if os.path.isdir(current):
+                modified.add(current)
+                break
+            deleted.add(current)
+            parent = os.path.dirname(current)
+            if not parent or parent == current:
+                break
+            current = parent
+    return sorted(deleted), sorted(modified)
+
+
 def wait_for_paths_stable(
     file_paths: Iterable[str],
     timeout_seconds: int = 60,
@@ -223,18 +264,83 @@ def delete_and_verify_paths(
             if series_id:
                 series_ids.add(series_id)
 
+    series_items: Dict[str, Dict[str, object]] = {
+        series_id: emby.get_catalog_item_by_id(series_id, base_url, api_key) or {}
+        for series_id in series_ids
+    }
+    libraries = emby.get_all_libraries_with_paths(base_url, api_key)
+
     # The exact Deleted notification is authoritative. A single recursive
     # refresh per deduplicated Series lets Emby discard missing children while
     # avoiding the old one-refresh-per-episode storm and any library-root scan.
-    refresh_ok = emby.notify_media_paths_updated(paths, base_url, api_key, update_type='Deleted')
-    refresh_ok = emby.notify_media_paths_updated(
-        {os.path.dirname(path) for path in paths},
+    # Never refresh a Series whose own directory has disappeared: Emby 4.9
+    # raises DirectoryNotFoundException while validating that stale item and
+    # may leave the scan progress stuck until the server is restarted.
+    deleted_notification_paths, modified_notification_paths = _deletion_notification_paths(
+        paths,
         base_url,
         api_key,
-        update_type='Modified',
-    ) and refresh_ok
+        libraries=libraries,
+    )
+    refresh_ok = emby.notify_media_paths_updated(
+        deleted_notification_paths,
+        base_url,
+        api_key,
+        update_type='Deleted',
+    )
+    if modified_notification_paths:
+        refresh_ok = emby.notify_media_paths_updated(
+            modified_notification_paths,
+            base_url,
+            api_key,
+            update_type='Modified',
+        ) and refresh_ok
+    missing_series_paths: Set[str] = set()
     for series_id in sorted(series_ids):
+        series_item = series_items.get(series_id) or {}
+        series_path = str(series_item.get('Path') or '').strip()
+        if not series_path or not os.path.isdir(series_path):
+            if series_path:
+                missing_series_paths.add(series_path)
+            logger.info(
+                f"  ➜ 剧集目录已删除，跳过失效剧集递归刷新: "
+                f"'{series_path or series_id}'。精确 Deleted 通知将负责清理目录项。"
+            )
+            continue
         refresh_ok = emby.refresh_item_by_id(series_id, base_url, api_key) and refresh_ok
+
+    # A vanished Series cannot refresh itself. Refresh only the direct children
+    # of its physical library root so Emby drops that stale Series row without
+    # recursively rescanning every remaining show in the library.
+    shallow_library_ids: Set[str] = set()
+    for library in libraries:
+        library_id = str((library.get('info') or {}).get('Id') or '').strip()
+        if not library_id:
+            continue
+        for root_path in library.get('paths') or []:
+            normalized_root = os.path.normcase(os.path.normpath(str(root_path)))
+            for series_path in missing_series_paths:
+                normalized_series = os.path.normcase(os.path.normpath(series_path))
+                try:
+                    is_within_root = os.path.commonpath(
+                        [normalized_series, normalized_root]
+                    ) == normalized_root
+                except ValueError:
+                    is_within_root = False
+                if is_within_root:
+                    shallow_library_ids.add(library_id)
+                    break
+    for library_id in sorted(shallow_library_ids):
+        logger.info(
+            f"  ➜ 剧集目录整体消失，浅层刷新物理媒体库 ({library_id})，"
+            "仅校验直属剧集，不递归扫描库内容。"
+        )
+        refresh_ok = emby.refresh_item_by_id(
+            library_id,
+            base_url,
+            api_key,
+            recursive=False,
+        ) and refresh_ok
     result.update(verify_deleted_paths(paths, base_url, api_key, verify_delays=verify_delays))
     result['refresh_ok'] = refresh_ok
     return result

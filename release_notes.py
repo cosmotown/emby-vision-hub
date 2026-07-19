@@ -2,6 +2,28 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.12",
+        "published_at": "2026-07-20T02:40:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.12",
+        "changelog": """## STRM 整部剧删除解卡热修复
+
+### 修复
+- 修复整部电视剧目录已被 115 或其他外部程序删除后，Toolkit 仍递归刷新数据库残留 `Series`，导致 Emby 4.9.5.0 抛出 `DirectoryNotFoundException`、扫库进度长时间不结束的问题。
+- 删除通知现在同时标记已经消失的季目录和剧集目录；仍存在的最近父目录只标记为 `Modified`，避免把失效目录当作刷新入口。
+- 整部剧目录消失时不再刷新失效 `Series`，改为对所属媒体库执行一次 `Recursive=false` 的浅层刷新，只核对直属剧集并移除残留目录项，不递归扫描库内其他剧集。
+- 仅删除一季且剧集目录仍存在时，继续对该 `Series` 做一次去重后的安全刷新，保持季删除及时生效。
+- 新增按 ID 的轻量目录查询，不读取 `MediaSources`，删除期间不会重新打开已经消失的 STRM。
+
+### 验证
+- Emby 4.9.5.0 + StrmAssistant PRO 3.0.0.49 环境下，39 集新增全部入库，PRO 追更与媒体信息持久化正常运行。
+- 在 PRO 媒体提取和 Emby 重启重叠期间删除整部剧，39/39 路径均在约 4 秒内确认移除；未递归刷新媒体库根、未出现 `FetchShortcutPath` 风暴或失效剧集目录异常。
+
+### 安全边界
+- Toolkit 仍只观察本地 STRM 变化并通知 Emby；不会删除 115 网盘文件、调用 MoviePilot 删除接口或直接修改 Emby 数据库。
+- 浅层媒体库刷新固定使用 `Recursive=false`，不会触发整库递归扫描。
+""",
+    },
+    {
         "version": "v7.1.11",
         "published_at": "2026-07-20T02:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.11",

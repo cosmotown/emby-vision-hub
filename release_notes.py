@@ -2,6 +2,20 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.14",
+        "published_at": "2026-07-20T22:45:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.14",
+        "changelog": """## 前后端版本标识同步修复
+
+### 修复
+- 将前端构建版本与后端 `APP_VERSION` 统一为 `7.1.14`，修复已升级到 STRM 连续入库热修复后，侧边栏仍显示 `7.1.12` 的问题。
+- 完整保留 `v7.1.13` 的 STRM 并发解阻、锚点去重和媒体库根目录保护。
+
+### 安全边界
+- 本版仅同步版本元数据，不包含正在开发中的其他 UI 改动。
+""",
+    },
+    {
         "version": "v7.1.13",
         "published_at": "2026-07-20T22:35:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.13",

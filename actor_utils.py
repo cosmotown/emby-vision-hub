@@ -230,14 +230,16 @@ def format_douban_cast(douban_api_actors_raw: List[Dict[str, Any]]) -> List[Dict
         douban_id = str(item.get("id", "")).strip() or None
 
         # 【严格的去重逻辑】
-        if douban_id and douban_id in seen_douban_ids:
-            continue
-        if name_zh in seen_names:
+        if douban_id:
+            if douban_id in seen_douban_ids:
+                continue
+        elif name_zh in seen_names:
             continue
 
         if douban_id:
             seen_douban_ids.add(douban_id)
-        seen_names.add(name_zh)
+        if not douban_id:
+            seen_names.add(name_zh)
         
         # ▼▼▼ 核心新增：从缓存中安全地提取头像链接 ▼▼▼
         avatar_obj = item.get("avatar") or {}
@@ -256,6 +258,15 @@ def format_douban_cast(douban_api_actors_raw: List[Dict[str, Any]]) -> List[Dict
             "OriginalName": str(item.get("latin_name", "")).strip(), 
             "Role": str(item.get("character", "")).strip(),
             "DoubanCelebrityId": douban_id,
+            "TmdbPersonId": (
+                item.get("tmdb_person_id")
+                or item.get("tmdb_id")
+                or (item.get("ProviderIds") or {}).get("Tmdb")
+            ),
+            "ImdbId": (
+                item.get("imdb_id")
+                or (item.get("ProviderIds") or {}).get("Imdb")
+            ),
             "ProviderIds": {"Douban": douban_id} if douban_id else {},
             # 新增字段，将头像链接传递下去
             "DoubanAvatarUrl": avatar_url 

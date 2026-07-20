@@ -116,18 +116,27 @@ def apply_safe_actor_name_translations(
 
 
 def deduplicate_cast_by_identity(cast_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Keep one cast row per TMDb identity and per existing Emby person record."""
+    """Keep one cast row per TMDb, Emby, and confirmed Douban identity."""
     deduplicated = []
     seen_tmdb_ids = set()
     seen_emby_ids = set()
+    seen_douban_ids = set()
     for actor in cast_list:
         tmdb_id = str(actor.get('id') or '').strip()
         emby_id = str(actor.get('emby_person_id') or '').strip()
-        if not tmdb_id or tmdb_id in seen_tmdb_ids or (emby_id and emby_id in seen_emby_ids):
+        douban_id = str(actor.get('douban_id') or '').strip()
+        if (
+            not tmdb_id
+            or tmdb_id in seen_tmdb_ids
+            or (emby_id and emby_id in seen_emby_ids)
+            or (douban_id and douban_id in seen_douban_ids)
+        ):
             continue
         seen_tmdb_ids.add(tmdb_id)
         if emby_id:
             seen_emby_ids.add(emby_id)
+        if douban_id:
+            seen_douban_ids.add(douban_id)
         deduplicated.append(actor)
     return deduplicated
 

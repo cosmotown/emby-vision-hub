@@ -2,6 +2,23 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.17",
+        "published_at": "2026-07-21T00:45:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.17",
+        "changelog": """## 豆瓣演员身份确认与同名去重修复
+
+### 修复
+- 豆瓣中文名和原名不再单独作为演员身份依据；只有豆瓣 Celebrity ID、IMDb ID 或数据源提供的 TMDb Person ID 最终对应到同一个 TMDb 身份时才合并。
+- TMDb 与豆瓣确认到同一个演员后只更新既有演员记录，不重复新增；最终继续按 TMDb、Emby 和豆瓣身份三重去重。
+- 保留姓名相同但 TMDb Person ID 不同的真实演员，修复旧逻辑可能误删同名异人的问题。
+- 豆瓣独有且无法解析到 TMDb Person ID 的演员继续安全跳过，不使用姓名或伪造 ID 自动创建 Person。
+
+### 安全边界
+- 翻译后的中文名只用于展示，不参与人物身份匹配。
+- 本版不包含正在开发中的其他 UI 改动。
+""",
+    },
+    {
         "version": "v7.1.16",
         "published_at": "2026-07-21T00:20:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.16",

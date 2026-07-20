@@ -20,6 +20,9 @@ class ActorEnrichmentSafetyTests(unittest.TestCase):
         self.assertIn('actor_utils.apply_douban_avatar_fallbacks', source)
         self.assertIn('rejected_name_translations = actor_utils.apply_safe_actor_name_translations', source)
         self.assertNotIn('entry.get("tmdb_person_id") and entry.get("emby_person_id")', source)
+        self.assertIn('仅按外部身份对号入座，姓名只用于展示', source)
+        self.assertNotIn('删除同名异人演员', source)
+        self.assertNotIn('douban_name_zh', source)
 
     def test_new_actor_requires_tmdb_identity_and_profile(self):
         cast = [
@@ -84,6 +87,26 @@ class ActorEnrichmentSafetyTests(unittest.TestCase):
         deduplicated = deduplicate_cast_by_identity(cast)
 
         self.assertEqual([actor['name'] for actor in deduplicated], ['First', 'Unique'])
+
+    def test_same_name_different_tmdb_people_are_not_deduplicated(self):
+        cast = [
+            {'id': '1', 'name': '王伟', 'douban_id': '101', 'profile_path': '/one.jpg'},
+            {'id': '2', 'name': '王伟', 'douban_id': '102', 'profile_path': '/two.jpg'},
+        ]
+
+        deduplicated = deduplicate_cast_by_identity(cast)
+
+        self.assertEqual([actor['id'] for actor in deduplicated], ['1', '2'])
+
+    def test_duplicate_douban_identity_is_deduplicated(self):
+        cast = [
+            {'id': '1', 'name': 'First', 'douban_id': '101', 'profile_path': '/one.jpg'},
+            {'id': '2', 'name': 'Duplicate Douban', 'douban_id': '101', 'profile_path': '/two.jpg'},
+        ]
+
+        deduplicated = deduplicate_cast_by_identity(cast)
+
+        self.assertEqual([actor['id'] for actor in deduplicated], ['1'])
 
     def test_translation_cannot_add_numbering_or_name_collisions(self):
         cast = [

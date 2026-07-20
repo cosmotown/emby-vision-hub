@@ -1,11 +1,10 @@
-# D:/vue/docker/docker-compose.yml (最终持久化版)
-
-version: '3.8'
+# EVH · Emby Vision Hub 本地构建与持久化部署示例
 
 services:
-  emby-toolkit:
+  emby-vision-hub:
     build: .
-    container_name: emby-toolkit
+    image: tzyzero186/emby-vision-hub:latest
+    container_name: emby-vision-hub
     restart: unless-stopped
     volumes:
       - ./local_data:/config 
@@ -15,14 +14,16 @@ services:
       - PGID=1000
       - DB_HOST=db
       - DB_PORT=5432
-      - DB_USER=embytoolkit      
-      - DB_PASSWORD=embytoolkit 
-      - DB_NAME=embytoolkit         
+      - DB_USER=evh
+      - DB_PASSWORD=change-me
+      - DB_NAME=evh
+      - CONTAINER_NAME=emby-vision-hub
+      - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:latest
     ports:
       - "5257:5257"
       - "8096:8096"
     networks:
-      - emby-net
+      - evh-net
     depends_on:
       db:
         condition: service_healthy
@@ -35,26 +36,26 @@ services:
   
   db:
     image: postgres:16-alpine 
-    container_name: emby-toolkit-db
+    container_name: emby-vision-hub-db
     restart: unless-stopped
     volumes:
       - postgres_data:/var/lib/postgresql/data
     environment:
-      - POSTGRES_USER=embytoolkit      
-      - POSTGRES_PASSWORD=embytoolkit 
-      - POSTGRES_DB=embytoolkit         
+      - POSTGRES_USER=evh
+      - POSTGRES_PASSWORD=change-me
+      - POSTGRES_DB=evh
     networks:
-      - emby-net
+      - evh-net
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U embytoolkit -d embytoolkit"]
+      test: ["CMD-SHELL", "pg_isready -U evh -d evh"]
       interval: 10s
       timeout: 5s
       retries: 5
 
 networks:
-  emby-net:
+  evh-net:
     driver: bridge
   
 volumes:

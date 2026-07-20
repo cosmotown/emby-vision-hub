@@ -2,27 +2,27 @@
 
 推荐使用 `docker-compose.yml` 方式部署，以下示例与仓库 README 一致，并补充关键说明。
 
-> 兼容说明：7.2.0 更名为 EVH 后，Docker 镜像、容器名、配置目录和数据库名暂时沿用 `emby-toolkit` 标识，老用户可原地升级，无需搬迁 `/config` 或 PostgreSQL 数据。
+> 兼容说明：新部署使用 `emby-vision-hub` 命名。旧的 `tzyzero186/emby-toolkit` 镜像标签在 7.2.0 继续同步发布，老用户可以保持现有 Compose、`/config` 和 PostgreSQL 数据原地升级。
 
 ## 目录准备
 
 ```bash
-mkdir -p /path/emby-toolkit
+mkdir -p /path/emby-vision-hub
 ```
 
 ## 示例 Compose
 
 ```yaml
 services:
-  emby-toolkit:
-    image: tzyzero186/emby-toolkit:latest
-    container_name: emby-toolkit
+  emby-vision-hub:
+    image: tzyzero186/emby-vision-hub:latest
+    container_name: emby-vision-hub
     network_mode: bridge
     ports:
       - "5257:5257"  # Web 控制台
       - "8097:8097"  # 反向代理/虚拟库端口
     volumes:
-      - /path/emby-toolkit:/config
+      - /path/emby-vision-hub:/config
       - /path/media:/media
       - /path/tmdb:/tmdb
       - /var/run/docker.sock:/var/run/docker.sock
@@ -34,11 +34,11 @@ services:
       - UMASK=022
       - DB_HOST=172.17.0.1
       - DB_PORT=5433
-      - DB_USER=embytoolkit
-      - DB_PASSWORD=embytoolkit
-      - DB_NAME=embytoolkit
-      - CONTAINER_NAME=emby-toolkit
-      - DOCKER_IMAGE_NAME=tzyzero186/emby-toolkit:latest
+      - DB_USER=evh
+      - DB_PASSWORD=请替换为强密码
+      - DB_NAME=evh
+      - CONTAINER_NAME=emby-vision-hub
+      - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:latest
     restart: unless-stopped
     depends_on:
       db:
@@ -46,19 +46,19 @@ services:
 
   db:
     image: postgres:18
-    container_name: emby-toolkit-db
+    container_name: emby-vision-hub-db
     restart: unless-stopped
     network_mode: bridge
     volumes:
       - postgres_data:/var/lib/postgresql
     environment:
-      - POSTGRES_USER=embytoolkit
-      - POSTGRES_PASSWORD=embytoolkit
-      - POSTGRES_DB=embytoolkit
+      - POSTGRES_USER=evh
+      - POSTGRES_PASSWORD=请替换为强密码
+      - POSTGRES_DB=evh
     ports:
       - "5433:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U embytoolkit -d embytoolkit"]
+      test: ["CMD-SHELL", "pg_isready -U evh -d evh"]
       interval: 10s
       timeout: 5s
       retries: 5

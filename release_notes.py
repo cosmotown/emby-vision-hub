@@ -21,7 +21,7 @@ CUSTOM_RELEASES = [
 - Webhook 追更对剧集容器使用非递归刷新，并只定点刷新本次新增分集，避免单集更新触发整库递归任务。
 
 ### 兼容说明
-- 现有 `/config`、PostgreSQL 数据、容器名和 `tzyzero186/emby-toolkit` 镜像标识继续兼容，升级 7.2.0 不需要迁移业务数据。
+- 新部署使用 `tzyzero186/emby-vision-hub` 镜像与 EVH Compose 命名；7.2.0 同步发布旧 `tzyzero186/emby-toolkit` 标签，已有部署无需迁移 `/config` 或 PostgreSQL 数据。
 - 项目源代码继续按 AGPL-3.0 发布，并保留完整修改历史。
 """,
     },

@@ -41,8 +41,10 @@ jobs:
       - name: Prepare Docker tags
         id: docker_tags
         run: |
-          TAGS="${{ secrets.DOCKERHUB_USERNAME }}/emby-toolkit:${{ inputs.image_tag }}"
+          TAGS="${{ secrets.DOCKERHUB_USERNAME }}/emby-vision-hub:${{ inputs.image_tag }}"
+          TAGS="$TAGS,${{ secrets.DOCKERHUB_USERNAME }}/emby-toolkit:${{ inputs.image_tag }}"
           if [ "${{ inputs.publish_latest }}" = "true" ]; then
+            TAGS="$TAGS,${{ secrets.DOCKERHUB_USERNAME }}/emby-vision-hub:latest"
             TAGS="$TAGS,${{ secrets.DOCKERHUB_USERNAME }}/emby-toolkit:latest"
           fi
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"

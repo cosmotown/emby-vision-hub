@@ -10,7 +10,7 @@
 
 EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 STRM 入库协调、元数据增强、智能订阅、媒体整理、合集与虚拟库、封面生成、任务调度、用户权限和运行诊断。
 
-项目从 7.2.0 起以 **Emby Vision Hub** 名称独立演进。现有容器名、配置目录、数据库名与 Docker 镜像地址暂时保持兼容，升级不需要迁移数据。
+项目从 7.2.0 起以 **Emby Vision Hub** 名称独立演进。新部署使用 `tzyzero186/emby-vision-hub` 镜像和 EVH Compose 命名；旧镜像标签继续同步发布，已有部署无需迁移 `/config` 或 PostgreSQL 数据。
 
 ## ✨ 功能特性
 
@@ -42,25 +42,25 @@ EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 S
 1.  **准备持久化数据目录**：
     在你的服务器上（例如 NAS）创建一个目录，用于存放应用的配置文件和数据库。例如：
     ```bash
-    mkdir -p /path/emby-toolkit
+    mkdir -p /path/emby-vision-hub
     ```
-    请将 `/path/emby-toolkit` 替换为你实际的路径。
+    请将 `/path/emby-vision-hub` 替换为你实际的路径。
 
 2.  **使用 `docker-compose.yml` (推荐)**：
     创建一个 `docker-compose.yml` 文件，内容如下：
 
     ```yaml
     services:
-      # --- 1. Emby-Toolkit 主程序 ---
-      emby-toolkit:
-        image: tzyzero186/emby-toolkit:latest
-        container_name: emby-toolkit
+      # --- 1. Emby Vision Hub 主程序 ---
+      emby-vision-hub:
+        image: tzyzero186/emby-vision-hub:latest
+        container_name: emby-vision-hub
         network_mode: bridge                          # 网络模式
         ports:
           - "5257:5257"                               # 管理端口
           - "8097:8097"                               # 反代端口，虚拟库用，冒号前面是实际访问端口，冒号后面是管理后台设置的反代监听端口
         volumes:
-          - /path/emby-toolkit:/config                # 将宿主机的数据目录挂载到容器的 /config 目录
+          - /path/emby-vision-hub:/config             # 将宿主机的数据目录挂载到容器的 /config 目录
           - /path/STRM:/STRM:ro                       # 映射 STRM 根目录供实时监控；容器内路径需与监控设置一致
           - /path/tmdb:/tmdb                          # 映射神医本地TMDB目录，非神医Pro用户可以留空
           - /var/run/docker.sock:/var/run/docker.sock # 一键更新用，不需要可以不配置
@@ -72,11 +72,11 @@ EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 S
           - UMASK=022                                 # 设置文件权限掩码，建议022
           - DB_HOST=172.17.0.1                        # 数据库服务的地址 
           - DB_PORT=5433                              # 数据库服务的端口 
-          - DB_USER=embytoolkit                       # !!! (可选) 修改为你自己的数据库用户名
-          - DB_PASSWORD=embytoolkit                   # !!! (必填) 请修改为一个强密码 !!!
-          - DB_NAME=embytoolkit                       # !!! (可选) 修改为你自己的数据库名
-          - CONTAINER_NAME=emby-toolkit               # 以下两项都是一键更新用，不需要可以不配置
-          - DOCKER_IMAGE_NAME=tzyzero186/emby-toolkit:latest
+          - DB_USER=evh                               # !!! (可选) 修改为你自己的数据库用户名
+          - DB_PASSWORD=请替换为强密码                 # !!! (必填) 与下方保持一致 !!!
+          - DB_NAME=evh                               # !!! (可选) 修改为你自己的数据库名
+          - CONTAINER_NAME=emby-vision-hub            # 以下两项都是一键更新用，不需要可以不配置
+          - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:latest
         restart: unless-stopped
         depends_on:                                   # 确保主程序只在数据库健康检查通过后才启动 
           db:
@@ -84,7 +84,7 @@ EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 S
       # --- 2. PostgreSQL 数据库服务 ---
       db:
         image: postgres:18
-        container_name: emby-toolkit-db
+        container_name: emby-vision-hub-db
         restart: unless-stopped
         network_mode: bridge
         volumes:
@@ -93,16 +93,16 @@ EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 S
           - postgres_data:/var/lib/postgresql
         environment:
           # --- 数据库认证配置 (核心) ---
-          # 这些值必须与上面的 'emby-toolkit' 服务中的环境变量完全匹配
-          - POSTGRES_USER=embytoolkit               # !!! (可选) 修改，与上面保持一致
-          - POSTGRES_PASSWORD=embytoolkit           # !!! (必填) 修改，与上面保持一致 !!!
-          - POSTGRES_DB=embytoolkit                 # !!! (可选) 修改，与上面保持一致
+          # 这些值必须与上面的 'emby-vision-hub' 服务中的环境变量完全匹配
+          - POSTGRES_USER=evh                       # !!! (可选) 修改，与上面保持一致
+          - POSTGRES_PASSWORD=请替换为强密码         # !!! (必填) 与上面保持一致 !!!
+          - POSTGRES_DB=evh                         # !!! (可选) 修改，与上面保持一致
         ports:
           # 将数据库端口映射到宿主机，方便使用Navicat等工具连接调试
           - "5433:5432"
         healthcheck:
           # 健康检查，确保数据库服务已准备好接受连接
-          test: ["CMD-SHELL", "pg_isready -U embytoolkit -d embytoolkit"]
+          test: ["CMD-SHELL", "pg_isready -U evh -d evh"]
           interval: 10s
           timeout: 5s
           retries: 5

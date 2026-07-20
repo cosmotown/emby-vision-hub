@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import threading
 import time
 import types
 import ast
@@ -18,6 +19,9 @@ from services import emby_ingest
 
 
 class EmbyIngestTests(unittest.TestCase):
+    def setUp(self):
+        emby_ingest._reset_ingest_refresh_state()
+
     def _make_strm_files(self, directory, count):
         paths = []
         for index in range(count):
@@ -105,6 +109,32 @@ class EmbyIngestTests(unittest.TestCase):
         self.assertTrue(emby_ingest._refresh_parent_targets(paths, "http://emby", "token"))
         refresh_item.assert_called_once_with("series-1", "http://emby", "token")
 
+    @mock.patch("services.emby_ingest.emby.refresh_item_by_id", return_value=True)
+    @mock.patch("services.emby_ingest.emby.find_nearest_library_anchor_details")
+    @mock.patch(
+        "services.emby_ingest.emby.get_all_libraries_with_paths",
+        return_value=[{"info": {"Id": "library-root"}, "paths": ["/media/tv"]}],
+    )
+    def test_recent_series_anchor_refresh_is_deduplicated_across_batches(
+        self,
+        _get_libraries,
+        find_anchor,
+        refresh_item,
+    ):
+        find_anchor.return_value = {
+            "Id": "series-1",
+            "Name": "New Show",
+            "Type": "Series",
+            "Path": "/media/tv/New Show",
+        }
+        first_batch = ["/media/tv/New Show/Season 01/S01E01.strm"]
+        second_batch = ["/media/tv/New Show/Season 01/S01E02.strm"]
+
+        self.assertTrue(emby_ingest._refresh_parent_targets(first_batch, "http://emby", "token"))
+        self.assertTrue(emby_ingest._refresh_parent_targets(second_batch, "http://emby", "token"))
+
+        refresh_item.assert_called_once_with("series-1", "http://emby", "token")
+
     @mock.patch("services.emby_ingest.emby.refresh_item_by_id")
     @mock.patch("services.emby_ingest.emby.find_nearest_library_anchor_details")
     @mock.patch("services.emby_ingest.emby.get_all_libraries_with_paths", return_value=[])
@@ -159,6 +189,67 @@ class EmbyIngestTests(unittest.TestCase):
         self.assertEqual(2, notify_paths.call_count)
         _refresh_targets.assert_called_once_with([path], "http://emby", "token")
         self.assertEqual([mock.call(8), mock.call(12)], sleep.call_args_list)
+
+    def test_verification_wait_does_not_block_next_batch_dispatch(self):
+        first_waiting = threading.Event()
+        release_first = threading.Event()
+        results = {}
+
+        def fake_sleep(_seconds):
+            if threading.current_thread().name == "first-ingest-batch":
+                first_waiting.set()
+                release_first.wait(timeout=2)
+
+        def confirm_all(paths, _base_url, _api_key):
+            return set(paths), set(), set()
+
+        def run_batch(name, paths):
+            results[name] = emby_ingest.refresh_and_verify_paths(
+                paths,
+                "http://emby",
+                "token",
+                verify_delays=(8,),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            first_path, second_path = self._make_strm_files(directory, 2)
+            with mock.patch(
+                "services.emby_ingest.emby.notify_media_paths_updated",
+                return_value=True,
+            ) as notify_paths, mock.patch(
+                "services.emby_ingest._refresh_parent_targets",
+                return_value=True,
+            ), mock.patch(
+                "services.emby_ingest.check_indexed_paths",
+                side_effect=confirm_all,
+            ), mock.patch(
+                "services.emby_ingest.time.sleep",
+                side_effect=fake_sleep,
+            ):
+                first_thread = threading.Thread(
+                    target=run_batch,
+                    args=("first", [first_path]),
+                    name="first-ingest-batch",
+                )
+                second_thread = threading.Thread(
+                    target=run_batch,
+                    args=("second", [second_path]),
+                    name="second-ingest-batch",
+                )
+                first_thread.start()
+                self.assertTrue(first_waiting.wait(timeout=1))
+                second_thread.start()
+                try:
+                    second_thread.join(timeout=1)
+                    self.assertFalse(second_thread.is_alive())
+                    self.assertEqual(2, notify_paths.call_count)
+                finally:
+                    release_first.set()
+                    first_thread.join(timeout=2)
+                    second_thread.join(timeout=2)
+
+        self.assertEqual(1, results["first"]["indexed"])
+        self.assertEqual(1, results["second"]["indexed"])
 
     def test_realtime_queue_keeps_all_paths_for_emby(self):
         source = (Path(__file__).resolve().parents[1] / "monitor_service.py").read_text(encoding="utf-8")

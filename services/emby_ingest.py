@@ -12,6 +12,51 @@ logger = logging.getLogger(__name__)
 
 INGEST_REFRESH_LOCK = threading.Lock()
 DEFAULT_VERIFY_DELAYS = (8, 20, 45)
+ANCHOR_REFRESH_COOLDOWN_SECONDS = 300
+
+_ANCHOR_REFRESH_STATE_LOCK = threading.Lock()
+_ANCHOR_REFRESH_INFLIGHT: Set[Tuple[str, str]] = set()
+_ANCHOR_REFRESHED_AT: Dict[Tuple[str, str], float] = {}
+
+
+def _claim_anchor_refresh(base_url: str, anchor_id: str) -> Optional[Tuple[str, str]]:
+    """Reserve one Series/Season refresh and suppress concurrent/recent duplicates."""
+    key = (str(base_url or '').rstrip('/'), str(anchor_id or '').strip())
+    if not key[1]:
+        return None
+
+    now = time.monotonic()
+    with _ANCHOR_REFRESH_STATE_LOCK:
+        last_refresh = _ANCHOR_REFRESHED_AT.get(key)
+        if key in _ANCHOR_REFRESH_INFLIGHT:
+            return None
+        if last_refresh is not None and now - last_refresh < ANCHOR_REFRESH_COOLDOWN_SECONDS:
+            return None
+        _ANCHOR_REFRESH_INFLIGHT.add(key)
+    return key
+
+
+def _finish_anchor_refresh(key: Tuple[str, str], succeeded: bool) -> None:
+    with _ANCHOR_REFRESH_STATE_LOCK:
+        _ANCHOR_REFRESH_INFLIGHT.discard(key)
+        if succeeded:
+            _ANCHOR_REFRESHED_AT[key] = time.monotonic()
+
+        expiry = time.monotonic() - (ANCHOR_REFRESH_COOLDOWN_SECONDS * 2)
+        stale_keys = [
+            cached_key
+            for cached_key, refreshed_at in _ANCHOR_REFRESHED_AT.items()
+            if refreshed_at < expiry and cached_key not in _ANCHOR_REFRESH_INFLIGHT
+        ]
+        for cached_key in stale_keys:
+            _ANCHOR_REFRESHED_AT.pop(cached_key, None)
+
+
+def _reset_ingest_refresh_state() -> None:
+    """Clear process-local refresh deduplication state for tests and clean restarts."""
+    with _ANCHOR_REFRESH_STATE_LOCK:
+        _ANCHOR_REFRESH_INFLIGHT.clear()
+        _ANCHOR_REFRESHED_AT.clear()
 
 
 def normalize_paths(file_paths: Iterable[str], require_existing: bool = True) -> List[str]:
@@ -402,8 +447,20 @@ def _refresh_parent_targets(
 
     success = True
     for anchor_id, anchor_name in anchors.items():
+        refresh_key = _claim_anchor_refresh(base_url, anchor_id)
+        if refresh_key is None:
+            logger.info(
+                f"  ➜ STRM 入库锚点近期已刷新或正在刷新，跳过重复请求: "
+                f"'{anchor_name}' ({anchor_id})"
+            )
+            continue
         logger.info(f"  ➜ STRM 入库刷新 Emby 锚点: '{anchor_name}' ({anchor_id})")
-        if not emby.refresh_item_by_id(anchor_id, base_url, api_key):
+        refreshed = False
+        try:
+            refreshed = emby.refresh_item_by_id(anchor_id, base_url, api_key)
+        finally:
+            _finish_anchor_refresh(refresh_key, refreshed)
+        if not refreshed:
             success = False
     return success
 
@@ -435,6 +492,10 @@ def refresh_and_verify_paths(
     if initial_delay_seconds > 0:
         time.sleep(max(0, int(initial_delay_seconds)))
 
+    # Serialize only the lightweight notification/refresh dispatch. Verification
+    # waits must not hold this lock: MoviePilot and other STRM writers can emit
+    # several debounced batches while the first batch is waiting for Emby. The
+    # old lock scope turned every batch into another 45-second queue slot.
     with INGEST_REFRESH_LOCK:
         refresh_ok = emby.notify_media_paths_updated(
             _notification_paths(paths),
@@ -442,39 +503,41 @@ def refresh_and_verify_paths(
             api_key,
         )
         refresh_ok = _refresh_parent_targets(paths, base_url, api_key) and refresh_ok
-        pending = set(paths)
-        query_failed: Set[str] = set()
 
-        previous_deadline = 0
-        for attempt, deadline_seconds in enumerate(verify_delays, start=1):
-            wait_seconds = max(1, int(deadline_seconds) - previous_deadline)
-            previous_deadline = int(deadline_seconds)
-            time.sleep(wait_seconds)
-            indexed, missing, failed = check_indexed_paths(pending, base_url, api_key)
-            pending -= indexed
-            query_failed = failed
-            logger.info(
-                f"  ➜ STRM 入库确认 {attempt}/{len(verify_delays)}: "
-                f"已入库 {len(paths) - len(pending)}/{len(paths)}，待重试 {len(pending)}。"
-            )
-            if not pending:
-                break
-            if attempt < len(verify_delays):
-                retry_paths = sorted(missing | failed)
+    pending = set(paths)
+    query_failed: Set[str] = set()
+
+    previous_deadline = 0
+    for attempt, deadline_seconds in enumerate(verify_delays, start=1):
+        wait_seconds = max(1, int(deadline_seconds) - previous_deadline)
+        previous_deadline = int(deadline_seconds)
+        time.sleep(wait_seconds)
+        indexed, missing, failed = check_indexed_paths(pending, base_url, api_key)
+        pending -= indexed
+        query_failed = failed
+        logger.info(
+            f"  ➜ STRM 入库确认 {attempt}/{len(verify_delays)}: "
+            f"已入库 {len(paths) - len(pending)}/{len(paths)}，待重试 {len(pending)}。"
+        )
+        if not pending:
+            break
+        if attempt < len(verify_delays):
+            retry_paths = sorted(missing | failed)
+            with INGEST_REFRESH_LOCK:
                 refresh_ok = emby.notify_media_paths_updated(
                     _notification_paths(retry_paths),
                     base_url,
                     api_key,
                 ) and refresh_ok
 
-        result.update({
-            'indexed': len(paths) - len(pending),
-            'confirmed_paths': sorted(set(paths) - pending),
-            'pending': sorted(pending),
-            'query_failed': sorted(query_failed & pending),
-            'refresh_ok': refresh_ok,
-        })
-        return result
+    result.update({
+        'indexed': len(paths) - len(pending),
+        'confirmed_paths': sorted(set(paths) - pending),
+        'pending': sorted(pending),
+        'query_failed': sorted(query_failed & pending),
+        'refresh_ok': refresh_ok,
+    })
+    return result
 
 
 def collect_recent_media_paths(

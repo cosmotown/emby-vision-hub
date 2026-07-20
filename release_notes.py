@@ -2,6 +2,28 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.13",
+        "published_at": "2026-07-20T22:35:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.13",
+        "changelog": """## STRM 连续入库解阻热修复
+
+### 修复
+- STRM 入库的 8/20/45 秒确认等待不再占用全局刷新锁，后续新文件可立即向 Emby 发送精确路径通知，不会再按每批最长 45 秒串行排队。
+- 同一 `Series` 或 `Season` 的跨批次刷新新增在途去重和 5 分钟冷却，避免连续生成数十集 STRM 时堆积递归刷新。
+- 重试通知仍按精确文件路径执行，并继续禁止将媒体库根目录作为递归刷新锚点。
+
+### 验证
+- 新增并发回归测试，确认前一批处于等待期间时，下一批仍可立即发送通知。
+- 确认同一剧集的多批分集只触发一次近端锚点刷新，相关 32 个入库回归测试全部通过。
+
+### 兼容说明
+- MoviePilot `P115StrmHelper` 的“媒体服务器刷新”和“Emby 媒体信息提取”会在新条目未建档时回退到媒体库根目录 `FullRefresh`。由 Toolkit 负责 STRM 精确入库时，建议关闭这两个重复入库开关。
+
+### 安全边界
+- 本版不修改 Emby 数据库、媒体文件、MoviePilot 或 115 网盘数据；仅收窄 Toolkit 内部的入库并发与刷新范围。
+""",
+    },
+    {
         "version": "v7.1.12",
         "published_at": "2026-07-20T02:40:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.12",

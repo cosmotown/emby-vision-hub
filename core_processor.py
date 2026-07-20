@@ -1850,6 +1850,64 @@ class MediaProcessor:
             update_status_callback(100, "全量处理完成")
     
     # --- 核心处理总管 ---
+    def _refresh_emby_after_metadata_sync(
+        self,
+        item_id: str,
+        item_name_for_log: str,
+        specific_episode_ids: Optional[List[str]] = None,
+    ) -> bool:
+        """Submit the smallest Emby refresh that can expose the synced metadata."""
+        episode_ids = list(dict.fromkeys(
+            str(episode_id).strip()
+            for episode_id in (specific_episode_ids or [])
+            if str(episode_id).strip()
+        ))
+
+        if not episode_ids:
+            return emby.refresh_emby_item_metadata(
+                item_emby_id=item_id,
+                emby_server_url=self.emby_url,
+                emby_api_key=self.emby_api_key,
+                user_id_for_ops=self.emby_user_id,
+                replace_all_metadata_param=True,
+                item_name_for_log=item_name_for_log,
+            )
+
+        logger.info(
+            f"  ➜ [追更刷新] 仅刷新剧集容器和本次新增的 {len(episode_ids)} 个分集，"
+            "不递归刷新整部剧。"
+        )
+        series_submitted = emby.refresh_emby_item_metadata(
+            item_emby_id=item_id,
+            emby_server_url=self.emby_url,
+            emby_api_key=self.emby_api_key,
+            user_id_for_ops=self.emby_user_id,
+            replace_all_metadata_param=True,
+            item_name_for_log=item_name_for_log,
+            recursive_override=False,
+        )
+        if not series_submitted:
+            return False
+
+        for episode_id in episode_ids:
+            episode_submitted = emby.refresh_emby_item_metadata(
+                item_emby_id=episode_id,
+                emby_server_url=self.emby_url,
+                emby_api_key=self.emby_api_key,
+                user_id_for_ops=self.emby_user_id,
+                replace_all_metadata_param=True,
+                item_name_for_log=f"{item_name_for_log} / 分集 {episode_id}",
+                recursive_override=False,
+                wait_for_idle=False,
+            )
+            if not episode_submitted:
+                logger.warning(
+                    f"  ➜ [追更刷新] 分集 {episode_id} 刷新提交失败，"
+                    "已停止继续提交，避免 Emby 异常时形成请求风暴。"
+                )
+                return False
+        return True
+
     def process_single_item(self, emby_item_id: str, force_full_update: bool = False, specific_episode_ids: Optional[List[str]] = None):
         """
         入口函数，它会先检查是否需要跳过已处理的项目。
@@ -2288,13 +2346,10 @@ class MediaProcessor:
 
                     # 通知 Emby 刷新
                     logger.info(f"  ➜ 处理完成，正在通知 Emby 刷新...")
-                    emby.refresh_emby_item_metadata(
-                        item_emby_id=item_id,
-                        emby_server_url=self.emby_url,
-                        emby_api_key=self.emby_api_key,
-                        user_id_for_ops=self.emby_user_id,
-                        replace_all_metadata_param=True, 
-                        item_name_for_log=item_name_for_log
+                    self._refresh_emby_after_metadata_sync(
+                        item_id=item_id,
+                        item_name_for_log=item_name_for_log,
+                        specific_episode_ids=specific_episode_ids,
                     )
 
                 # TMDb 元数据刷新不会携带豆瓣独有人物；刷新完成后按 Douban ID

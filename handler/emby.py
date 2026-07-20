@@ -89,6 +89,15 @@ class EmbyAPIClient:
     def post(self, url, **kwargs):
         return self.request("POST", url, **kwargs)
 
+    def post_once(self, url, **kwargs):
+        """Submit a non-idempotent POST without the shared automatic retry policy."""
+        if 'timeout' not in kwargs:
+            kwargs['timeout'] = config_manager.APP_CONFIG.get(
+                constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60
+            )
+        with self.semaphore:
+            return requests.post(url, **kwargs)
+
     def delete(self, url, **kwargs):
         return self.request("DELETE", url, **kwargs)
 
@@ -798,14 +807,18 @@ def refresh_emby_item_metadata(item_emby_id: str,
                                user_id_for_ops: str,
                                replace_all_metadata_param: bool = False,
                                replace_all_images_param: bool = False,
-                               item_name_for_log: Optional[str] = None
+                               item_name_for_log: Optional[str] = None,
+                               recursive_override: Optional[bool] = None,
+                               wait_for_idle: bool = True,
                                ) -> bool:
     if not all([item_emby_id, emby_server_url, emby_api_key, user_id_for_ops]):
         logger.error("刷新Emby元数据参数不足：缺少ItemID、服务器URL、API Key或UserID。")
         return False
-    wait_for_server_idle(emby_server_url, emby_api_key)
+    if wait_for_idle:
+        wait_for_server_idle(emby_server_url, emby_api_key)
     log_identifier = f"'{item_name_for_log}'" if item_name_for_log else f"ItemID: {item_emby_id}"
-    
+
+    item_data: Dict[str, Any] = {}
     try:
         logger.trace(f"  ➜ 正在为 {log_identifier} 获取当前详情...")
         item_data = get_emby_item_details(item_emby_id, emby_server_url, emby_api_key, user_id_for_ops)
@@ -827,38 +840,54 @@ def refresh_emby_item_metadata(item_emby_id: str,
         if item_needs_update:
             logger.trace(f"  ➜ 正在为 {log_identifier} 提交锁状态更新...")
             update_url = f"{emby_server_url.rstrip('/')}/Items/{item_emby_id}"
-            update_params = {"api_key": emby_api_key}
-            headers = {'Content-Type': 'application/json'}
-            update_response = emby_client.post(update_url, json=item_data, headers=headers, params=update_params)
+            headers = {
+                'Content-Type': 'application/json',
+                'X-Emby-Token': emby_api_key,
+            }
+            update_response = emby_client.post(update_url, json=item_data, headers=headers)
             update_response.raise_for_status()
             logger.trace(f"  ➜ 成功更新 {log_identifier} 的锁状态。")
         else:
             logger.trace(f"  ➜ 项目 {log_identifier} 的锁状态无需更新。")
 
-    except Exception as e:
-        logger.warning(f"  ➜ 在刷新前更新锁状态时失败: {e}。刷新将继续，但可能受影响。")
+    except Exception as exc:
+        logger.warning(
+            f"  ➜ 在刷新前更新锁状态时失败 ({type(exc).__name__})，已中止本次刷新。"
+        )
+        return False
 
     logger.debug(f"  ➜ 正在为 {log_identifier} 发送最终的刷新请求...")
     refresh_url = f"{emby_server_url.rstrip('/')}/Items/{item_emby_id}/Refresh"
+    recursive = (
+        bool(recursive_override)
+        if recursive_override is not None
+        else item_data.get("Type") == "Series"
+    )
     params = {
-        "api_key": emby_api_key,
-        "Recursive": str(item_data.get("Type") == "Series").lower(),
+        "Recursive": str(recursive).lower(),
         "MetadataRefreshMode": "Default",
         "ImageRefreshMode": "Default",
         "ReplaceAllMetadata": str(replace_all_metadata_param).lower(),
         "ReplaceAllImages": str(replace_all_images_param).lower()
     }
+    headers = {'X-Emby-Token': emby_api_key}
     
     try:
-        response = emby_client.post(refresh_url, params=params)
+        # Refresh is not idempotent from Emby's point of view. Never replay it
+        # automatically after a read timeout: the first request may already have
+        # entered ProviderManager's queue even though the response was lost.
+        response = emby_client.post_once(refresh_url, params=params, headers=headers)
         if response.status_code == 204:
-            logger.info(f"  ➜ 已成功为 {log_identifier} 刷新元数据。")
+            logger.info(
+                f"  ➜ 已为 {log_identifier} 提交元数据刷新请求"
+                f" (Recursive={str(recursive).lower()})。"
+            )
             return True
         else:
             logger.error(f"  - 刷新请求失败: HTTP状态码 {response.status_code}")
             return False
-    except requests.exceptions.RequestException as e:
-        logger.error(f"  - 刷新请求时发生网络错误: {e}")
+    except requests.exceptions.RequestException as exc:
+        logger.error(f"  - 刷新请求时发生网络错误: {type(exc).__name__}")
         return False
 
 # --- 仅查找路径对应的最近 Emby 锚点，不刷新 ---

@@ -2,6 +2,23 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.19",
+        "published_at": "2026-07-21T01:35:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.19",
+        "changelog": """## Webhook 追更定点刷新热修复
+
+### 修复
+- Webhook 追更不再对 Series 发送递归整剧刷新；改为非递归刷新剧集容器，并只定点刷新本次新增分集。
+- 分集刷新一旦提交失败就立即熔断，避免 Emby 卡顿时继续堆叠请求。
+- Emby 返回 HTTP 204 时改为记录“已提交刷新请求”，不再误报“已刷新完成”。
+- 该刷新链路的 Emby API 凭据从 URL 查询参数移到 `X-Emby-Token` 请求头，网络异常日志只记录异常类型。
+
+### 安全边界
+- 普通手动处理和全量处理的既有刷新策略不变；本版只收紧 Webhook 追更链路。
+- 本版从独立工作树构建，不包含正在开发中的其他 UI 改动。
+""",
+    },
+    {
         "version": "v7.1.18",
         "published_at": "2026-07-21T01:05:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.18",

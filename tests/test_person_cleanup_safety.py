@@ -7,6 +7,7 @@ from services.person_cleanup_safety import (
     classify_reference_check,
     find_ghost_candidates,
     normalize_person_name,
+    person_name_protection_keys,
 )
 
 
@@ -47,6 +48,22 @@ class PersonCleanupSafetyTests(unittest.TestCase):
 
         self.assertEqual([person['Id'] for person in candidates], ['1'])
         self.assertEqual(normalize_person_name('  Alice  SMITH '), 'alice smith')
+
+    def test_protected_person_name_excludes_numbered_translation_duplicates(self):
+        people = [
+            {'Id': '1', 'Name': '1①めぐみ'},
+            {'Id': '2', 'Name': '2梅田'},
+            {'Id': '3', 'Name': '2Pac'},
+        ]
+
+        candidates = find_ghost_candidates(
+            people,
+            referenced_person_ids=set(),
+            protected_person_names={'めぐみ', '梅田'},
+        )
+
+        self.assertEqual([person['Id'] for person in candidates], ['3'])
+        self.assertEqual(person_name_protection_keys('3②みさ'), {'3②みさ', 'みさ'})
 
     def test_only_explicit_zero_reference_count_is_deletable(self):
         self.assertEqual(classify_reference_check({'count': 0, 'items': []}), 'orphan')
@@ -117,10 +134,12 @@ class PersonCleanupSafetyTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
         }
         merge_source = ast.unparse(functions['merge_protected_people_for_library'])
+        replace_candidates_source = ast.unparse(functions['replace_candidates'])
         task_source = (repo_root / 'tasks' / 'actors.py').read_text()
         schema_source = (repo_root / 'database' / 'connection.py').read_text()
 
         self.assertNotIn('DELETE FROM person_cleanup_protected_people', merge_source)
+        self.assertIn('_exclude_protected_candidates', replace_candidates_source)
         self.assertIn('ON CONFLICT', merge_source)
         self.assertIn('merge_protected_people_for_library', task_source)
         self.assertIn('get_protected_person_ids', task_source)
@@ -128,7 +147,7 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertIn('capture_library_ids=protected_library_ids', task_source)
         self.assertIn('include_protected=True', task_source)
         self.assertIn('person_id in protected_person_ids', task_source)
-        self.assertIn('normalize_person_name(person_name) in protected_person_names', task_source)
+        self.assertIn('person_name_protection_keys(person_name)', task_source)
         self.assertIn('person_cleanup_protected_libraries', schema_source)
         self.assertIn('person_cleanup_protected_people', schema_source)
 

@@ -1740,55 +1740,6 @@ class MediaProcessor:
             logger.error(f"通过 TMDB ID '{tmdb_id}' 查询 person_identity_map 时出错: {e}")
             return None
     
-    # --- 通过 API 更新 Emby 中演员名字 ---
-    def _update_emby_person_names_from_final_cast(self, final_cast: List[Dict[str, Any]], item_name_for_log: str):
-        """
-        根据最终处理好的演员列表，通过 API 更新 Emby 中“演员”项目的名字。
-        """
-        actors_to_update = [
-            actor for actor in final_cast 
-            if actor.get("emby_person_id") and utils.contains_chinese(actor.get("name"))
-        ]
-
-        if not actors_to_update:
-            logger.info(f"  ➜ 无需通过 API 更新演员名字 (没有找到需要翻译的 Emby 演员)。")
-            return
-
-        logger.info(f"  ➜ 开始为《{item_name_for_log}》的 {len(actors_to_update)} 位演员通过 API 更新名字...")
-        
-        # 批量获取这些演员在 Emby 中的当前信息，以减少 API 请求
-        person_ids = [actor["emby_person_id"] for actor in actors_to_update]
-        current_person_details = emby.get_emby_items_by_id(
-            base_url=self.emby_url,
-            api_key=self.emby_api_key,
-            user_id=self.emby_user_id,
-            item_ids=person_ids,
-            fields="Name"
-        )
-        
-        current_names_map = {p["Id"]: p.get("Name") for p in current_person_details} if current_person_details else {}
-
-        updated_count = 0
-        for actor in actors_to_update:
-            person_id = actor["emby_person_id"]
-            new_name = actor["name"]
-            current_name = current_names_map.get(person_id)
-
-            # 只有当新名字和当前名字不同时，才执行更新
-            if new_name != current_name:
-                emby.update_person_details(
-                    person_id=person_id,
-                    new_data={"Name": new_name},
-                    emby_server_url=self.emby_url,
-                    emby_api_key=self.emby_api_key,
-                    user_id=self.emby_user_id
-                )
-                updated_count += 1
-                # 加个小延迟避免请求过快
-                time.sleep(0.2) 
-
-        logger.info(f"  ➜ 成功通过 API 更新了 {updated_count} 位演员的名字。")
-    
     # --- 全量处理的入口 ---
     def process_full_library(self, update_status_callback: Optional[callable] = None, force_full_update: bool = False):
         """
@@ -2300,6 +2251,7 @@ class MediaProcessor:
                         tmdb_api_key=self.tmdb_api_key,
                         stop_event=self.get_stop_event()
                     )
+                    conn.commit()
 
             # =========================================================
             # ★★★ 步骤 5: 统一的收尾流程 ★★★
@@ -2333,9 +2285,6 @@ class MediaProcessor:
                         episode_ids_to_sync=specific_episode_ids,
                         metadata_override=tmdb_details_for_extra 
                     )
-
-                    # 通过 API 实时更新 Emby 演员库中的名字
-                    self._update_emby_person_names_from_final_cast(final_processed_cast, item_name_for_log)
 
                     # 通知 Emby 刷新
                     logger.info(f"  ➜ 处理完成，正在通知 Emby 刷新...")
@@ -2711,7 +2660,7 @@ class MediaProcessor:
                     match_found = False
                     if d_douban_id:
                         entry = self.actor_db_manager.find_person_by_any_id(cursor, douban_id=d_douban_id)
-                        if entry and entry.get("tmdb_person_id") and entry.get("emby_person_id"):
+                        if entry and entry.get("tmdb_person_id"):
                             tmdb_id_from_map = str(entry.get("tmdb_person_id"))
                             if tmdb_id_from_map not in final_cast_map:
                                 logger.info(f"    ├─ 匹配成功 (通过 豆瓣ID映射): 豆瓣演员 '{d_actor.get('Name')}' -> 加入最终演员表")
@@ -2763,7 +2712,7 @@ class MediaProcessor:
                                 logger.debug(f"  ➜ 为 '{d_actor.get('Name')}' 获取到 IMDb ID: {d_imdb_id}，开始匹配...")
                                 
                                 entry_from_map = self.actor_db_manager.find_person_by_any_id(cursor, imdb_id=d_imdb_id)
-                                if entry_from_map and entry_from_map.get("tmdb_person_id") and entry_from_map.get("emby_person_id"):
+                                if entry_from_map and entry_from_map.get("tmdb_person_id"):
                                     tmdb_id_from_map = str(entry_from_map.get("tmdb_person_id"))
                                     if tmdb_id_from_map not in final_cast_map:
                                         logger.debug(f"    ├─ 匹配成功 (通过 IMDb映射): 豆瓣演员 '{d_actor.get('Name')}' -> 加入最终演员表")
@@ -2788,7 +2737,7 @@ class MediaProcessor:
                                         d_actor['imdb_id_from_api'] = d_imdb_id
 
                                         final_check_row = self.actor_db_manager.find_person_by_any_id(cursor, tmdb_id=tmdb_id_from_find)
-                                        if final_check_row and dict(final_check_row).get("emby_person_id"):
+                                        if final_check_row:
                                             emby_pid_from_final_check = dict(final_check_row).get("emby_person_id")
                                             if tmdb_id_from_find not in final_cast_map:
                                                 logger.info(f"    ├─ 匹配成功 (通过 TMDb反查): 豆瓣演员 '{d_actor.get('Name')}' -> 加入最终演员表")
@@ -2885,6 +2834,24 @@ class MediaProcessor:
             logger.info(f"  ➜ 新增演员头像信息补全完成，成功为 {supplemented_count}/{total_to_supplement} 位演员补充了头像。")
         else:
             logger.info("  ➜ 没有需要补充头像的新增演员。")
+
+        original_emby_person_ids = {
+            str(actor.get('Id'))
+            for actor in emby_cast_people
+            if actor.get('Id')
+        }
+        before_safe_filter = len(current_cast_list)
+        current_cast_list = actor_utils.filter_unsafe_new_cast(
+            current_cast_list,
+            original_emby_person_ids=original_emby_person_ids,
+        )
+        current_cast_list = actor_utils.deduplicate_cast_by_identity(current_cast_list)
+        skipped_unsafe_count = before_safe_filter - len(current_cast_list)
+        if skipped_unsafe_count:
+            logger.warning(
+                f"  ➜ 自动演员补充安全过滤：跳过 {skipped_unsafe_count} 位"
+                "缺少头像、TMDb 身份或身份重复的新增演员。"
+            )
 
         # ======================================================================
         # 步骤 5: ★★★ 从演员表移除无头像演员 ★★★
@@ -3016,10 +2983,16 @@ class MediaProcessor:
             if failed_to_translate_terms:
                 logger.warning(f"    ➜ 翻译失败列表 ({len(failed_to_translate_terms)}条): {list(failed_to_translate_terms)}")
 
+            rejected_name_translations = actor_utils.apply_safe_actor_name_translations(
+                current_cast_list,
+                final_translation_map,
+            )
+            if rejected_name_translations:
+                logger.warning(
+                    "  ➜ 已拒绝可能引入编号或姓名碰撞的演员译名，保留原名: "
+                    f"{rejected_name_translations}"
+                )
             for actor in current_cast_list:
-                original_name = actor.get('name')
-                if original_name and original_name in final_translation_map:
-                    actor['name'] = final_translation_map[original_name]
                 original_character = actor.get('character')
                 if original_character:
                     cleaned_character = utils.clean_character_name_static(original_character)

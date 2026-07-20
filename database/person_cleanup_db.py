@@ -2,27 +2,28 @@ import json
 from typing import Any, Dict, Iterable, List, Optional
 
 from .connection import get_db_connection
-from services.person_cleanup_safety import normalize_person_name
+from services.person_cleanup_safety import (
+    build_person_name_protection_keys,
+    person_name_protection_keys,
+)
 
 
 def _exclude_protected_candidates(candidates: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     protected_ids = get_protected_person_ids()
-    protected_names = {
-        normalized
-        for name in get_protected_person_names()
-        if (normalized := normalize_person_name(name))
-    }
+    protected_names = build_person_name_protection_keys(get_protected_person_names())
     return [
         candidate
         for candidate in candidates
-        if str(candidate.get('person_id') or '') not in protected_ids
-        and normalize_person_name(candidate.get('person_name')) not in protected_names
+        if str(candidate.get('person_id') or candidate.get('Id') or '') not in protected_ids
+        and person_name_protection_keys(
+            candidate.get('person_name') or candidate.get('Name')
+        ).isdisjoint(protected_names)
     ]
 
 
 def replace_candidates(candidates: Iterable[Dict[str, Any]]) -> int:
     normalized = []
-    for candidate in candidates:
+    for candidate in _exclude_protected_candidates(candidates):
         person_id = str(candidate.get('Id') or '').strip()
         if not person_id:
             continue

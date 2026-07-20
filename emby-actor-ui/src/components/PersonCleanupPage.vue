@@ -517,6 +517,7 @@ const saveProtectedLibraries = async () => {
     });
     message.success(response.data.message || '保护设置已保存');
     await fetchProtectedLibraries();
+    await fetchCandidates();
   } catch (error) {
     message.error(error.response?.data?.error || '无法保存受保护媒体库');
   } finally {

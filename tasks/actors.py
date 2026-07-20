@@ -16,9 +16,10 @@ import utils
 from actor_utils import enrich_all_actor_aliases_task
 from handler.actor_sync import UnifiedSyncHandler
 from services.person_cleanup_safety import (
+    build_person_name_protection_keys,
     classify_reference_check,
     find_ghost_candidates,
-    normalize_person_name,
+    person_name_protection_keys,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,11 +142,9 @@ def task_delete_selected_ghost_actors(processor, person_ids):
     protected_count = 0
     total = len(requested_ids)
     protected_person_ids = person_cleanup_db.get_protected_person_ids()
-    protected_person_names = {
-        normalized
-        for name in person_cleanup_db.get_protected_person_names()
-        if (normalized := normalize_person_name(name))
-    }
+    protected_person_names = build_person_name_protection_keys(
+        person_cleanup_db.get_protected_person_names()
+    )
 
     for index, person_id in enumerate(requested_ids, start=1):
         if processor.is_stop_requested():
@@ -154,7 +153,7 @@ def task_delete_selected_ghost_actors(processor, person_ids):
         person_name = candidate.get('person_name') or person_id
         if (
             person_id in protected_person_ids
-            or normalize_person_name(person_name) in protected_person_names
+            or not person_name_protection_keys(person_name).isdisjoint(protected_person_names)
         ):
             protected_count += 1
             person_cleanup_db.remove_candidate(person_id)

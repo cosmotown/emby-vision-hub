@@ -15,6 +15,11 @@ import handler.tmdb as tmdb
 import handler.emby as emby
 from handler.douban import DoubanApi
 from ai_translator import AITranslator
+from services.actor_enrichment_safety import (
+    apply_safe_actor_name_translations,
+    deduplicate_cast_by_identity,
+    filter_unsafe_new_cast,
+)
 from utils import contains_chinese
 
 logger = logging.getLogger(__name__)

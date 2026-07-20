@@ -2,6 +2,22 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.16",
+        "published_at": "2026-07-21T00:20:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.16",
+        "changelog": """## 豆瓣演员头像回退修复
+
+### 修复
+- 已确认到同一 TMDb Person 身份的演员，如果 TMDb 没有头像但豆瓣提供头像，允许采用豆瓣头像，不再误判为无头像演员。
+- TMDb 头像仍保持最高优先级；豆瓣头像只作为缺失时的回退，并限制为可信豆瓣图片域名和 HTTP(S) URL。
+- 同时兼容豆瓣在线接口的 `profile_path`、缓存数据的 `avatar.large`/`avatar.normal` 以及 `cover_url` 字段。
+
+### 安全边界
+- 豆瓣头像不能绕过演员身份校验；演员仍必须先解析到有效 TMDb Person ID，并继续按 TMDb/Emby 身份去重。
+- 本版从独立工作树构建，不包含正在开发中的其他 UI 改动。
+""",
+    },
+    {
         "version": "v7.1.15",
         "published_at": "2026-07-20T23:40:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.15",

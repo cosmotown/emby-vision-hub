@@ -16,6 +16,7 @@ import handler.emby as emby
 from handler.douban import DoubanApi
 from ai_translator import AITranslator
 from services.actor_enrichment_safety import (
+    apply_douban_avatar_fallbacks,
     apply_safe_actor_name_translations,
     deduplicate_cast_by_identity,
     filter_unsafe_new_cast,
@@ -239,7 +240,14 @@ def format_douban_cast(douban_api_actors_raw: List[Dict[str, Any]]) -> List[Dict
         seen_names.add(name_zh)
         
         # ▼▼▼ 核心新增：从缓存中安全地提取头像链接 ▼▼▼
-        avatar_url = (item.get("avatar", {}) or {}).get("large")
+        avatar_obj = item.get("avatar") or {}
+        if isinstance(avatar_obj, dict):
+            avatar_url = avatar_obj.get("large") or avatar_obj.get("normal")
+        elif isinstance(avatar_obj, str):
+            avatar_url = avatar_obj
+        else:
+            avatar_url = None
+        avatar_url = avatar_url or item.get("profile_path") or item.get("cover_url")
         # ▲▲▲ 新增结束 ▲▲▲
 
         formatted_candidates.append({

@@ -2620,6 +2620,8 @@ class MediaProcessor:
                     douban_id_to_add = d_actor.get("DoubanCelebrityId")
                     if douban_id_to_add:
                         l_actor["douban_id"] = douban_id_to_add
+                    if d_actor.get("DoubanAvatarUrl"):
+                        l_actor["douban_avatar_url"] = d_actor.get("DoubanAvatarUrl")
                     
                     merged_actors.append(unmatched_local_actors.pop(i))
                     match_found_for_this_douban_actor = True
@@ -2671,7 +2673,8 @@ class MediaProcessor:
                                     "original_name": cached_metadata.get("original_name") or d_actor.get("OriginalName"),
                                     "character": d_actor.get("Role"), "order": 999,
                                     "imdb_id": entry.get("imdb_id"), "douban_id": d_douban_id,
-                                    "emby_person_id": entry.get("emby_person_id")
+                                    "emby_person_id": entry.get("emby_person_id"),
+                                    "douban_avatar_url": d_actor.get("DoubanAvatarUrl")
                                 }
                                 final_cast_map[tmdb_id_from_map] = new_actor_entry
                             match_found = True
@@ -2719,7 +2722,8 @@ class MediaProcessor:
                                         new_actor_entry = {
                                             "id": tmdb_id_from_map, "name": d_actor.get("Name"),
                                             "character": d_actor.get("Role"), "order": 999, "imdb_id": d_imdb_id,
-                                            "douban_id": d_douban_id, "emby_person_id": entry_from_map.get("emby_person_id")
+                                            "douban_id": d_douban_id, "emby_person_id": entry_from_map.get("emby_person_id"),
+                                            "douban_avatar_url": d_actor.get("DoubanAvatarUrl")
                                         }
                                         final_cast_map[tmdb_id_from_map] = new_actor_entry
                                     match_found = True
@@ -2745,7 +2749,8 @@ class MediaProcessor:
                                                     "id": tmdb_id_from_find, "name": d_actor.get("Name"),
                                                     "character": d_actor.get("Role"), "order": 999,
                                                     "imdb_id": d_imdb_id, "douban_id": d_douban_id,
-                                                    "emby_person_id": emby_pid_from_final_check
+                                                    "emby_person_id": emby_pid_from_final_check,
+                                                    "douban_avatar_url": d_actor.get("DoubanAvatarUrl")
                                                 }
                                                 final_cast_map[tmdb_id_from_find] = new_actor_entry
                                             match_found = True
@@ -2773,6 +2778,8 @@ class MediaProcessor:
                                         existing_actor["name"] = new_name
                                         logger.debug(f"    ➜ [合并] 已将演员 (TMDb ID: {tmdb_id_to_process}) 的名字从 '{original_name}' 更新为 '{new_name}'")
                                         merged_count += 1
+                                    if d_actor.get("DoubanAvatarUrl") and not existing_actor.get("profile_path"):
+                                        existing_actor["douban_avatar_url"] = d_actor.get("DoubanAvatarUrl")
                                 
                                 # 情况二：演员不存在，执行新增
                                 else:
@@ -2783,7 +2790,8 @@ class MediaProcessor:
                                         "order": 999,
                                         "imdb_id": d_actor.get("imdb_id_from_api"),
                                         "douban_id": d_actor.get("DoubanCelebrityId"),
-                                        "emby_person_id": None
+                                        "emby_person_id": None,
+                                        "douban_avatar_url": d_actor.get("DoubanAvatarUrl")
                                     }
                                     final_cast_map[tmdb_id_to_process] = new_actor_entry
                                     added_count += 1
@@ -2834,6 +2842,14 @@ class MediaProcessor:
             logger.info(f"  ➜ 新增演员头像信息补全完成，成功为 {supplemented_count}/{total_to_supplement} 位演员补充了头像。")
         else:
             logger.info("  ➜ 没有需要补充头像的新增演员。")
+
+        current_cast_list, douban_avatar_count = actor_utils.apply_douban_avatar_fallbacks(
+            current_cast_list
+        )
+        if douban_avatar_count:
+            logger.info(
+                f"  ➜ TMDb 无头像时采用了 {douban_avatar_count} 张已匹配豆瓣演员头像。"
+            )
 
         original_emby_person_ids = {
             str(actor.get('Id'))

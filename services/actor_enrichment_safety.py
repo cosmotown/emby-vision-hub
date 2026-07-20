@@ -1,5 +1,6 @@
 import re
 from typing import Any, Dict, List
+from urllib.parse import urlparse, urlunparse
 
 
 _LEADING_TRANSLATION_INDEX_RE = re.compile(
@@ -7,6 +8,55 @@ _LEADING_TRANSLATION_INDEX_RE = re.compile(
     r'\d+\s*[.)、:：]|'
     r'\d+(?=[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]))'
 )
+
+_TRUSTED_DOUBAN_AVATAR_HOST_SUFFIXES = (
+    'douban.com',
+    'doubanio.com',
+    'bdstatic.com',
+)
+
+
+def normalize_douban_avatar_url(value: Any) -> str:
+    """Accept only HTTP(S) avatar URLs served by known Douban image hosts."""
+    if not isinstance(value, str):
+        return ''
+    candidate = value.strip()
+    if not candidate:
+        return ''
+    try:
+        parsed = urlparse(candidate)
+    except ValueError:
+        return ''
+    hostname = (parsed.hostname or '').lower().rstrip('.')
+    if parsed.scheme not in {'http', 'https'} or not hostname:
+        return ''
+    if not any(
+        hostname == suffix or hostname.endswith(f'.{suffix}')
+        for suffix in _TRUSTED_DOUBAN_AVATAR_HOST_SUFFIXES
+    ):
+        return ''
+    if parsed.username or parsed.password:
+        return ''
+    return urlunparse(parsed._replace(scheme='https'))
+
+
+def apply_douban_avatar_fallbacks(
+    cast_list: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], int]:
+    """Use a trusted Douban avatar only when the matched TMDb person has no image."""
+    normalized_cast = []
+    adopted_count = 0
+    for actor in cast_list:
+        normalized_actor = actor.copy()
+        douban_avatar = normalize_douban_avatar_url(
+            normalized_actor.pop('douban_avatar_url', None)
+            or normalized_actor.pop('DoubanAvatarUrl', None)
+        )
+        if not normalized_actor.get('profile_path') and douban_avatar:
+            normalized_actor['profile_path'] = douban_avatar
+            adopted_count += 1
+        normalized_cast.append(normalized_actor)
+    return normalized_cast, adopted_count
 
 
 def is_safe_actor_name_translation(original_name: Any, translated_name: Any) -> bool:
@@ -86,7 +136,7 @@ def filter_unsafe_new_cast(
     cast_list: List[Dict[str, Any]],
     original_emby_person_ids=(),
 ) -> List[Dict[str, Any]]:
-    """Require every supplemented cast member to have a TMDb identity and profile image."""
+    """Require every supplemented cast member to have a TMDb identity and safe profile image."""
     original_ids = {
         str(person_id).strip()
         for person_id in original_emby_person_ids

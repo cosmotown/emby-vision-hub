@@ -18,8 +18,13 @@ from ai_translator import AITranslator
 from services.actor_enrichment_safety import (
     apply_douban_avatar_fallbacks,
     apply_safe_actor_name_translations,
+    build_douban_identity_profile,
+    build_tmdb_identity_profile,
     deduplicate_cast_by_identity,
     filter_unsafe_new_cast,
+    normalize_douban_avatar_url,
+    resolve_douban_actor_against_tmdb_cast,
+    select_cast_by_source_order,
 )
 from utils import contains_chinese
 
@@ -222,7 +227,7 @@ def format_douban_cast(douban_api_actors_raw: List[Dict[str, Any]]) -> List[Dict
     if not douban_api_actors_raw:
         return formatted_candidates
 
-    for item in douban_api_actors_raw:
+    for douban_order, item in enumerate(douban_api_actors_raw):
         name_zh = str(item.get("name", "")).strip()
         if not name_zh: 
             continue
@@ -257,6 +262,7 @@ def format_douban_cast(douban_api_actors_raw: List[Dict[str, Any]]) -> List[Dict
             # 修正：根据你提供的JSON，字段应为 latin_name
             "OriginalName": str(item.get("latin_name", "")).strip(), 
             "Role": str(item.get("character", "")).strip(),
+            "DoubanOrder": douban_order,
             "DoubanCelebrityId": douban_id,
             "TmdbPersonId": (
                 item.get("tmdb_person_id")

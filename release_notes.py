@@ -2,6 +2,27 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.1.18",
+        "published_at": "2026-07-21T01:05:00+08:00",
+        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.18",
+        "changelog": """## TMDb/豆瓣双身份演员补充
+
+### 修复
+- TMDb 未收录的豆瓣演员不再一律丢弃；人物详情核验确认没有 IMDb/TMDb 桥接身份后，可使用唯一 Douban Celebrity ID 建立独立人物身份。
+- 缺少跨库 ID 时，姓名与别名只用于检索当前影片的 TMDb 候选；仅在公开生日也一致且候选唯一时合并，姓名疑似相同但证据不足时暂缓新增，完整核对后无候选才按豆瓣独立身份入库。
+- 创建或复用 Emby Person 后写入 `ProviderIds.Douban`，并在人物身份、媒体挂载两次写后复核通过后才保存 Emby Person ID。
+- 移除通过 Emby 姓名或历史译名反查 TMDb 人物的旧路径；姓名和翻译结果只用于展示，不参与身份合并。
+- 新增演员仍必须有稳定外部 ID 和可信头像；TMDb、Douban、IMDb、Emby 任一身份冲突时失败关闭，不覆盖既有映射。
+- 豆瓣演员原始顺位贯穿所有身份核验分支，完整核验后才统一按来源顺序截断，避免主演被易匹配的小配角挤出人数上限。
+- Emby 人物查询和更新改用 `X-Emby-Token` 请求头；豆瓣网络异常也只记录接口路径和异常类型，错误日志不再携带 URL 查询凭据、API key 或签名参数。
+
+### 安全边界
+- 豆瓣在线人物详情关闭、请求失败，或有 IMDb 但 TMDb 反查失败时，本轮暂缓新增，避免把暂时查不到误判为豆瓣独有人物。
+- 不伪造 TMDb Person ID，不按姓名自动合并，也不自动删除现有 Emby 人物。
+- 本版从独立工作树构建，不包含正在开发中的其他 UI 改动。
+""",
+    },
+    {
         "version": "v7.1.17",
         "published_at": "2026-07-21T00:45:00+08:00",
         "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.17",

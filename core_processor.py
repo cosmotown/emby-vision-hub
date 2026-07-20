@@ -2297,6 +2297,14 @@ class MediaProcessor:
                         item_name_for_log=item_name_for_log
                     )
 
+                # TMDb 元数据刷新不会携带豆瓣独有人物；刷新完成后按 Douban ID
+                # 单独创建/复用 Person，并在写后复核通过后再锁定 Emby Person ID。
+                self._sync_douban_only_cast_to_emby(
+                    item_id=item_id,
+                    final_cast=final_processed_cast,
+                    cursor=cursor,
+                )
+
                 # 更新我们自己的数据库缓存
                 self._upsert_media_metadata(
                     cursor=cursor,
@@ -2543,29 +2551,32 @@ class MediaProcessor:
         logger.debug("  ➜ 开始演员数据适配 (反查缓存模式)...")
         
         tmdb_actor_map_by_id = {str(actor.get("id")): actor for actor in tmdb_cast_people}
-        tmdb_actor_map_by_en_name = {str(actor.get("name") or "").lower().strip(): actor for actor in tmdb_cast_people}
-
         final_cast_list = []
         used_tmdb_ids = set()
 
         for emby_actor in emby_cast_people:
             emby_person_id = emby_actor.get("Id")
             emby_tmdb_id = emby_actor.get("ProviderIds", {}).get("Tmdb")
-            emby_name_lower = str(emby_actor.get("Name") or "").lower().strip()
-
             tmdb_match = None
 
             if emby_tmdb_id and str(emby_tmdb_id) in tmdb_actor_map_by_id:
                 tmdb_match = tmdb_actor_map_by_id[str(emby_tmdb_id)]
             else:
-                if emby_name_lower in tmdb_actor_map_by_en_name:
-                    tmdb_match = tmdb_actor_map_by_en_name[emby_name_lower]
-                else:
-                    cache_entry = self.actor_db_manager.get_translation_from_db(cursor, emby_actor.get("Name"), by_translated_text=True)
-                    if cache_entry and cache_entry.get('original_text'):
-                        original_en_name = str(cache_entry['original_text']).lower().strip()
-                        if original_en_name in tmdb_actor_map_by_en_name:
-                            tmdb_match = tmdb_actor_map_by_en_name[original_en_name]
+                provider_ids = emby_actor.get("ProviderIds") or {}
+                identity_entry = None
+                if provider_ids.get("Imdb"):
+                    identity_entry = self.actor_db_manager.find_person_by_any_id(
+                        cursor, imdb_id=provider_ids.get("Imdb")
+                    )
+                if not identity_entry and provider_ids.get("Douban"):
+                    identity_entry = self.actor_db_manager.find_person_by_any_id(
+                        cursor, douban_id=provider_ids.get("Douban")
+                    )
+                confirmed_tmdb_id = str(
+                    (identity_entry or {}).get("tmdb_person_id") or ""
+                ).strip()
+                if confirmed_tmdb_id in tmdb_actor_map_by_id:
+                    tmdb_match = tmdb_actor_map_by_id[confirmed_tmdb_id]
 
             if tmdb_match:
                 tmdb_id_str = str(tmdb_match.get("id"))
@@ -2613,6 +2624,8 @@ class MediaProcessor:
                 target_actor["imdb_id"] = douban_actor.get("ImdbId")
             if douban_actor.get("DoubanAvatarUrl") and not target_actor.get("profile_path"):
                 target_actor["douban_avatar_url"] = douban_actor.get("DoubanAvatarUrl")
+            if douban_actor.get("DoubanOrder") is not None:
+                target_actor["order"] = douban_actor.get("DoubanOrder")
             return target_actor
 
         for d_actor in douban_candidates:
@@ -2668,7 +2681,7 @@ class MediaProcessor:
             if current_actor_count >= limit:
                 logger.info(
                     f"  ➜ 当前演员数 ({current_actor_count}) 已达上限 ({limit})，"
-                    "仍会核对已有演员身份并合并中文信息，但不新增演员。"
+                    "仍会完整核验候选，最后按原始演员顺位统一截断。"
                 )
             else:
                 logger.info(f"  ➜ 当前演员数 ({current_actor_count}) 低于上限 ({limit})，进入补充模式。")
@@ -2679,20 +2692,37 @@ class MediaProcessor:
                 if self.is_stop_requested(): raise InterruptedError("任务中止")
                 d_douban_id = d_actor.get("DoubanCelebrityId")
                 match_found = False
-                if d_douban_id:
+                direct_tmdb_id = str(d_actor.get("TmdbPersonId") or "").strip()
+                if direct_tmdb_id:
+                    if direct_tmdb_id in final_cast_map:
+                        merge_confirmed_douban_actor(final_cast_map[direct_tmdb_id], d_actor)
+                    else:
+                        final_cast_map[direct_tmdb_id] = {
+                            "id": direct_tmdb_id,
+                            "name": d_actor.get("Name"),
+                            "original_name": d_actor.get("OriginalName"),
+                            "character": d_actor.get("Role"),
+                            "order": d_actor.get("DoubanOrder", 999),
+                            "imdb_id": d_actor.get("ImdbId"),
+                            "douban_id": d_douban_id,
+                            "emby_person_id": None,
+                            "douban_avatar_url": d_actor.get("DoubanAvatarUrl"),
+                        }
+                    match_found = True
+                if d_douban_id and not match_found:
                     entry = self.actor_db_manager.find_person_by_any_id(cursor, douban_id=d_douban_id)
                     if entry and entry.get("tmdb_person_id"):
                         tmdb_id_from_map = str(entry.get("tmdb_person_id"))
                         if tmdb_id_from_map in final_cast_map:
                             merge_confirmed_douban_actor(final_cast_map[tmdb_id_from_map], d_actor)
-                        elif len(final_cast_map) < limit:
+                        else:
                             logger.info(f"    ├─ 匹配成功 (通过 豆瓣ID映射): 豆瓣演员 '{d_actor.get('Name')}' -> 加入最终演员表")
                             cached_metadata_map = self.actor_db_manager.get_full_actor_details_by_tmdb_ids(cursor, [int(tmdb_id_from_map)])
                             cached_metadata = cached_metadata_map.get(int(tmdb_id_from_map), {})
                             new_actor_entry = {
                                 "id": tmdb_id_from_map, "name": d_actor.get("Name"),
                                 "original_name": cached_metadata.get("original_name") or d_actor.get("OriginalName"),
-                                "character": d_actor.get("Role"), "order": 999,
+                                "character": d_actor.get("Role"), "order": d_actor.get("DoubanOrder", 999),
                                 "imdb_id": entry.get("imdb_id"), "douban_id": d_douban_id,
                                 "emby_person_id": entry.get("emby_person_id"),
                                 "douban_avatar_url": d_actor.get("DoubanAvatarUrl")
@@ -2703,6 +2733,43 @@ class MediaProcessor:
                     still_unmatched.append(d_actor)
             unmatched_douban_actors = still_unmatched
 
+            # 只有在线人物详情核验完成、并确认没有 IMDb 桥接身份后，
+            # 才能判定为真正的 Douban-only 人物。
+            douban_only_candidates = []
+            tmdb_identity_profiles = None
+            tmdb_identity_profiles_complete = False
+
+            def load_current_title_tmdb_identity_profiles():
+                """Load aliases/birthdays once; incomplete data must fail closed."""
+                nonlocal tmdb_identity_profiles, tmdb_identity_profiles_complete
+                if tmdb_identity_profiles is not None:
+                    return tmdb_identity_profiles, tmdb_identity_profiles_complete
+
+                tmdb_identity_profiles = []
+                tmdb_identity_profiles_complete = True
+                for tmdb_actor in tmdb_cast_people:
+                    if self.is_stop_requested():
+                        raise InterruptedError("任务中止")
+                    tmdb_person_id = tmdb_actor.get("id")
+                    if not tmdb_person_id or not tmdb_api_key:
+                        tmdb_identity_profiles_complete = False
+                        continue
+                    person_details = tmdb.get_person_details_tmdb(
+                        tmdb_person_id,
+                        tmdb_api_key,
+                        append_to_response="translations,external_ids",
+                    )
+                    if not person_details:
+                        tmdb_identity_profiles_complete = False
+                        continue
+                    tmdb_identity_profiles.append(
+                        actor_utils.build_tmdb_identity_profile(
+                            tmdb_actor,
+                            person_details,
+                        )
+                    )
+                return tmdb_identity_profiles, tmdb_identity_profiles_complete
+
             if self.config.get(constants.CONFIG_OPTION_DOUBAN_ENABLE_ONLINE_API, False):
                     logger.info(f"  ➜ 匹配阶段 3: 用IMDb ID进行最终匹配和新增 ({len(unmatched_douban_actors)} 位演员)")
                     still_unmatched_final = []
@@ -2711,11 +2778,14 @@ class MediaProcessor:
 
                         d_douban_id = d_actor.get("DoubanCelebrityId")
                         match_found = False
+                        identity_checked_without_bridge = False
                         if d_douban_id and self.douban_api and self.tmdb_api_key:
                             if self.is_stop_requested(): raise InterruptedError("任务中止")
-                            details = self.douban_api.celebrity_details(d_douban_id)
-                            time_module.sleep(0.3)
-                            d_imdb_id = None
+                            d_imdb_id = str(d_actor.get("ImdbId") or "").strip() or None
+                            details = None
+                            if not d_imdb_id:
+                                details = self.douban_api.celebrity_details(d_douban_id)
+                                time_module.sleep(0.3)
                             if details and not details.get("error"):
                                 try:
                                     info_list = details.get("extra", {}).get("info", [])
@@ -2726,6 +2796,46 @@ class MediaProcessor:
                                                 break
                                 except Exception as e_parse:
                                     logger.warning(f"  ➜ 解析 IMDb ID 时发生意外错误: {e_parse}")
+                            if not d_imdb_id and details and not details.get("error"):
+                                profiles, profiles_complete = (
+                                    load_current_title_tmdb_identity_profiles()
+                                )
+                                douban_profile = actor_utils.build_douban_identity_profile(
+                                    d_actor,
+                                    details,
+                                )
+                                candidate_resolution = (
+                                    actor_utils.resolve_douban_actor_against_tmdb_cast(
+                                        douban_profile,
+                                        profiles,
+                                    )
+                                )
+                                resolution_status = candidate_resolution.get("status")
+                                resolved_tmdb_id = str(
+                                    candidate_resolution.get("tmdb_id") or ""
+                                ).strip()
+                                if (
+                                    profiles_complete
+                                    and resolution_status == "confirmed"
+                                    and resolved_tmdb_id in final_cast_map
+                                ):
+                                    merge_confirmed_douban_actor(
+                                        final_cast_map[resolved_tmdb_id],
+                                        d_actor,
+                                    )
+                                    match_found = True
+                                    logger.info(
+                                        f"    ├─ 双信号确认: 豆瓣演员 '{d_actor.get('Name')}' "
+                                        "与当前 TMDb 演员的别名及生日一致，已合并身份。"
+                                    )
+                                elif profiles_complete and resolution_status == "no_candidate":
+                                    identity_checked_without_bridge = True
+                                else:
+                                    logger.warning(
+                                        f"  ➜ 豆瓣演员 '{d_actor.get('Name')}' 与当前 TMDb 演员"
+                                        "存在姓名/别名候选，但生日证据不足、冲突，或 TMDb 详情未完整获取，"
+                                        "本轮暂缓新增。"
+                                    )
                             
                             if d_imdb_id:
                                 logger.debug(f"  ➜ 为 '{d_actor.get('Name')}' 获取到 IMDb ID: {d_imdb_id}，开始匹配...")
@@ -2735,11 +2845,11 @@ class MediaProcessor:
                                     tmdb_id_from_map = str(entry_from_map.get("tmdb_person_id"))
                                     if tmdb_id_from_map in final_cast_map:
                                         merge_confirmed_douban_actor(final_cast_map[tmdb_id_from_map], d_actor)
-                                    elif len(final_cast_map) < limit:
+                                    else:
                                         logger.debug(f"    ├─ 匹配成功 (通过 IMDb映射): 豆瓣演员 '{d_actor.get('Name')}' -> 加入最终演员表")
                                         new_actor_entry = {
                                             "id": tmdb_id_from_map, "name": d_actor.get("Name"),
-                                            "character": d_actor.get("Role"), "order": 999, "imdb_id": d_imdb_id,
+                                            "character": d_actor.get("Role"), "order": d_actor.get("DoubanOrder", 999), "imdb_id": d_imdb_id,
                                             "douban_id": d_douban_id, "emby_person_id": entry_from_map.get("emby_person_id"),
                                             "douban_avatar_url": d_actor.get("DoubanAvatarUrl")
                                         }
@@ -2766,11 +2876,11 @@ class MediaProcessor:
                                         )
                                         if tmdb_id_from_find in final_cast_map:
                                             merge_confirmed_douban_actor(final_cast_map[tmdb_id_from_find], d_actor)
-                                        elif len(final_cast_map) < limit:
+                                        else:
                                             logger.info(f"    ├─ 匹配成功 (通过 TMDb反查): 豆瓣演员 '{d_actor.get('Name')}' -> 加入最终演员表")
                                             new_actor_entry = {
                                                 "id": tmdb_id_from_find, "name": d_actor.get("Name"),
-                                                "character": d_actor.get("Role"), "order": 999,
+                                                "character": d_actor.get("Role"), "order": d_actor.get("DoubanOrder", 999),
                                                 "imdb_id": d_imdb_id, "douban_id": d_douban_id,
                                                 "emby_person_id": emby_pid_from_final_check,
                                                 "douban_avatar_url": d_actor.get("DoubanAvatarUrl")
@@ -2778,8 +2888,15 @@ class MediaProcessor:
                                             final_cast_map[tmdb_id_from_find] = new_actor_entry
                                         match_found = True
                         
-                        if not match_found:
+                        if not match_found and identity_checked_without_bridge:
                             still_unmatched_final.append(d_actor)
+                        elif not match_found:
+                            logger.warning(
+                                f"  ➜ 豆瓣演员 '{d_actor.get('Name')}' 的跨库身份未能可靠核验，"
+                                "本轮暂缓新增。"
+                            )
+
+                    douban_only_candidates = still_unmatched_final
 
                     # --- 处理新增 ---
                     if still_unmatched_final:
@@ -2806,13 +2923,11 @@ class MediaProcessor:
                                 
                                 # 情况二：演员不存在，执行新增
                                 else:
-                                    if len(final_cast_map) >= limit:
-                                        continue
                                     new_actor_entry = {
                                         "id": tmdb_id_to_process,
                                         "name": d_actor.get("Name"),
                                         "character": d_actor.get("Role"),
-                                        "order": 999,
+                                        "order": d_actor.get("DoubanOrder", 999),
                                         "imdb_id": d_actor.get("imdb_id_from_api"),
                                         "douban_id": d_actor.get("DoubanCelebrityId"),
                                         "emby_person_id": None,
@@ -2825,6 +2940,51 @@ class MediaProcessor:
                             logger.info(f"  ➜ 成功合并了 {merged_count} 位现有演员的豆瓣信息。")
                         if added_count > 0:
                             logger.info(f"  ➜ 成功新增了 {added_count} 位演员到最终列表。")
+
+            douban_only_added = 0
+            douban_only_skipped = 0
+            for d_actor in douban_only_candidates:
+                douban_id = str(d_actor.get("DoubanCelebrityId") or "").strip()
+                avatar_url = actor_utils.normalize_douban_avatar_url(
+                    d_actor.get("DoubanAvatarUrl")
+                )
+                actor_name = str(d_actor.get("Name") or "").strip()
+                if not douban_id or not avatar_url or not actor_name:
+                    douban_only_skipped += 1
+                    continue
+
+                identity_entry = self.actor_db_manager.find_person_by_any_id(
+                    cursor, douban_id=douban_id
+                )
+                if identity_entry and identity_entry.get("tmdb_person_id"):
+                    # 已能锁定 TMDb 的人物必须走 TMDb 路径，不能另建豆瓣身份。
+                    douban_only_skipped += 1
+                    continue
+
+                final_cast_map[f"douban:{douban_id}"] = {
+                    "id": None,
+                    "name": actor_name,
+                    "original_name": d_actor.get("OriginalName"),
+                    "character": d_actor.get("Role"),
+                    "order": d_actor.get("DoubanOrder", 999),
+                    "imdb_id": d_actor.get("ImdbId"),
+                    "douban_id": douban_id,
+                    "emby_person_id": (
+                        identity_entry.get("emby_person_id") if identity_entry else None
+                    ),
+                    "profile_path": avatar_url,
+                    "identity_source": "douban",
+                }
+                douban_only_added += 1
+
+            if douban_only_added:
+                logger.info(
+                    f"  ➜ 以 Douban Celebrity ID 安全补充了 {douban_only_added} 位 TMDb 未收录演员。"
+                )
+            if douban_only_skipped:
+                logger.info(
+                    f"  ➜ 跳过 {douban_only_skipped} 位缺少豆瓣ID/可信头像或身份冲突的演员。"
+                )
         
         # ======================================================================
         # 步骤 4: ★★★ 从TMDb补全头像 ★★★
@@ -2891,7 +3051,7 @@ class MediaProcessor:
         if skipped_unsafe_count:
             logger.warning(
                 f"  ➜ 自动演员补充安全过滤：跳过 {skipped_unsafe_count} 位"
-                "缺少头像、TMDb 身份或身份重复的新增演员。"
+                "缺少头像、外部身份或身份重复的新增演员。"
             )
 
         # ======================================================================
@@ -2919,20 +3079,15 @@ class MediaProcessor:
             limit = 30
 
         original_count = len(current_cast_list)
-        
+        current_cast_list = actor_utils.select_cast_by_source_order(
+            current_cast_list,
+            limit,
+        )
         if original_count > limit:
-            logger.info(f"  ➜ 演员列表总数 ({original_count}) 超过上限 ({limit})，将优先保留有头像的演员后进行截断。")
-            sort_key = lambda x: x.get('order') if x.get('order') is not None and x.get('order') >= 0 else 999
-            with_profile = [actor for actor in current_cast_list if actor.get("profile_path")]
-            without_profile = [actor for actor in current_cast_list if not actor.get("profile_path")]
-            with_profile.sort(key=sort_key)
-            without_profile.sort(key=sort_key)
-            prioritized_list = with_profile + without_profile
-            current_cast_list = prioritized_list[:limit]
-            logger.debug(f"  ➜ 截断后，保留了 {len(with_profile)} 位有头像演员中的 {len([a for a in current_cast_list if a.get('profile_path')])} 位。")
-        else:
-            # ▼▼▼ 核心修改：直接在 current_cast_list 上排序 ▼▼▼
-            current_cast_list.sort(key=lambda x: x.get('order') if x.get('order') is not None and x.get('order') >= 0 else 999)
+            logger.info(
+                f"  ➜ 演员列表总数 ({original_count}) 超过上限 ({limit})，"
+                "已严格按 TMDb/豆瓣原始演员顺位截断。"
+            )
 
         # ======================================================================
         # 步骤 7: ★★★ 翻译和格式化 ★★★
@@ -3064,9 +3219,13 @@ class MediaProcessor:
                 actor["emby_person_id"] = tmdb_to_emby_id_map[tmdb_id_str]
         for actor in final_cast_perfect:
             actor["provider_ids"] = {
-                "Tmdb": str(actor.get("id")),
-                "Imdb": actor.get("imdb_id"),
-                "Douban": actor.get("douban_id")
+                key: value
+                for key, value in {
+                    "Tmdb": str(actor.get("id")) if actor.get("id") else None,
+                    "Imdb": actor.get("imdb_id"),
+                    "Douban": actor.get("douban_id"),
+                }.items()
+                if value
             }
 
         # ======================================================================
@@ -3093,6 +3252,292 @@ class MediaProcessor:
         logger.info(f"  ➜ 成功处理了 {processed_count} 位演员的数据库回写/更新。")
 
         return final_cast_perfect
+
+    def _sync_douban_only_cast_to_emby(
+        self,
+        item_id: str,
+        final_cast: List[Dict[str, Any]],
+        cursor: psycopg2.extensions.cursor,
+    ) -> int:
+        """Provision and attach Douban-only people, accepting only verified identities."""
+        candidates = [
+            actor for actor in final_cast
+            if not actor.get('id')
+            and actor.get('douban_id')
+            and actor.get('profile_path')
+        ]
+        if not candidates or not item_id or item_id == 'pending':
+            return 0
+
+        def detach_unverified_temporary_person(person_id: str, temporary_name: str) -> None:
+            item_details = emby.get_emby_item_details(
+                item_id, self.emby_url, self.emby_api_key, self.emby_user_id
+            )
+            if not item_details:
+                return
+            people = list(item_details.get('People') or [])
+            cleaned_people = [
+                person for person in people
+                if not (
+                    str(person.get('Id') or '').strip() == person_id
+                    or (
+                        not person_id
+                        and str(person.get('Name') or '') == temporary_name
+                    )
+                )
+            ]
+            if len(cleaned_people) != len(people):
+                emby.update_emby_item_details(
+                    item_id,
+                    {'People': cleaned_people},
+                    self.emby_url,
+                    self.emby_api_key,
+                    self.emby_user_id,
+                )
+
+        synced_count = 0
+        for actor in candidates:
+            douban_id = str(actor.get('douban_id') or '').strip()
+            desired_name = str(actor.get('name') or '').strip()
+            desired_role = str(actor.get('character') or '演员').strip() or '演员'
+            if not douban_id or not desired_name:
+                continue
+
+            identity_entry = self.actor_db_manager.find_person_by_any_id(
+                cursor, douban_id=douban_id
+            )
+            if identity_entry and identity_entry.get('tmdb_person_id'):
+                logger.warning(
+                    f"  ➜ Douban {douban_id} 已绑定 TMDb 身份，拒绝按豆瓣独立人物入库。"
+                )
+                continue
+
+            provider_matches = emby.get_people_by_provider_ids(
+                self.emby_url,
+                self.emby_api_key,
+                [f"douban.{douban_id}"],
+                limit=10,
+            )
+            if provider_matches is None:
+                continue
+            provider_match_ids = {
+                str(person.get('Id') or '').strip()
+                for person in provider_matches
+                if str(person.get('Id') or '').strip()
+            }
+            if len(provider_match_ids) > 1:
+                logger.error(
+                    f"  ➜ Douban {douban_id} 在 Emby 中命中多个人物，拒绝自动入库。"
+                )
+                continue
+
+            mapped_emby_id = str(
+                (identity_entry or {}).get('emby_person_id') or ''
+            ).strip()
+            provider_emby_id = next(iter(provider_match_ids), '')
+            if mapped_emby_id and provider_emby_id and mapped_emby_id != provider_emby_id:
+                logger.error(
+                    f"  ➜ Douban {douban_id} 的本地映射与 Emby 外部身份冲突，已跳过。"
+                )
+                continue
+
+            person_id = provider_emby_id or mapped_emby_id
+            person_details = None
+            if person_id:
+                person_details = emby.get_emby_item_details(
+                    person_id,
+                    self.emby_url,
+                    self.emby_api_key,
+                    self.emby_user_id,
+                    fields="Name,ProviderIds,ImageTags",
+                    silent_404=True,
+                )
+                if not person_details:
+                    person_id = ''
+                else:
+                    existing_douban_id = str(
+                        (person_details.get('ProviderIds') or {}).get('Douban') or ''
+                    ).strip()
+                    if existing_douban_id and existing_douban_id != douban_id:
+                        logger.error(
+                            f"  ➜ Emby Person {person_id} 已绑定其他 Douban ID，已跳过。"
+                        )
+                        continue
+
+            created_here = False
+            if not person_id:
+                temporary_name = f"__ETK_DOUBAN_{douban_id}__"
+                item_details = emby.get_emby_item_details(
+                    item_id, self.emby_url, self.emby_api_key, self.emby_user_id
+                )
+                if not item_details:
+                    continue
+                people = list(item_details.get('People') or [])
+                if not any(str(person.get('Name') or '') == temporary_name for person in people):
+                    people.append({
+                        'Name': temporary_name,
+                        'Role': desired_role,
+                        'Type': 'Actor',
+                    })
+                    if not emby.update_emby_item_details(
+                        item_id,
+                        {'People': people},
+                        self.emby_url,
+                        self.emby_api_key,
+                        self.emby_user_id,
+                    ):
+                        continue
+
+                temporary_matches = []
+                for attempt in range(3):
+                    refreshed_item = emby.get_emby_item_details(
+                        item_id, self.emby_url, self.emby_api_key, self.emby_user_id
+                    )
+                    temporary_matches = [
+                        person for person in (refreshed_item or {}).get('People', [])
+                        if str(person.get('Name') or '') == temporary_name
+                        and str(person.get('Id') or '').strip()
+                    ]
+                    if len(temporary_matches) == 1:
+                        break
+                    if attempt < 2:
+                        time_module.sleep(0.4)
+                if len(temporary_matches) != 1:
+                    logger.error(
+                        f"  ➜ 未能唯一确认 Douban {douban_id} 的临时 Emby Person，已跳过。"
+                    )
+                    detach_unverified_temporary_person('', temporary_name)
+                    continue
+                person_id = str(temporary_matches[0]['Id'])
+                person_details = emby.get_emby_item_details(
+                    person_id,
+                    self.emby_url,
+                    self.emby_api_key,
+                    self.emby_user_id,
+                    fields="Name,ProviderIds,ImageTags",
+                )
+                if not person_details:
+                    detach_unverified_temporary_person(person_id, temporary_name)
+                    continue
+                provider_ids = dict(person_details.get('ProviderIds') or {})
+                provider_ids['Douban'] = douban_id
+                if not emby.update_person_details(
+                    person_id,
+                    {'Name': desired_name, 'ProviderIds': provider_ids},
+                    self.emby_url,
+                    self.emby_api_key,
+                    self.emby_user_id,
+                ):
+                    detach_unverified_temporary_person(person_id, temporary_name)
+                    continue
+                created_here = True
+            else:
+                provider_ids = dict((person_details or {}).get('ProviderIds') or {})
+                if not provider_ids.get('Douban'):
+                    provider_ids['Douban'] = douban_id
+                    if not emby.update_person_details(
+                        person_id,
+                        {'ProviderIds': provider_ids},
+                        self.emby_url,
+                        self.emby_api_key,
+                        self.emby_user_id,
+                    ):
+                        continue
+
+            verified_person = emby.get_emby_item_details(
+                person_id,
+                self.emby_url,
+                self.emby_api_key,
+                self.emby_user_id,
+                fields="Name,ProviderIds,ImageTags",
+            )
+            if str(
+                ((verified_person or {}).get('ProviderIds') or {}).get('Douban') or ''
+            ).strip() != douban_id:
+                logger.error(
+                    f"  ➜ Douban {douban_id} 写入 Emby Person 后复核失败，已停止挂载。"
+                )
+                if created_here:
+                    detach_unverified_temporary_person(
+                        person_id, f"__ETK_DOUBAN_{douban_id}__"
+                    )
+                continue
+
+            item_details = emby.get_emby_item_details(
+                item_id, self.emby_url, self.emby_api_key, self.emby_user_id
+            )
+            if not item_details:
+                continue
+            original_people = copy.deepcopy(list(item_details.get('People') or []))
+            people = copy.deepcopy(original_people)
+            attached = False
+            for person in people:
+                if str(person.get('Id') or '').strip() == person_id:
+                    person['Role'] = desired_role
+                    person['Type'] = 'Actor'
+                    attached = True
+                    break
+            if not attached:
+                people.append({
+                    'Id': person_id,
+                    'Name': str((verified_person or {}).get('Name') or desired_name),
+                    'Role': desired_role,
+                    'Type': 'Actor',
+                })
+            if not emby.update_emby_item_details(
+                item_id,
+                {'People': people},
+                self.emby_url,
+                self.emby_api_key,
+                self.emby_user_id,
+            ):
+                continue
+
+            attached_item = emby.get_emby_item_details(
+                item_id, self.emby_url, self.emby_api_key, self.emby_user_id
+            )
+            if not any(
+                str(person.get('Id') or '').strip() == person_id
+                for person in (attached_item or {}).get('People', [])
+            ):
+                logger.error(
+                    f"  ➜ Emby 未确认挂载 Person {person_id}，不写入本地身份映射。"
+                )
+                emby.update_emby_item_details(
+                    item_id,
+                    {'People': original_people},
+                    self.emby_url,
+                    self.emby_api_key,
+                    self.emby_user_id,
+                )
+                continue
+
+            if created_here and not (verified_person or {}).get('ImageTags'):
+                emby.upload_item_primary_image_from_url(
+                    person_id,
+                    actor.get('profile_path'),
+                    self.emby_url,
+                    self.emby_api_key,
+                )
+
+            actor['emby_person_id'] = person_id
+            map_id, action = self.actor_db_manager.upsert_person(
+                cursor,
+                actor,
+                {
+                    'url': self.emby_url,
+                    'api_key': self.emby_api_key,
+                    'user_id': self.emby_user_id,
+                },
+            )
+            if map_id > 0 and action not in {'ERROR', 'CONFLICT_ERROR', 'SKIPPED'}:
+                synced_count += 1
+
+        if synced_count:
+            logger.info(
+                f"  ➜ 已按 Douban Celebrity ID 创建/复用并复核 {synced_count} 位 Emby 演员。"
+            )
+        return synced_count
     
     # --- 一键翻译 ---
     def translate_cast_list_for_editing(self, 

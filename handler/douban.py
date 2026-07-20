@@ -120,7 +120,9 @@ class DoubanApi:
                 return self._make_error_dict("rate_limit", msg, response_json)
             return response_json
         except requests.exceptions.HTTPError as e:
-            msg = str(e)
+            status_code = e.response.status_code if e.response is not None else None
+            msg = f"HTTP {status_code}" if status_code else "HTTP request failed"
+            error_json = None
             if e.response is not None:
                 try:
                     error_json = e.response.json()
@@ -129,16 +131,17 @@ class DoubanApi:
                         msg = "need_login"
                         logger.error(f"豆瓣API请求失败: 需要登录。请在设置中配置有效的豆瓣Cookie。")
                     else:
-                        msg = error_json.get("msg", str(e))
+                        msg = error_json.get("msg", msg)
                 except json.JSONDecodeError:
-                    msg = f"{str(e)} (响应非JSON: {e.response.text[:100]})"
-            logger.error(f"HTTP error on GET {req_url}: {msg}", exc_info=False) # exc_info=False 避免need_login刷屏
-            return self._make_error_dict("http_error", msg, getattr(e.response, 'json', lambda: None)())
+                    pass
+            logger.error(f"HTTP error on GET {url}: {msg}", exc_info=False)
+            return self._make_error_dict("http_error", msg, error_json)
         except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed on GET {req_url}: {e}", exc_info=True)
-            return self._make_error_dict("request_exception", str(e))
-        except json.JSONDecodeError as e:
-            logger.error(f"JSONDecodeError on GET {req_url}: {e}. Response text: {resp.text[:200] if resp else 'N/A'}", exc_info=True)
+            error_type = type(e).__name__
+            logger.error(f"Request failed on GET {url}: {error_type}", exc_info=False)
+            return self._make_error_dict("request_exception", error_type)
+        except json.JSONDecodeError:
+            logger.error(f"JSONDecodeError on GET {url}", exc_info=False)
             return self._make_error_dict("json_decode_error", "无效的JSON响应")
 
     def __post(self, url: str, **kwargs) -> Dict[str, Any]:
@@ -167,12 +170,14 @@ class DoubanApi:
                 # 1. 这是一个预期的“未找到”情况，使用 WARNING 级别日志，而不是 ERROR
                 # 2. 日志内容更友好，明确指出是资源未找到
                 # 3. 最关键：不使用 exc_info=True，这样就不会打印 traceback
-                logger.warning(f"请求的资源未找到 (404 Not Found)，URL: {req_url}")
+                logger.warning(f"请求的资源未找到 (404 Not Found)，接口: {url}")
                 
                 # 4. 返回一个特定的错误字典，方便上层调用者判断具体错误类型
                 #    这里的 "movie_not_found" 对应了日志中的 "movie_not_found"
                 return self._make_error_dict("movie_not_found", f"IMDb ID a la que se consulta no encontrada en Douban")
-            msg = str(e)
+            status_code = e.response.status_code if e.response is not None else None
+            msg = f"HTTP {status_code}" if status_code else "HTTP request failed"
+            error_json = None
             if e.response is not None:
                 try:
                     error_json = e.response.json()
@@ -180,16 +185,17 @@ class DoubanApi:
                         msg = "need_login"
                         logger.error(f"豆瓣API请求失败: 需要登录。请在设置中配置有效的豆瓣Cookie。")
                     else:
-                        msg = error_json.get("msg", str(e))
+                        msg = error_json.get("msg", msg)
                 except json.JSONDecodeError:
-                    msg = f"{str(e)} (响应非JSON: {e.response.text[:100]})"
-            logger.error(f"HTTP error on POST {req_url}: {msg}", exc_info=True)
-            return self._make_error_dict("http_error", msg, getattr(e.response, 'json', lambda: None)())
+                    pass
+            logger.error(f"HTTP error on POST {url}: {msg}", exc_info=False)
+            return self._make_error_dict("http_error", msg, error_json)
         except requests.exceptions.RequestException as e:
-            logger.error(f"Request failed on POST {req_url}: {e}", exc_info=True)
-            return self._make_error_dict("request_exception", str(e))
-        except json.JSONDecodeError as e:
-            logger.error(f"JSONDecodeError on POST {req_url}: {e}. Response text: {resp.text[:200] if resp else 'N/A'}", exc_info=True)
+            error_type = type(e).__name__
+            logger.error(f"Request failed on POST {url}: {error_type}", exc_info=False)
+            return self._make_error_dict("request_exception", error_type)
+        except json.JSONDecodeError:
+            logger.error(f"JSONDecodeError on POST {url}", exc_info=False)
             return self._make_error_dict("json_decode_error", "无效的JSON响应 (POST)")
 
     def imdbid(self, imdbid: str, ts: Optional[str] = None) -> Dict[str, Any]:

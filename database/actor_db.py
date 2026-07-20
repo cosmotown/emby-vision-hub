@@ -293,7 +293,9 @@ class ActorDBManager:
         通过为 ON CONFLICT DO UPDATE 增加 WHERE 条件，实现真正的条件更新。
         这能准确区分数据实际被“更新”和数据因无变化而“未变”的情况，从而解决统计不准的问题。
         """
-        emby_id = str(person_data.get("emby_id") or '').strip() or None
+        emby_id = str(
+            person_data.get("emby_id") or person_data.get("emby_person_id") or ''
+        ).strip() or None
         tmdb_id_raw = person_data.get("id") or person_data.get("tmdb_id")
         imdb_id = str(person_data.get("imdb_id") or '').strip() or None
         douban_id = str(person_data.get("douban_id") or '').strip() or None
@@ -306,8 +308,8 @@ class ActorDBManager:
             except (ValueError, TypeError):
                 pass
 
-        if not tmdb_id:
-            logger.warning(f"upsert_person 调用缺少有效的 tmdb_person_id，跳过。 (原始值: {tmdb_id_raw})")
+        if not tmdb_id and not douban_id:
+            logger.warning("upsert_person 调用缺少 TMDb/Douban 外部身份，跳过。")
             return -1, "SKIPPED"
 
         if not name and emby_id:
@@ -317,6 +319,86 @@ class ActorDBManager:
             name = "Unknown Actor"
 
         try:
+            if douban_id:
+                cursor.execute(
+                    "SELECT * FROM person_identity_map WHERE douban_celebrity_id = %s",
+                    (douban_id,),
+                )
+                douban_record = cursor.fetchone()
+                if douban_record and tmdb_id:
+                    existing_tmdb_id = douban_record.get('tmdb_person_id')
+                    if existing_tmdb_id and int(existing_tmdb_id) != tmdb_id:
+                        logger.error(
+                            "拒绝合并冲突人物身份：Douban %s 已绑定 TMDb %s，新数据为 TMDb %s。",
+                            douban_id, existing_tmdb_id, tmdb_id,
+                        )
+                        return -1, "CONFLICT_ERROR"
+                    cursor.execute(
+                        "SELECT map_id FROM person_identity_map WHERE tmdb_person_id = %s",
+                        (tmdb_id,),
+                    )
+                    tmdb_record = cursor.fetchone()
+                    if tmdb_record and tmdb_record['map_id'] != douban_record['map_id']:
+                        logger.error(
+                            "拒绝自动合并两条既有人物记录：Douban %s 与 TMDb %s 分属不同 map_id。",
+                            douban_id, tmdb_id,
+                        )
+                        return -1, "CONFLICT_ERROR"
+                    existing_emby_id = str(douban_record.get('emby_person_id') or '').strip()
+                    if existing_emby_id and emby_id and existing_emby_id != emby_id:
+                        logger.error(
+                            "拒绝覆盖 Douban %s 已锁定的 Emby Person ID。",
+                            douban_id,
+                        )
+                        return -1, "CONFLICT_ERROR"
+                    cursor.execute(
+                        """
+                        UPDATE person_identity_map SET
+                            primary_name = %s,
+                            emby_person_id = COALESCE(%s, emby_person_id),
+                            tmdb_person_id = %s,
+                            imdb_id = COALESCE(%s, imdb_id),
+                            last_updated_at = NOW()
+                        WHERE map_id = %s
+                        RETURNING map_id
+                        """,
+                        (name, emby_id, tmdb_id, imdb_id, douban_record['map_id']),
+                    )
+                    promoted = cursor.fetchone()
+                    if 'profile_path' in person_data or 'gender' in person_data or 'popularity' in person_data:
+                        self.update_actor_metadata_from_tmdb(cursor, tmdb_id, person_data)
+                    return promoted['map_id'], "UPDATED"
+
+            if not tmdb_id:
+                sql = """
+                    INSERT INTO person_identity_map
+                    (primary_name, emby_person_id, tmdb_person_id, imdb_id, douban_celebrity_id, last_updated_at)
+                    VALUES (%s, %s, NULL, %s, %s, NOW())
+                    ON CONFLICT (douban_celebrity_id) DO UPDATE SET
+                        primary_name = EXCLUDED.primary_name,
+                        emby_person_id = COALESCE(EXCLUDED.emby_person_id, person_identity_map.emby_person_id),
+                        imdb_id = COALESCE(EXCLUDED.imdb_id, person_identity_map.imdb_id),
+                        last_updated_at = NOW()
+                    WHERE
+                        person_identity_map.primary_name IS DISTINCT FROM EXCLUDED.primary_name OR
+                        person_identity_map.emby_person_id IS DISTINCT FROM COALESCE(EXCLUDED.emby_person_id, person_identity_map.emby_person_id) OR
+                        person_identity_map.imdb_id IS DISTINCT FROM COALESCE(EXCLUDED.imdb_id, person_identity_map.imdb_id)
+                    RETURNING map_id, (CASE xmax WHEN 0 THEN 'INSERTED' ELSE 'UPDATED' END) as action
+                """
+                cursor.execute(sql, (name, emby_id, imdb_id, douban_id))
+                result = cursor.fetchone()
+                if result:
+                    return result['map_id'], result['action']
+                cursor.execute(
+                    "SELECT map_id FROM person_identity_map WHERE douban_celebrity_id = %s",
+                    (douban_id,),
+                )
+                existing_record = cursor.fetchone()
+                if not existing_record:
+                    logger.error("未能写入或找到 Douban 人物身份 %s。", douban_id)
+                    return -1, "ERROR"
+                return existing_record['map_id'], "UNCHANGED"
+
             sql = """
                 INSERT INTO person_identity_map 
                 (primary_name, emby_person_id, tmdb_person_id, imdb_id, douban_celebrity_id, last_updated_at)

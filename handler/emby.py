@@ -15,6 +15,7 @@ from urllib3.util.retry import Retry
 from threading import BoundedSemaphore
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+from urllib.parse import urljoin
 
 import config_manager
 import constants
@@ -354,15 +355,13 @@ def get_emby_item_details(item_id: str, emby_server_url: str, emby_api_key: str,
     else:
         fields_to_request = "Type,ProviderIds,People,Path,OriginalTitle,DateCreated,PremiereDate,ProductionYear,ChildCount,RecursiveItemCount,Overview,CommunityRating,OfficialRating,Genres,Studios,Taglines,MediaStreams,TagItems,Tags"
 
-    params = {
-        "api_key": emby_api_key,
-        "Fields": fields_to_request
-    }
+    params = {"Fields": fields_to_request}
+    headers = {'X-Emby-Token': emby_api_key}
     
     params["PersonFields"] = "ImageTags,ProviderIds"
     
     try:
-        response = emby_client.get(url, params=params)
+        response = emby_client.get(url, params=params, headers=headers)
 
         if response.status_code != 200:
             logger.trace(f"响应头部: {response.headers}")
@@ -386,15 +385,14 @@ def get_emby_item_details(item_id: str, emby_server_url: str, emby_api_key: str,
                 logger.warning(f"Emby API未找到项目ID: {item_id} (UserID: {user_id})。URL: {e.request.url}")
         elif e.response.status_code == 401 or e.response.status_code == 403:
             logger.error(
-                f"获取Emby项目详情时发生认证/授权错误 (ItemID: {item_id}, UserID: {user_id}): {e.response.status_code} - {e.response.text[:200]}. URL: {e.request.url}. 请检查API Key和UserID权限。")
+                f"获取Emby项目详情时发生认证/授权错误 (ItemID: {item_id}, UserID: {user_id}): {e.response.status_code} - {e.response.text[:200]}. 请检查API Key和UserID权限。")
         else:
             logger.error(
-                f"获取Emby项目详情时发生HTTP错误 (ItemID: {item_id}, UserID: {user_id}): {e.response.status_code} - {e.response.text[:200]}. URL: {e.request.url}")
+                f"获取Emby项目详情时发生HTTP错误 (ItemID: {item_id}, UserID: {user_id}): {e.response.status_code} - {e.response.text[:200]}")
         return None
     except requests.exceptions.RequestException as e:
-        url_requested = e.request.url if e.request else url
         logger.error(
-            f"获取Emby项目详情时发生请求错误 (ItemID: {item_id}, UserID: {user_id}): {e}. URL: {url_requested}")
+            f"获取Emby项目详情时发生请求错误 (ItemID: {item_id}, UserID: {user_id}): {type(e).__name__}")
         return None
     except Exception as e:
         import traceback
@@ -409,11 +407,11 @@ def update_person_details(person_id: str, new_data: Dict[str, Any], emby_server_
         return False
 
     api_url = f"{emby_server_url.rstrip('/')}/Users/{user_id}/Items/{person_id}"
-    params = {"api_key": emby_api_key}
+    headers = {'X-Emby-Token': emby_api_key}
     wait_for_server_idle(emby_server_url, emby_api_key)
     try:
         logger.trace(f"准备获取 Person 详情 (ID: {person_id}, UserID: {user_id}) at {api_url}")
-        response_get = emby_client.get(api_url, params=params)
+        response_get = emby_client.get(api_url, headers=headers)
         response_get.raise_for_status()
         person_to_update = response_get.json()
     except requests.exceptions.RequestException as e:
@@ -424,11 +422,11 @@ def update_person_details(person_id: str, new_data: Dict[str, Any], emby_server_
         person_to_update[key] = value
     
     update_url = f"{emby_server_url.rstrip('/')}/Items/{person_id}"
-    headers = {'Content-Type': 'application/json'}
+    headers = {'Content-Type': 'application/json', 'X-Emby-Token': emby_api_key}
 
     logger.trace(f"  ➜ 准备更新 Person (ID: {person_id}) 的信息，新数据: {new_data}")
     try:
-        response_post = emby_client.post(update_url, json=person_to_update, headers=headers, params=params)
+        response_post = emby_client.post(update_url, json=person_to_update, headers=headers)
         response_post.raise_for_status()
         logger.trace(f"  ➜ 成功更新 Person (ID: {person_id}) 的信息。")
         return True
@@ -2101,10 +2099,12 @@ def update_emby_item_details(item_id: str, new_data: Dict[str, Any], emby_server
 
         # 3. 执行 POST
         update_url = f"{emby_server_url.rstrip('/')}/Items/{item_id}"
-        params = {"api_key": emby_api_key}
-        headers = {'Content-Type': 'application/json'}
+        headers = {
+            'Content-Type': 'application/json',
+            'X-Emby-Token': emby_api_key,
+        }
 
-        response_post = emby_client.post(update_url, json=item_to_update, headers=headers, params=params)
+        response_post = emby_client.post(update_url, json=item_to_update, headers=headers)
         response_post.raise_for_status()
         
         return True
@@ -2271,6 +2271,89 @@ def get_people_by_provider_ids(
     except Exception as exc:
         logger.error(f"按外部身份查询 Emby 人物失败: {type(exc).__name__}")
         return None
+
+
+def upload_item_primary_image_from_url(
+    item_id: str,
+    image_url: str,
+    base_url: str,
+    api_key: str,
+    max_bytes: int = 10 * 1024 * 1024,
+) -> bool:
+    """Download a trusted Douban image and upload it as an Emby item avatar."""
+    from services.actor_enrichment_safety import normalize_douban_avatar_url
+
+    current_url = normalize_douban_avatar_url(image_url)
+    if not item_id or not current_url or not base_url or not api_key:
+        return False
+
+    response = None
+    try:
+        for _ in range(4):
+            response = emby_client.get(
+                current_url,
+                allow_redirects=False,
+                stream=True,
+                timeout=20,
+            )
+            if response.status_code in {301, 302, 303, 307, 308}:
+                redirect_url = normalize_douban_avatar_url(
+                    urljoin(current_url, response.headers.get('Location', ''))
+                )
+                response.close()
+                response = None
+                if not redirect_url:
+                    return False
+                current_url = redirect_url
+                continue
+            break
+        if response is None:
+            return False
+        response.raise_for_status()
+        content_type = str(response.headers.get('Content-Type') or '').split(';', 1)[0].lower()
+        if content_type not in {'image/jpeg', 'image/png', 'image/webp'}:
+            logger.warning("拒绝上传非图片格式的豆瓣人物头像。")
+            return False
+        declared_size = int(response.headers.get('Content-Length') or 0)
+        if declared_size > max_bytes:
+            logger.warning("拒绝上传超过大小上限的豆瓣人物头像。")
+            return False
+        chunks = []
+        downloaded_size = 0
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            downloaded_size += len(chunk)
+            if downloaded_size > max_bytes:
+                logger.warning("豆瓣人物头像下载超过大小上限，已中止。")
+                return False
+            chunks.append(chunk)
+        if not chunks:
+            return False
+        image_data = base64.b64encode(b''.join(chunks))
+    except Exception as exc:
+        logger.warning(f"下载豆瓣人物头像失败: {type(exc).__name__}")
+        return False
+    finally:
+        if response is not None:
+            response.close()
+
+    upload_url = f"{base_url.rstrip('/')}/Items/{item_id}/Images/Primary"
+    try:
+        upload_response = emby_client.post(
+            upload_url,
+            headers={
+                'X-Emby-Token': api_key,
+                'Content-Type': content_type,
+            },
+            data=image_data,
+            timeout=60,
+        )
+        upload_response.raise_for_status()
+        return True
+    except Exception as exc:
+        logger.warning(f"上传 Emby 人物头像失败 (PersonID: {item_id}): {type(exc).__name__}")
+        return False
 
 
 def delete_person_custom_api(base_url: str, api_key: str, person_id: str) -> bool:

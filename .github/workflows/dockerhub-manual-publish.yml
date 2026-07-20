@@ -6,11 +6,11 @@ on:
       source_ref:
         description: Git branch, tag, or SHA to build
         required: true
-        default: based-on-6.8.9
+        default: main
       image_tag:
         description: Docker image tag to publish
         required: true
-        default: 7.0.0
+        default: 7.2.0
       publish_latest:
         description: Also publish the latest tag
         required: true

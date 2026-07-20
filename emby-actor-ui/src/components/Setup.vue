@@ -8,8 +8,9 @@
         
         <!-- 头部区域：Logo 和 标题 -->
         <div class="setup-header">
-          <img src="../assets/logo.png" alt="Logo" class="setup-logo" />
-          <h2 class="setup-title">Emby Toolkit</h2>
+          <img src="../assets/evh-logo.svg" alt="Emby Vision Hub" class="setup-logo" />
+          <h2 class="setup-title">Emby Vision Hub</h2>
+          <p class="public-brand-kicker">COSMOTOWN EDITION</p>
           <p class="setup-subtitle">初始化配置向导</p>
         </div>
 

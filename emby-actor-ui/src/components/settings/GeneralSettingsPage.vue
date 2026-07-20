@@ -1,6 +1,6 @@
 <!-- src/components/settings/GeneralSettingsPage.vue -->
 <template>
-  <n-layout content-style="padding: 24px;">
+  <n-layout :content-style="{ padding: isMobile ? '12px' : '24px' }" class="general-settings-page">
     <n-space vertical :size="24" style="margin-top: 15px;">
       
       <!-- ★★★ 最终修正: v-if, v-else-if, v-else 现在是正确的同级兄弟关系 ★★★ -->
@@ -9,12 +9,17 @@
           ref="formRef"
           :rules="formRules"
           @submit.prevent="save"
-          label-placement="left"
-          label-width="200"
-          label-align="right"
+          :label-placement="isMobile ? 'top' : 'left'"
+          :label-width="isMobile ? 'auto' : 200"
+          :label-align="isMobile ? 'left' : 'right'"
           :model="configModel"
         >
-          <n-tabs type="line" animated size="large" pane-style="padding: 20px; box-sizing: border-box;">
+          <n-tabs
+            type="line"
+            animated
+            :size="isMobile ? 'medium' : 'large'"
+            :pane-style="`padding: ${isMobile ? 12 : 20}px 0 0; box-sizing: border-box;`"
+          >
             <!-- ================== 标签页 1: 通用设置 ================== -->
             <n-tab-pane name="general" tab="通用设置">
               <n-grid cols="1 l:3" :x-gap="24" :y-gap="24" responsive="screen">
@@ -1061,6 +1066,10 @@ import axios from 'axios';
 const directoryPickerVisible = ref(false);
 const directoryPickerTarget = ref('monitor');
 const directoryPickerInitialPath = ref('/');
+const isMobile = ref(false);
+const checkMobile = () => {
+  isMobile.value = window.innerWidth < 768;
+};
 
 const commonDirectoryParent = (paths) => {
   const value = Array.isArray(paths) && paths.length ? paths[paths.length - 1] : '/';
@@ -1676,6 +1685,8 @@ const handleCorrectSequences = async () => {
   }
 };
 onMounted(() => {
+  checkMobile();
+  window.addEventListener('resize', checkMobile);
   componentIsMounted.value = true;
   unwatchGlobal = watch(loadingConfig, (isLoading) => {
     if (!isLoading && componentIsMounted.value && configModel.value) {
@@ -1701,6 +1712,7 @@ onMounted(() => {
   });
 });
 onUnmounted(() => {
+  window.removeEventListener('resize', checkMobile);
   componentIsMounted.value = false;
   if (unwatchGlobal) unwatchGlobal();
   if (unwatchEmbyConfig) unwatchEmbyConfig();
@@ -1768,5 +1780,21 @@ onUnmounted(() => {
   gap: 8px;
   width: 100%;
   align-items: start;
+}
+
+@media (max-width: 767px) {
+  .general-settings-page :deep(.n-form-item-label) {
+    min-height: 0;
+    padding: 0 0 6px;
+    text-align: left;
+  }
+
+  .general-settings-page :deep(.n-form-item-blank) {
+    min-width: 0;
+  }
+
+  .path-picker-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 </style>

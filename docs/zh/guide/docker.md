@@ -2,6 +2,8 @@
 
 推荐使用 `docker-compose.yml` 方式部署，以下示例与仓库 README 一致，并补充关键说明。
 
+> 兼容说明：7.2.0 更名为 EVH 后，Docker 镜像、容器名、配置目录和数据库名暂时沿用 `emby-toolkit` 标识，老用户可原地升级，无需搬迁 `/config` 或 PostgreSQL 数据。
+
 ## 目录准备
 
 ```bash

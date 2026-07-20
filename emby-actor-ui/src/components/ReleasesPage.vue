@@ -6,10 +6,10 @@
           <template #trigger>
             <n-button @click="showSponsorModal = true" type="primary" ghost>
               <template #icon><n-icon :component="CafeIcon" /></template>
-              请我喝杯奶茶
+              支持 CosmoTown
             </n-button>
           </template>
-          用爱发电不易，您的支持是项目前进的最大动力！
+          您的支持是 CosmoTown 持续维护项目的动力。
         </n-tooltip>
         <n-button tag="a" :href="`https://github.com/${githubRepo}/issues`" target="_blank" secondary>
           <template #icon><n-icon :component="LogoGithub" /></template>
@@ -27,6 +27,12 @@
       </template>
     </n-page-header>
     <n-divider />
+
+    <n-alert title="开源许可与免责声明" type="info" :bordered="false" class="legal-notice">
+      EVH 依据 AGPL-3.0 发布，源代码与修改历史可在
+      <a :href="`https://github.com/${githubRepo}`" target="_blank">项目仓库</a>
+      查看。本软件不提供任何明示或默示担保，也不是 Emby、MoviePilot 或其他第三方服务的官方产品。
+    </n-alert>
 
     <div v-if="isLoading" class="dashboard-card"><n-spin size="large" /></div>
     <div v-else-if="error" class="center-container"><n-alert title="加载错误" type="error">{{ error }}</n-alert></div>
@@ -52,13 +58,13 @@
     </div>
 
     <!-- 支持开发者 模态框 -->
-    <n-modal v-model:show="showSponsorModal" preset="card" style="width: 90%; max-width: 400px;" title="支持开发者" :bordered="false">
+    <n-modal v-model:show="showSponsorModal" preset="card" style="width: 90%; max-width: 400px;" title="支持 CosmoTown" :bordered="false">
       <div class="sponsor-content">
         <n-p>
-          用ai发电也不易，喝杯奶茶行不行！
+          感谢支持 CosmoTown 继续维护 EVH。
         </n-p>
         <n-p>
-          您的支持，哪怕是一点点，都是我持续更新的最大动力。感谢您的慷慨！
+          您的每一份支持，都会用于后续功能开发、测试与文档维护。
         </n-p>
         <n-divider />
         <div class="qr-code-item">
@@ -113,7 +119,7 @@ const dialog = useDialog();
 const appStore = useAppStore();
 
 const githubRepoOwner = 'cosmotown';
-const githubRepoName = 'emby-toolkit';
+const githubRepoName = 'emby-vision-hub';
 const githubRepo = computed(() => `${githubRepoOwner}/${githubRepoName}`);
 
 const isLoading = ref(false);
@@ -130,7 +136,7 @@ let eventSource = null;
 const handleUpdate = () => {
   dialog.warning({
     title: '确认更新',
-    content: '将从 DockerHub 拉取 tzyzero186/emby-toolkit:latest 并重启应用，期间服务将短暂中断。确定要继续吗？',
+    content: '将拉取 EVH 最新稳定镜像并重启应用，期间服务将短暂中断。确定要继续吗？',
     positiveText: '检查并更新',
     negativeText: '取消',
     onPositiveClick: () => {
@@ -243,6 +249,13 @@ onMounted(fetchData);
 }
 .sponsor-content {
   text-align: center;
+}
+.legal-notice {
+  margin-bottom: 20px;
+}
+.legal-notice a {
+  color: var(--app-primary);
+  font-weight: 600;
 }
 .qr-code-item {
   display: flex;

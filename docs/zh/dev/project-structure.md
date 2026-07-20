@@ -3,7 +3,7 @@
 顶层结构概览：
 
 ```
-emby-toolkit/
+emby-vision-hub/
   web_app.py                 # Web 服务入口
   core_processor.py          # 核心处理器
   watchlist_processor.py     # 追剧处理

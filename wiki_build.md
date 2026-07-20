@@ -20,15 +20,15 @@ npm run docs:build
 npm run docs:preview
 ```
 
-由于站点配置了 `base: /emby-toolkit/`，预览时请访问：
+由于站点配置了 `base: /emby-vision-hub/`，预览时请访问：
 
 ```
-http://localhost:4173/emby-toolkit/
+http://localhost:4173/emby-vision-hub/
 ```
 
 ## 发布设置（GitHub Pages）
 
-已配置工作流：`.github/workflows/docs-deploy.yml`。
+已配置工作流：`.github/workflows/deploy.yml`。
 
 需要在 GitHub 仓库设置中确认：
 
@@ -43,5 +43,5 @@ http://localhost:4173/emby-toolkit/
 
 站点基路径：
 
-- 已在 `docs/.vitepress/config.mts` 设置 `base: /emby-toolkit/`。
+- 已在 `docs/.vitepress/config.mts` 设置 `base: /emby-vision-hub/`。
 - 若仓库名或 Pages 路径变化，请同步修改该配置。

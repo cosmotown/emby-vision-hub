@@ -1,154 +1,419 @@
-// src/theme.js (真·最终修复版)
+const THEME_STORAGE_KEY = 'moviepilot-theme-customizer';
 
-export const themes = {
-  // ================= 主题一: 赛博科技 =================
-  default: {
-    name: '赛博科技',
-    light: {
-      custom: { '--card-bg-color': 'rgba(255, 255, 255, 0.85)', '--modal-solid-bg-color': 'rgb(255, 255, 255)', '--card-border-color': 'rgba(0, 0, 0, 0.1)', '--card-shadow-color': 'rgba(0, 0, 0, 0.08)', '--accent-color': '#007aff', '--accent-glow-color': 'rgba(0, 122, 255, 0.2)', '--text-color': '#1a1a1a' },
-      naive: { common: { primaryColor: '#007aff', bodyColor: '#f0f2f5' }, Card: { color: 'rgba(255, 255, 255, 0.85)', borderColor: 'rgba(0, 0, 0, 0.1)' }, Layout: { siderColor: '#f5f7fa' }, Menu: { itemTextColor: '#4c5b6a', itemIconColor: '#4c5b6a', itemTextColorHover: 'var(--n-common-primary-color)', itemIconColorHover: 'var(--n-common-primary-color)', itemTextColorActive: 'var(--n-common-primary-color)', itemIconColorActive: 'var(--n-common-primary-color)', itemTextColorActiveHover: 'var(--n-common-primary-color)', itemIconColorActiveHover: 'var(--n-common-primary-color)' } }
-    },
-    dark: {
-      custom: { '--card-bg-color': 'rgba(26, 27, 30, 0.7)', '--modal-solid-bg-color': 'rgb(26, 27, 30)', '--card-border-color': 'rgba(255, 255, 255, 0.1)', '--card-shadow-color': 'rgba(0, 0, 0, 0.3)', '--accent-color': '#00a1ff', '--accent-glow-color': 'rgba(0, 161, 255, 0.4)', '--text-color': '#ffffff' },
-      naive: {
-        common: { primaryColor: '#00a1ff', primaryColorHover: '#33b4ff', primaryColorPressed: '#0090e6', primaryColorSuppl: '#00a1ff', bodyColor: '#101014', cardColor: 'rgba(26, 27, 30, 0.7)' },
-        Card: { color: 'rgba(26, 27, 30, 0.7)', borderColor: 'rgba(255, 255, 255, 0.1)' }, Layout: { siderColor: '#101418' }, Menu: { itemTextColor: '#a8aeb3', itemIconColor: '#a8aeb3', itemTextColorHover: '#ffffff', itemIconColorHover: '#ffffff', itemTextColorActive: 'var(--n-common-primary-color)', itemIconColorActive: 'var(--n-common-primary-color)', itemTextColorActiveHover: 'var(--n-common-primary-color)', itemIconColorActiveHover: 'var(--n-common-primary-color)' },
-        Switch: { railColorActive: '#00a1ff' }, Slider: { fillColor: '#00a1ff' }, Checkbox: { colorChecked: '#00a1ff', checkMarkColor: '#ffffff', borderChecked: '#00a1ff' }, Button: { textColorPrimary: '#ffffff' }
-      }
-    }
-  },
+export const moviePilotThemeOptions = [
+  { label: '跟随系统', value: 'auto' },
+  { label: '浅色', value: 'light' },
+  { label: '深色', value: 'dark' },
+  { label: '幻紫', value: 'purple' },
+  { label: '透明', value: 'transparent' },
+];
 
-  // ================= 主题二: 玻璃拟态 =================
-  glass: {
-    name: '玻璃拟态',
-    light: {
-      custom: { '--card-bg-color': 'rgba(255, 255, 255, 0.6)', '--modal-solid-bg-color': 'rgb(255, 255, 255)', '--card-border-color': 'rgba(0, 0, 0, 0.1)', '--card-shadow-color': 'rgba(0, 0, 0, 0.1)', '--accent-color': '#e91e63', '--accent-glow-color': 'rgba(233, 30, 99, 0.3)', '--text-color': '#1a1a1a' },
-      naive: { common: { primaryColor: '#e91e63', bodyColor: '#f0f2f5' }, Card: { color: 'rgba(255, 255, 255, 0.6)', borderColor: 'rgba(0, 0, 0, 0.1)' }, Layout: { siderColor: 'rgba(250, 245, 255, 0.7)' }, Menu: { itemTextColor: '#6c5f78', itemIconColor: '#6c5f78', itemTextColorActive: 'var(--n-common-primary-color)', itemIconColorActive: 'var(--n-common-primary-color)' } }
-    },
-    dark: {
-      custom: { '--card-bg-color': 'rgba(30, 30, 30, 0.5)', '--modal-solid-bg-color': 'rgb(30, 30, 30)', '--card-border-color': 'rgba(255, 255, 255, 0.15)', '--card-shadow-color': 'rgba(0, 0, 0, 0.4)', '--accent-color': '#c33cff', '--accent-glow-color': 'rgba(195, 60, 255, 0.5)', '--text-color': '#f0f0f0' },
-      naive: {
-        common: { primaryColor: '#c33cff', primaryColorHover: '#d063ff', primaryColorPressed: '#b623f5', primaryColorSuppl: '#c33cff', bodyColor: '#101014', cardColor: 'rgba(30, 30, 30, 0.5)' },
-        Card: { color: 'rgba(30, 30, 30, 0.5)', borderColor: 'rgba(255, 255, 255, 0.15)' }, Layout: { siderColor: 'rgba(15, 10, 30, 0.6)' }, Menu: { itemTextColor: '#b0a4c7', itemIconColor: '#b0a4c7', itemTextColorActive: '#ffffff', itemIconColorActive: '#ffffff' },
-        Switch: { railColorActive: '#c33cff' }, Slider: { fillColor: '#c33cff' }, Checkbox: { colorChecked: '#c33cff', checkMarkColor: '#ffffff', borderChecked: '#c33cff' }, Button: { textColorPrimary: '#ffffff' }
-      }
-    }
-  },
+export const moviePilotPrimaryColors = [
+  { name: 'Purple', value: '#8D51F9' },
+  { name: 'Indigo', value: '#3F51B5' },
+  { name: 'Blue', value: '#1976D2' },
+  { name: 'Cyan', value: '#00BCD4' },
+  { name: 'Teal', value: '#009688' },
+  { name: 'Green', value: '#4CAF50' },
+  { name: 'Amber', value: '#FFB400' },
+  { name: 'Orange', value: '#FF9800' },
+  { name: 'Coral', value: '#FF4C51' },
+  { name: 'Pink', value: '#E91E63' },
+  { name: 'Sky', value: '#16B1FF' },
+  { name: 'Slate', value: '#607D8B' },
+];
 
-  // ================= 主题三: 落日浪潮 =================
-  synthwave: {
-    name: '落日浪潮',
-    light: {
-      custom: { '--card-bg-color': 'rgba(240, 230, 255, 0.8)', '--modal-solid-bg-color': 'rgb(240, 230, 255)', '--card-border-color': 'rgba(228, 90, 216, 0.6)', '--card-shadow-color': 'rgba(0, 0, 0, 0.1)', '--accent-color': '#ff3d8d', '--accent-glow-color': 'rgba(255, 61, 141, 0.4)', '--text-color': '#1a1a1a' },
-      naive: { common: { primaryColor: '#ff3d8d', bodyColor: '#f0f2f5' }, Card: { color: 'rgba(240, 230, 255, 0.8)', borderColor: 'rgba(228, 90, 216, 0.6)' }, Layout: { siderColor: '#f2eaff' }, Menu: { itemTextColor: '#6c5f78', itemIconColor: '#6c5f78', itemTextColorActive: 'var(--n-common-primary-color)', itemIconColorActive: 'var(--n-common-primary-color)' } }
-    },
-    dark: {
-      custom: { '--card-bg-color': 'rgba(29, 15, 54, 0.75)', '--modal-solid-bg-color': 'rgb(29, 15, 54)', '--card-border-color': 'rgba(255, 110, 199, 0.5)', '--card-shadow-color': 'rgba(0, 0, 0, 0.5)', '--accent-color': '#00f7ff', '--accent-glow-color': 'rgba(0, 247, 255, 0.6)', '--text-color': '#f5f5f5' },
-      naive: {
-        common: { primaryColor: '#00f7ff', primaryColorHover: '#33faff', primaryColorPressed: '#00e0e6', primaryColorSuppl: '#00f7ff', bodyColor: '#101014', cardColor: 'rgba(29, 15, 54, 0.75)' },
-        Card: { color: 'rgba(29, 15, 54, 0.75)', borderColor: 'rgba(255, 110, 199, 0.5)' }, Layout: { siderColor: '#160b2f' }, Menu: { itemTextColor: '#b39ff3', itemIconColor: '#b39ff3', itemTextColorActive: '#ffffff', itemIconColorActive: '#ffffff' },
-        Switch: { railColorActive: '#00f7ff' }, Slider: { fillColor: '#00f7ff' }, Checkbox: { colorChecked: '#00f7ff', checkMarkColor: '#000000', borderChecked: '#00f7ff' }, Button: { textColorPrimary: '#000000' }
-      }
-    }
-  },
+export const moviePilotLayoutOptions = [
+  { label: '垂直', value: 'vertical' },
+  { label: '折叠', value: 'collapsed' },
+  { label: '水平', value: 'horizontal' },
+];
 
-  // ================= 主题四: 全息机甲 =================
-  holo: {
-    name: '全息机甲',
-    light: {
-      custom: { '--card-bg-color': 'rgba(230, 245, 255, 0.85)', '--modal-solid-bg-color': 'rgb(230, 245, 255)', '--card-border-color': 'rgba(20, 120, 220, 0.4)', '--card-shadow-color': 'rgba(0, 0, 0, 0.08)', '--accent-color': '#0d6efd', '--accent-glow-color': 'rgba(13, 110, 253, 0.3)', '--text-color': '#061a40' },
-      naive: { common: { primaryColor: '#0d6efd', bodyColor: '#f0f2f5' }, Card: { color: 'rgba(230, 245, 255, 0.85)', borderColor: 'rgba(20, 120, 220, 0.4)' }, Layout: { siderColor: '#e6f7ff' }, Menu: { itemTextColor: '#061a40', itemIconColor: '#061a40', itemTextColorActive: 'var(--n-common-primary-color)', itemIconColorActive: 'var(--n-common-primary-color)' } }
-    },
-    dark: {
-      custom: { '--card-bg-color': 'rgba(10, 25, 47, 0.8)', '--modal-solid-bg-color': 'rgb(10, 25, 47)', '--card-border-color': 'rgba(100, 255, 218, 0.3)', '--card-shadow-color': 'rgba(0, 0, 0, 0.4)', '--accent-color': '#64ffda', '--accent-glow-color': 'rgba(100, 255, 218, 0.5)', '--text-color': '#ccd6f6' },
-      naive: {
-        common: { primaryColor: '#64ffda', primaryColorHover: '#83ffdf', primaryColorPressed: '#4ff0c8', primaryColorSuppl: '#64ffda', bodyColor: '#0a192f', cardColor: 'rgba(10, 25, 47, 0.8)' },
-        Card: { color: 'rgba(10, 25, 47, 0.8)', borderColor: 'rgba(100, 255, 218, 0.3)' }, Layout: { siderColor: '#0a192f' }, Menu: { itemTextColor: '#8892b0', itemIconColor: '#8892b0', itemTextColorActive: 'var(--n-common-primary-color)', itemIconColorActive: 'var(--n-common-primary-color)' },
-        Switch: { railColorActive: '#64ffda' }, Slider: { fillColor: '#64ffda' }, Checkbox: { colorChecked: '#64ffda', checkMarkColor: '#000000', borderChecked: '#64ffda' }, Button: { textColorPrimary: '#000000' }
-      }
-    }
-  },
+export const moviePilotRadiusOptions = [
+  { label: '无圆角', value: 'none' },
+  { label: '小圆角', value: 'small' },
+  { label: '默认', value: 'default' },
+  { label: '大圆角', value: 'large' },
+  { label: '更大圆角', value: 'extra' },
+];
 
-  // ================= 主题五: 美漫硬派 =================
-  comic: {
-    name: '美漫硬派',
-    light: {
-      custom: { '--card-bg-color': '#f0f0f0', '--modal-solid-bg-color': '#f0f0f0', '--card-border-color': '#000000', '--card-shadow-color': 'rgba(0, 0, 0, 0.2)', '--accent-color': '#d93025', '--accent-glow-color': 'rgba(217, 48, 37, 0.4)', '--text-color': '#000000' },
-      naive: { common: { primaryColor: '#d93025', bodyColor: '#f0f0f0' }, Card: { color: '#f0f0f0', borderColor: '#000000' }, Layout: { siderColor: '#e6e6e6' }, Menu: { itemTextColor: '#333333', itemIconColor: '#333333', itemTextColorActive: '#ffffff', itemIconColorActive: '#ffffff', itemTextColorActiveHover: '#ffffff', itemIconColorActiveHover: '#ffffff' } }
-    },
-    dark: {
-      custom: { '--card-bg-color': '#2c2c2c', '--modal-solid-bg-color': '#2c2c2c', '--card-border-color': '#000000', '--card-shadow-color': 'rgba(0, 0, 0, 0.7)', '--accent-color': '#ffcc00', '--accent-glow-color': 'rgba(255, 204, 0, 0.5)', '--text-color': '#ffffff' },
-      naive: {
-        common: { primaryColor: '#ffcc00', primaryColorHover: '#ffde5c', primaryColorPressed: '#f0c200', primaryColorSuppl: '#ffcc00', bodyColor: '#1e1e1e', cardColor: '#2c2c2c' },
-        Card: { color: '#2c2c2c', borderColor: '#000000' }, Layout: { siderColor: '#3a3a3a' }, Menu: { itemTextColor: '#e0e0e0', itemIconColor: '#e0e0e0', itemTextColorActive: '#000000', itemIconColorActive: '#000000', itemTextColorActiveHover: '#000000', itemIconColorActiveHover: '#000000' },
-        Switch: { railColorActive: '#ffcc00' }, Slider: { fillColor: '#ffcc00' }, Checkbox: { colorChecked: '#ffcc00', checkMarkColor: '#000000', borderChecked: '#ffcc00' }, Button: { textColorPrimary: '#000000' }
-      }
-    }
-  },
+export const moviePilotSkinOptions = [
+  { label: '无边框', value: 'default' },
+  { label: '有边框', value: 'bordered' },
+];
 
-  // ================= 主题六: 森海秘境 =================
-  forest: {
-    name: '森海秘境',
-    light: {
-      custom: { '--card-bg-color': 'rgba(255, 255, 255, 0.8)', '--modal-solid-bg-color': 'rgb(255, 255, 255)', '--card-border-color': 'rgba(46, 125, 50, 0.2)', '--card-shadow-color': 'rgba(0, 0, 0, 0.08)', '--accent-color': '#2E7D32', '--accent-glow-color': 'rgba(46, 125, 50, 0.3)', '--text-color': '#41444B' },
-      naive: {
-        common: { primaryColor: '#2E7D32', primaryColorHover: '#388E3C', primaryColorPressed: '#1B5E20', primaryColorSuppl: '#2E7D32', bodyColor: '#F5F5F0' },
-        Card: { color: 'rgba(255, 255, 255, 0.8)', borderColor: 'rgba(46, 125, 50, 0.2)' }, Layout: { siderColor: '#E8E5DA' }, Menu: { itemTextColor: '#5D6168', itemIconColor: '#5D6168', itemTextColorActive: 'var(--n-common-primary-color)', itemIconColorActive: 'var(--n-common-primary-color)' },
-        Switch: { railColorActive: '#2E7D32' }, Slider: { fillColor: '#2E7D32' }, Checkbox: { colorChecked: '#2E7D32', checkMarkColor: '#ffffff', borderChecked: '#2E7D32' }, Button: { textColorPrimary: '#ffffff' }
-      }
-    },
-    dark: {
-      custom: { '--card-bg-color': 'rgba(32, 36, 32, 0.75)', '--modal-solid-bg-color': 'rgb(32, 36, 32)', '--card-border-color': 'rgba(166, 226, 46, 0.2)', '--card-shadow-color': 'rgba(0, 0, 0, 0.4)', '--accent-color': '#A6E22E', '--accent-glow-color': 'rgba(166, 226, 46, 0.4)', '--text-color': '#E6E6E6' },
-      naive: {
-        common: { primaryColor: '#A6E22E', primaryColorHover: '#b7f04d', primaryColorPressed: '#95cc2a', primaryColorSuppl: '#A6E22E', bodyColor: '#1a1d1a', cardColor: 'rgba(32, 36, 32, 0.75)' },
-        Card: { color: 'rgba(32, 36, 32, 0.75)', borderColor: 'rgba(166, 226, 46, 0.2)' }, Layout: { siderColor: '#202420' }, Menu: { itemTextColor: '#a0a79a', itemIconColor: '#a0a79a', itemTextColorActive: 'var(--n-common-primary-color)', itemIconColorActive: 'var(--n-common-primary-color)' },
-        Switch: { railColorActive: '#A6E22E' }, Slider: { fillColor: '#A6E22E' }, Checkbox: { colorChecked: '#A6E22E', checkMarkColor: '#000000', borderChecked: '#A6E22E' }, Button: { textColorPrimary: '#000000' }
-      }
-    }
-  },
+export const defaultThemeSettings = Object.freeze({
+  theme: 'auto',
+  primaryColor: '#8D51F9',
+  skin: 'default',
+  radius: 'default',
+  shadow: '0',
+  semiDarkMenu: false,
+  layout: 'vertical',
+  transparentOpacity: 0.3,
+  transparentBlur: 10,
+  transparentBackgroundPosterOpacity: 0,
+  transparentBackgroundBlur: 16,
+  transparentGlassQuality: 'lightweight',
+});
 
-  // ================= 主题七: 赤色警戒 =================
-  alert: {
-    name: '赤色警戒',
-    light: {
-      custom: { '--card-bg-color': 'rgba(255, 255, 255, 0.85)', '--modal-solid-bg-color': 'rgb(255, 255, 255)', '--card-border-color': 'rgba(0, 0, 0, 0.1)', '--card-shadow-color': 'rgba(0, 0, 0, 0.1)', '--accent-color': '#F44336', '--accent-glow-color': 'rgba(244, 67, 54, 0.3)', '--text-color': '#222222' },
-      naive: {
-        common: { primaryColor: '#F44336', primaryColorHover: '#E53935', primaryColorPressed: '#C62828', primaryColorSuppl: '#F44336', bodyColor: '#F8F8F8' },
-        Card: { color: 'rgba(255, 255, 255, 0.85)', borderColor: 'rgba(0, 0, 0, 0.1)' }, Layout: { siderColor: '#FFFFFF' }, Menu: { itemTextColor: '#555555', itemIconColor: '#555555', itemTextColorActive: 'var(--n-common-primary-color)', itemIconColorActive: 'var(--n-common-primary-color)' },
-        Switch: { railColorActive: '#F44336' }, Slider: { fillColor: '#F44336' }, Checkbox: { colorChecked: '#F44336', checkMarkColor: '#ffffff', borderChecked: '#F44336' }, Button: { textColorPrimary: '#ffffff' }
-      }
-    },
-    dark: {
-      custom: { '--card-bg-color': 'rgba(25, 25, 25, 0.7)', '--modal-solid-bg-color': 'rgb(25, 25, 25)', '--card-border-color': 'rgba(249, 38, 114, 0.25)', '--card-shadow-color': 'rgba(0, 0, 0, 0.5)', '--accent-color': '#F92672', '--accent-glow-color': 'rgba(249, 38, 114, 0.5)', '--text-color': '#CCCCCC' },
-      naive: {
-        common: { primaryColor: '#F92672', primaryColorHover: '#fc538d', primaryColorPressed: '#f81062', primaryColorSuppl: '#F92672', bodyColor: '#0D0D0D', cardColor: 'rgba(25, 25, 25, 0.7)' },
-        Card: { color: 'rgba(25, 25, 25, 0.7)', borderColor: 'rgba(249, 38, 114, 0.25)' }, Layout: { siderColor: '#141414' }, Menu: { itemTextColor: '#888888', itemIconColor: '#888888', itemTextColorActive: 'var(--n-common-primary-color)', itemIconColorActive: 'var(--n-common-primary-color)' },
-        Switch: { railColorActive: '#F92672' }, Slider: { fillColor: '#F92672' }, Checkbox: { colorChecked: '#F92672', checkMarkColor: '#ffffff', borderChecked: '#F92672' }, Button: { textColorPrimary: '#ffffff' }
-      }
-    }
-  },
+const themeNames = new Set(moviePilotThemeOptions.map((item) => item.value));
+const layoutNames = new Set(moviePilotLayoutOptions.map((item) => item.value));
+const radiusNames = new Set(moviePilotRadiusOptions.map((item) => item.value));
+const skinNames = new Set(moviePilotSkinOptions.map((item) => item.value));
+const glassQualityNames = new Set(['lightweight', 'realtime']);
 
-  // ================= 主题八: 极简风格 (无特效) =================
-  minimal: {
-    name: '极简风格',
-    light: {
-      custom: { '--card-bg-color': '#ffffff', '--modal-solid-bg-color': '#ffffff', '--card-border-color': '#e0e0e0', '--card-shadow-color': 'rgba(0, 0, 0, 0.05)', '--accent-color': '#42b983', '--accent-glow-color': 'transparent', '--text-color': '#333333' },
-      naive: {
-        common: { primaryColor: '#42b983', bodyColor: '#f5f5f5' },
-        Card: { color: '#ffffff', borderColor: '#e0e0e0' },
-        Layout: { siderColor: '#f0f0f0' },
-        Menu: { itemTextColor: '#555555', itemIconColor: '#555555', itemTextColorHover: 'var(--n-common-primary-color)', itemIconColorHover: 'var(--n-common-primary-color)', itemTextColorActive: 'var(--n-common-primary-color)', itemIconColorActive: 'var(--n-common-primary-color)', itemTextColorActiveHover: 'var(--n-common-primary-color)', itemIconColorActiveHover: 'var(--n-common-primary-color)' }
-      }
-    },
-    dark: {
-      custom: { '--card-bg-color': '#2c2c2c', '--modal-solid-bg-color': '#2c2c2c', '--card-border-color': '#444444', '--card-shadow-color': 'rgba(0, 0, 0, 0.2)', '--accent-color': '#66cc99', '--accent-glow-color': 'transparent', '--text-color': '#e0e0e0' },
-      naive: {
-        common: { primaryColor: '#66cc99', primaryColorHover: '#80d4ad', primaryColorPressed: '#5cb88c', primaryColorSuppl: '#66cc99', bodyColor: '#1e1e1e', cardColor: '#2c2c2c' },
-        Card: { color: '#2c2c2c', borderColor: '#444444' },
-        Layout: { siderColor: '#252525' },
-        Menu: { itemTextColor: '#cccccc', itemIconColor: '#cccccc', itemTextColorHover: '#ffffff', itemIconColorHover: '#ffffff', itemTextColorActive: 'var(--n-common-primary-color)', itemIconColorActive: 'var(--n-common-primary-color)', itemTextColorActiveHover: 'var(--n-common-primary-color)', itemIconColorActiveHover: 'var(--n-common-primary-color)' },
-        Switch: { railColorActive: '#66cc99' }, Slider: { fillColor: '#66cc99' }, Checkbox: { colorChecked: '#66cc99', checkMarkColor: '#ffffff', borderChecked: '#66cc99' }, Button: { textColorPrimary: '#ffffff' }
-      }
-    }
-  }
+const clampNumber = (value, fallback, min, max) => {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue)
+    ? Math.min(max, Math.max(min, numericValue))
+    : fallback;
 };
+
+const radiusPixels = {
+  none: '0px',
+  small: '4px',
+  default: '8px',
+  large: '12px',
+  extra: '16px',
+};
+
+const baseThemes = {
+  light: {
+    primary: '#8D51F9',
+    background: '#F4F5FA',
+    surface: '#FFFFFF',
+    surfaceSoft: '#F9F8F9',
+    sidebar: '#FFFFFF',
+    text: '#3A3541',
+    textMuted: '#6E6B7B',
+    border: 'rgba(58, 53, 65, 0.12)',
+    tableHeader: '#F9FAFC',
+    overlay: '#3A3541',
+    overlayOpacity: '0.5',
+  },
+  dark: {
+    primary: '#6E66ED',
+    background: '#0E1116',
+    surface: '#14161F',
+    surfaceSoft: '#373452',
+    sidebar: '#14161F',
+    text: '#E7E3FC',
+    textMuted: 'rgba(231, 227, 252, 0.68)',
+    border: 'rgba(231, 227, 252, 0.12)',
+    tableHeader: '#14161F',
+    overlay: '#191D21',
+    overlayOpacity: '0.6',
+  },
+  purple: {
+    primary: '#8D51F9',
+    background: '#28243D',
+    surface: '#312D4B',
+    surfaceSoft: '#373452',
+    sidebar: '#312D4B',
+    text: '#E7E3FC',
+    textMuted: 'rgba(231, 227, 252, 0.68)',
+    border: 'rgba(231, 227, 252, 0.12)',
+    tableHeader: '#3D3759',
+    overlay: '#2C2942',
+    overlayOpacity: '0.6',
+  },
+  transparent: {
+    primary: '#A370F7',
+    background: '#1C1C1C',
+    surface: 'rgba(30, 30, 30, 0.30)',
+    surfaceSoft: 'rgba(30, 30, 30, 0.20)',
+    sidebar: 'rgba(30, 30, 30, 0.20)',
+    text: '#E7E3FC',
+    textMuted: 'rgba(255, 255, 255, 0.65)',
+    border: 'rgba(255, 255, 255, 0.12)',
+    tableHeader: 'rgba(30, 30, 30, 0.30)',
+    overlay: '#000000',
+    overlayOpacity: '0.7',
+  },
+};
+
+export function getMoviePilotThemePrimary(themeName) {
+  const resolvedTheme = resolveThemeName(themeName);
+  return (baseThemes[resolvedTheme] || baseThemes.light).primary;
+}
+
+const normalizeHex = (value) => (
+  typeof value === 'string' && /^#[\da-f]{6}$/i.test(value)
+    ? value.toUpperCase()
+    : defaultThemeSettings.primaryColor
+);
+
+export function normalizeThemeSettings(settings = {}) {
+  const shadow = String(settings.shadow ?? defaultThemeSettings.shadow);
+  const numericShadow = Number.parseInt(shadow, 10);
+
+  return {
+    theme: themeNames.has(settings.theme) ? settings.theme : defaultThemeSettings.theme,
+    primaryColor: normalizeHex(settings.primaryColor),
+    skin: skinNames.has(settings.skin) ? settings.skin : defaultThemeSettings.skin,
+    radius: radiusNames.has(settings.radius) ? settings.radius : defaultThemeSettings.radius,
+    shadow: Number.isInteger(numericShadow) && numericShadow >= 0 && numericShadow <= 24
+      ? String(numericShadow)
+      : defaultThemeSettings.shadow,
+    semiDarkMenu: typeof settings.semiDarkMenu === 'boolean'
+      ? settings.semiDarkMenu
+      : defaultThemeSettings.semiDarkMenu,
+    layout: layoutNames.has(settings.layout) ? settings.layout : defaultThemeSettings.layout,
+    transparentOpacity: clampNumber(
+      settings.transparentOpacity,
+      defaultThemeSettings.transparentOpacity,
+      0,
+      1,
+    ),
+    transparentBlur: clampNumber(
+      settings.transparentBlur,
+      defaultThemeSettings.transparentBlur,
+      0,
+      30,
+    ),
+    transparentBackgroundPosterOpacity: clampNumber(
+      settings.transparentBackgroundPosterOpacity,
+      defaultThemeSettings.transparentBackgroundPosterOpacity,
+      0,
+      1,
+    ),
+    transparentBackgroundBlur: clampNumber(
+      settings.transparentBackgroundBlur,
+      defaultThemeSettings.transparentBackgroundBlur,
+      0,
+      30,
+    ),
+    transparentGlassQuality: glassQualityNames.has(settings.transparentGlassQuality)
+      ? settings.transparentGlassQuality
+      : defaultThemeSettings.transparentGlassQuality,
+  };
+}
+
+export function loadThemeSettings() {
+  try {
+    const moviePilotSettings = JSON.parse(localStorage.getItem(THEME_STORAGE_KEY) || '{}');
+    if (Object.keys(moviePilotSettings).length > 0) {
+      return normalizeThemeSettings(moviePilotSettings);
+    }
+  } catch (error) {
+    console.warn('读取 MoviePilot 主题设置失败，将使用默认主题。', error);
+  }
+
+  // 只迁移旧版明暗偏好，不再迁移旧版 Toolkit 皮肤。
+  const legacyDark = localStorage.getItem('isDark');
+  return normalizeThemeSettings({ theme: legacyDark === 'true' ? 'dark' : 'auto' });
+}
+
+export function saveThemeSettings(settings) {
+  localStorage.setItem(THEME_STORAGE_KEY, JSON.stringify(normalizeThemeSettings(settings)));
+}
+
+export function resolveThemeName(themeName) {
+  if (themeName !== 'auto') return themeName;
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+export function isDarkTheme(themeName) {
+  return ['dark', 'purple', 'transparent'].includes(resolveThemeName(themeName));
+}
+
+function hexToRgb(hex) {
+  const value = normalizeHex(hex).slice(1);
+  return [0, 2, 4].map((offset) => Number.parseInt(value.slice(offset, offset + 2), 16));
+}
+
+function alpha(hex, opacity) {
+  const [red, green, blue] = hexToRgb(hex);
+  return `rgba(${red}, ${green}, ${blue}, ${opacity})`;
+}
+
+function colorShift(hex, amount) {
+  const [red, green, blue] = hexToRgb(hex);
+  const shift = (channel) => Math.max(0, Math.min(255, channel + amount));
+  return `#${[shift(red), shift(green), shift(blue)]
+    .map((channel) => channel.toString(16).padStart(2, '0'))
+    .join('')}`;
+}
+
+export function buildTheme(settings) {
+  const normalized = normalizeThemeSettings(settings);
+  const resolvedTheme = resolveThemeName(normalized.theme);
+  const dark = ['dark', 'purple', 'transparent'].includes(resolvedTheme);
+  const palette = baseThemes[resolvedTheme] || baseThemes.light;
+  // MoviePilot 为每种主题配置了不同的默认主色；用户选择自定义色后再覆盖默认值。
+  const primary = normalized.primaryColor === defaultThemeSettings.primaryColor
+    ? palette.primary
+    : normalized.primaryColor;
+  const radius = radiusPixels[normalized.radius];
+  const shadowLevel = Number.parseInt(normalized.shadow, 10);
+  const showBorder = normalized.skin === 'bordered';
+  const cardShadow = shadowLevel === 0
+    ? 'none'
+    : `0 ${Math.max(2, Math.round(shadowLevel / 3))}px ${Math.max(8, shadowLevel * 2)}px rgba(0, 0, 0, ${dark ? 0.34 : 0.14})`;
+  const sidebar = normalized.semiDarkMenu && !dark ? baseThemes.dark.sidebar : palette.sidebar;
+  const sidebarText = normalized.semiDarkMenu && !dark ? baseThemes.dark.text : palette.text;
+  const border = showBorder ? palette.border : 'transparent';
+  const transparentOpacity = normalized.transparentOpacity;
+  const transparentOpacityLight = Math.min(1, transparentOpacity * 0.67);
+  const transparentOpacityHeavy = Math.min(1, transparentOpacity * 1.67);
+
+  return {
+    settings: normalized,
+    resolvedTheme,
+    dark,
+    custom: {
+      '--app-background': palette.background,
+      '--app-surface': palette.surface,
+      '--app-surface-soft': palette.surfaceSoft,
+      '--app-sidebar': sidebar,
+      '--app-sidebar-text': sidebarText,
+      '--app-text': palette.text,
+      '--app-text-muted': palette.textMuted,
+      '--app-border': border,
+      '--app-border-subtle': palette.border,
+      '--app-radius': radius,
+      '--app-shadow': cardShadow,
+      '--app-primary': primary,
+      '--app-primary-soft': alpha(primary, dark ? 0.22 : 0.12),
+      '--app-primary-glow': alpha(primary, 0.28),
+      '--app-table-header': palette.tableHeader,
+      '--app-overlay': palette.overlay,
+      '--app-overlay-opacity': palette.overlayOpacity,
+      '--transparent-opacity': transparentOpacity.toString(),
+      '--transparent-opacity-light': transparentOpacityLight.toString(),
+      '--transparent-opacity-heavy': transparentOpacityHeavy.toString(),
+      '--transparent-blur': `${normalized.transparentBlur}px`,
+      '--transparent-blur-light': `${normalized.transparentBlur * 0.6}px`,
+      '--transparent-blur-heavy': `${normalized.transparentBlur * 1.6}px`,
+      '--transparent-background-poster-opacity': (1 - normalized.transparentBackgroundPosterOpacity).toString(),
+      '--transparent-background-blur': `${normalized.transparentBackgroundBlur}px`,
+      '--app-backdrop-blur': resolvedTheme === 'transparent' ? `${normalized.transparentBackgroundBlur}px` : '0px',
+      '--app-backdrop-scale': resolvedTheme === 'transparent' ? '1.03' : '1',
+      '--app-backdrop-shade': '0',
+      '--card-bg-color': palette.surface,
+      '--modal-solid-bg-color': resolvedTheme === 'transparent' ? 'rgba(30, 30, 30, 0.50)' : palette.surface,
+      '--card-border-color': border,
+      '--card-shadow-color': dark ? 'rgba(0, 0, 0, 0.34)' : 'rgba(0, 0, 0, 0.12)',
+      '--accent-color': primary,
+      '--accent-glow-color': alpha(primary, 0.18),
+      '--text-color': palette.text,
+    },
+    naive: {
+      common: {
+        primaryColor: primary,
+        primaryColorHover: colorShift(primary, 18),
+        primaryColorPressed: colorShift(primary, -18),
+        primaryColorSuppl: primary,
+        bodyColor: palette.background,
+        cardColor: palette.surface,
+        modalColor: resolvedTheme === 'transparent' ? 'rgba(30, 30, 30, 0.50)' : palette.surface,
+        popoverColor: resolvedTheme === 'transparent' ? 'rgba(30, 30, 30, 0.50)' : palette.surface,
+        textColorBase: palette.text,
+        textColor1: palette.text,
+        textColor2: palette.textMuted,
+        textColor3: palette.textMuted,
+        dividerColor: palette.border,
+        borderColor: palette.border,
+        inputColor: resolvedTheme === 'transparent' ? 'transparent' : palette.surface,
+        tableColor: palette.surface,
+        actionColor: palette.surfaceSoft,
+        hoverColor: alpha(primary, dark ? 0.10 : 0.04),
+        borderRadius: radius,
+      },
+      Card: {
+        color: palette.surface,
+        borderColor: border,
+        borderRadius: radius,
+      },
+      Layout: {
+        color: palette.background,
+        headerColor: palette.surface,
+        siderColor: sidebar,
+      },
+      Menu: {
+        color: 'transparent',
+        itemColorActive: primary,
+        itemColorActiveHover: colorShift(primary, 10),
+        itemTextColor: sidebarText,
+        itemIconColor: sidebarText,
+        itemTextColorActive: '#FFFFFF',
+        itemIconColorActive: '#FFFFFF',
+        itemTextColorActiveHover: '#FFFFFF',
+        itemIconColorActiveHover: '#FFFFFF',
+        itemBorderRadius: radius,
+      },
+      Button: {
+        borderRadiusMedium: radius,
+        textColorPrimary: '#FFFFFF',
+        textColorHoverPrimary: '#FFFFFF',
+        textColorPressedPrimary: '#FFFFFF',
+        textColorFocusPrimary: '#FFFFFF',
+        textColorDisabledPrimary: '#FFFFFF',
+      },
+      Radio: {
+        buttonColorActive: primary,
+        buttonTextColorActive: '#FFFFFF',
+        buttonBorderColorActive: primary,
+        buttonBoxShadow: `inset 0 0 0 1px ${palette.border}`,
+        buttonBoxShadowHover: `inset 0 0 0 1px ${primary}`,
+        buttonBoxShadowFocus: `inset 0 0 0 1px ${primary}, 0 0 0 2px ${alpha(primary, 0.22)}`,
+      },
+      Input: {
+        borderRadius: radius,
+        color: resolvedTheme === 'transparent' ? 'transparent' : palette.surface,
+        colorFocus: resolvedTheme === 'transparent' ? 'transparent' : palette.surface,
+      },
+      Select: { peers: { InternalSelection: { borderRadius: radius } } },
+      DataTable: {
+        thColor: palette.tableHeader,
+        tdColor: resolvedTheme === 'transparent' ? 'transparent' : palette.surface,
+        tdColorHover: alpha(primary, dark ? 0.10 : 0.04),
+        borderColor: palette.border,
+      },
+      Drawer: { color: resolvedTheme === 'transparent' ? 'rgba(30, 30, 30, 0.50)' : palette.surface },
+    },
+  };
+}
+
+export function applyThemeToDocument(theme) {
+  const root = document.documentElement;
+  const body = document.body;
+
+  Object.entries(theme.custom).forEach(([key, value]) => root.style.setProperty(key, value));
+  root.classList.toggle('dark', theme.dark);
+  root.classList.toggle('light', !theme.dark);
+  const transparentTheme = theme.resolvedTheme === 'transparent';
+  root.classList.toggle(
+    'transparent-glass-lightweight',
+    transparentTheme && theme.settings.transparentGlassQuality === 'lightweight',
+  );
+  root.classList.toggle(
+    'transparent-glass-realtime',
+    transparentTheme && theme.settings.transparentGlassQuality === 'realtime',
+  );
+  root.classList.toggle('transparent-blur-disabled', transparentTheme && theme.settings.transparentBlur <= 0);
+  root.classList.toggle(
+    'transparent-background-blur-disabled',
+    transparentTheme && theme.settings.transparentBackgroundBlur <= 0,
+  );
+  root.dataset.theme = theme.resolvedTheme;
+  root.dataset.themePreference = theme.settings.theme;
+  root.dataset.themeLayout = theme.settings.layout;
+  root.dataset.themeRadius = theme.settings.radius;
+  root.dataset.themeShadow = theme.settings.shadow;
+  root.dataset.themeSkin = theme.settings.skin;
+  root.dataset.themeSemiDarkMenu = String(theme.settings.semiDarkMenu);
+  root.style.colorScheme = theme.dark ? 'dark' : 'light';
+
+  if (body) {
+    body.dataset.theme = theme.resolvedTheme;
+    body.dataset.themePreference = theme.settings.theme;
+    body.dataset.themeLayout = theme.settings.layout;
+    body.style.colorScheme = theme.dark ? 'dark' : 'light';
+  }
+}
+
+export function resetThemeSettings() {
+  return { ...defaultThemeSettings };
+}

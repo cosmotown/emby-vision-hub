@@ -1,4 +1,4 @@
-name: Docker Image CI & CD for Emby Toolkit
+name: Docker Image CI & CD for EVH
 
 on:
   workflow_dispatch:

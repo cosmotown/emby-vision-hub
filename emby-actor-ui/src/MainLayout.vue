@@ -1,280 +1,455 @@
-<!-- src/MainLayout.vue -->
 <template>
-  <n-layout style="height: 100vh; position: relative;">
-    <n-layout-header :bordered="false" class="app-header">
-      <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
-        
-        <!-- 左侧：Logo 与 菜单按钮 -->
-        <div style="display: flex; align-items: center;">
-          <!-- 移动端显示的汉堡菜单按钮 -->
-          <n-button 
-            v-if="isMobile" 
-            text 
-            style="font-size: 24px; margin-right: 12px;" 
-            @click="collapsed = !collapsed"
-          >
-            <n-icon :component="MenuOutline" />
-          </n-button>
-
-          <span class="text-effect">
-            <img
-              :src="logo"
-              alt="Logo"
-              style="height: 1.5em; vertical-align: middle; margin-right: 0.3em;"
-            />
-            <span v-if="!isMobile || !collapsed">Emby Toolkit</span>
-          </span>
+  <n-layout class="app-shell">
+    <div class="app-backdrop" aria-hidden="true" />
+    <n-layout-header class="app-header" :bordered="false">
+      <div class="header-brand">
+        <n-button v-if="isMobile" text class="mobile-menu-button" aria-label="打开功能导航" @click="mobileMenuOpen = true">
+          <template #icon><n-icon :component="MenuOutline" /></template>
+        </n-button>
+        <img :src="logo" alt="Emby Vision Hub" class="brand-logo" />
+        <div class="brand-copy">
+          <strong>EMBY VISION HUB</strong>
+          <span>COSMOTOWN EDITION</span>
         </div>
+      </div>
 
-        <!-- 中间：任务状态 (仅桌面端显示) -->
-        <div 
-          v-if="!isMobile && authStore.isAdmin && props.taskStatus && props.taskStatus.current_action !== '空闲' && props.taskStatus.current_action !== '无'"
-          class="header-task-status"
+      <div
+        v-if="!isMobile && authStore.isAdmin && hasActiveTask"
+        class="header-task-status"
+      >
+        <n-spin v-if="props.taskStatus?.is_running" size="small" />
+        <n-icon v-else :component="TimerOutline" size="18" />
+        <div class="task-copy">
+          <strong>{{ props.taskStatus.current_action }}</strong>
+          <span>{{ props.taskStatus.message }}</span>
+        </div>
+        <n-progress
+          v-if="props.taskStatus?.is_running && props.taskStatus.progress >= 0"
+          type="line"
+          :percentage="props.taskStatus.progress"
+          :show-indicator="false"
+          processing
+          class="task-progress"
+        />
+        <n-button
+          v-if="props.taskStatus?.is_running"
+          type="error"
+          size="tiny"
+          circle
+          secondary
+          @click="triggerStopTask"
         >
-          <div class="status-content">
-            <n-text class="status-text">
-              <n-spin 
-                v-if="props.taskStatus.is_running" 
-                size="small" 
-                style="margin-right: 8px; vertical-align: middle;" 
-              />
-              <n-icon 
-                v-else 
-                :component="SchedulerIcon" 
-                size="18" 
-                style="margin-right: 8px; vertical-align: middle; opacity: 0.6;" 
-              />
-              <strong :style="{ color: props.taskStatus.is_running ? '#2080f0' : 'inherit' }">
-                {{ props.taskStatus.current_action }}
-              </strong>
-              <span class="status-divider">-</span>
-              <span class="status-message">{{ props.taskStatus.message }}</span>
-            </n-text>
-            
-            <n-progress
-              v-if="props.taskStatus.is_running && props.taskStatus.progress >= 0"
-              type="line"
-              :percentage="props.taskStatus.progress"
-              :show-indicator="false"
-              processing
-              status="info"
-              style="width: 100px; margin: 0 12px;"
-            />
+          <template #icon><n-icon :component="Stop" /></template>
+        </n-button>
+      </div>
 
-            <n-tooltip trigger="hover">
-              <template #trigger>
-                <n-button
-                  v-if="props.taskStatus.is_running"
-                  type="error"
-                  size="tiny"
-                  circle
-                  secondary
-                  @click="triggerStopTask"
-                >
-                  <template #icon><n-icon :component="StopIcon" /></template>
-                </n-button>
-              </template>
-              停止任务
-            </n-tooltip>
-          </div>
-        </div>
-
-        <!-- 右侧：工具栏 -->
-        <div style="display: flex; align-items: center; gap: 8px;">
-            <!-- 桌面端显示的工具按钮 -->
-            <template v-if="!isMobile">
-              <n-button-group v-if="authStore.isAdmin" size="small">
-                <n-tooltip>
-                  <template #trigger>
-                    <n-button @click="isRealtimeLogVisible = true" circle>
-                      <template #icon><n-icon :component="ReaderOutline" /></template>
-                    </n-button>
-                  </template>
-                  实时日志
-                </n-tooltip>
-                <n-tooltip>
-                  <template #trigger>
-                    <n-button @click="isHistoryLogVisible = true" circle>
-                      <template #icon><n-icon :component="ArchiveOutline" /></template>
-                    </n-button>
-                  </template>
-                  历史日志
-                </n-tooltip>
-              </n-button-group>
-            </template>
-
-            <!-- 用户名下拉菜单 (移动端简化显示) -->
-            <n-dropdown 
-              v-if="authStore.isLoggedIn" 
-              trigger="hover" 
-              :options="userOptions" 
-              @select="handleUserSelect"
-            >
-              <div style="display: flex; align-items: center; cursor: pointer; gap: 4px;">
-                <span style="font-size: 14px;">
-                  {{ isMobile ? '' : `欢迎, ${authStore.username}` }}
-                </span>
-                <!-- 移动端只显示一个图标或头像占位 -->
-                <n-icon v-if="isMobile" size="20" :component="UserCenterIcon" />
-                <svg v-else xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24"><path fill="currentColor" d="m7 10l5 5l5-5z"></path></svg>
-              </div>
-            </n-dropdown>
-
-            <!-- 桌面端显示版本号和主题 -->
-            <template v-if="!isMobile">
-              <span style="font-size: 12px; color: #999;">v{{ appVersion }}</span>
-
-              <n-select
-                :value="props.selectedTheme"
-                @update:value="newValue => emit('update:selected-theme', newValue)"
-                :options="themeOptions"
-                size="small"
-                style="width: 120px;"
-              />
-              
-              <n-tooltip v-if="props.selectedTheme === 'custom'">
-                <template #trigger>
-                  <n-button @click="emit('edit-custom-theme')" circle size="small">
-                    <template #icon><n-icon :component="PaletteIcon" /></template>
-                  </n-button>
-                </template>
-                编辑我的专属主题
-              </n-tooltip>
-
-              <n-tooltip>
-                <template #trigger>
-                  <n-button @click="setRandomTheme" circle size="small">
-                    <template #icon><n-icon :component="ShuffleIcon" /></template>
-                  </n-button>
-                </template>
-                随机主题
-              </n-tooltip>
-            </template>
-
-            <!-- 明暗模式切换器 (始终显示) -->
-            <n-switch 
-              :value="props.isDark" 
-              @update:value="newValue => emit('update:is-dark', newValue)"
-              size="small"
-            >
-              <template #checked-icon><n-icon :component="MoonIcon" /></template>
-              <template #unchecked-icon><n-icon :component="SunnyIcon" /></template>
-            </n-switch>
-          </div>
+      <div class="header-actions">
+        <n-tooltip v-if="!isMobile && authStore.isAdmin">
+          <template #trigger>
+            <n-button quaternary circle aria-label="查看实时日志" @click="isRealtimeLogVisible = true">
+              <template #icon><n-icon :component="ReaderOutline" /></template>
+            </n-button>
+          </template>
+          实时日志
+        </n-tooltip>
+        <n-tooltip v-if="!isMobile && authStore.isAdmin">
+          <template #trigger>
+            <n-button quaternary circle aria-label="查看历史日志" @click="isHistoryLogVisible = true">
+              <template #icon><n-icon :component="ArchiveOutline" /></template>
+            </n-button>
+          </template>
+          历史日志
+        </n-tooltip>
+        <n-dropdown
+          v-if="authStore.isLoggedIn"
+          trigger="click"
+          placement="bottom-end"
+          :options="userOptions"
+          :menu-props="userMenuProps"
+          @select="handleUserSelect"
+        >
+          <button type="button" class="user-menu-button" aria-label="打开用户菜单">
+            <span class="user-avatar">{{ usernameInitial }}</span>
+            <span v-if="!isMobile" class="user-menu-copy">
+              <strong>{{ authStore.username }}</strong>
+              <small>{{ authStore.isAdmin ? '管理员' : '用户' }}</small>
+            </span>
+          </button>
+        </n-dropdown>
       </div>
     </n-layout-header>
-    
-    <n-layout has-sider style="height: calc(100vh - 60px); position: relative;">
-      <!-- 遮罩层：仅在移动端且侧边栏展开时显示，点击关闭侧边栏 -->
-      <div 
-        v-if="isMobile && !collapsed" 
+
+    <div v-if="isHorizontal" class="horizontal-navigation">
+      <n-menu
+        mode="horizontal"
+        responsive
+        :options="horizontalMenuOptions"
+        :value="activeMenuKey"
+        @update:value="handleMenuUpdate"
+      />
+    </div>
+
+    <n-layout
+      has-sider
+      class="app-body"
+      :class="{ 'with-horizontal-navigation': isHorizontal }"
+    >
+      <div
+        v-if="isMobile && mobileMenuOpen"
         class="mobile-sider-mask"
-        @click="collapsed = true"
-      ></div>
+        @click="mobileMenuOpen = false"
+      />
 
       <n-layout-sider
+        v-if="!isHorizontal || isMobile"
         :bordered="false"
         collapse-mode="width"
-        :collapsed-width="isMobile ? 0 : 64"
-        :width="240"
-        :show-trigger="isMobile ? false : 'arrow-circle'"
-        content-style="padding-top: 10px;"
+        :collapsed-width="72"
+        :width="248"
+        :collapsed="!isMobile && isCollapsedLayout"
+        :show-trigger="isMobile ? false : 'bar'"
         :native-scrollbar="false"
-        :collapsed="collapsed"
-        @update:collapsed="val => collapsed = val"
-        :class="{ 'mobile-sider': isMobile }"
+        class="app-sider"
+        :class="{ 'mobile-sider': isMobile, 'is-open': mobileMenuOpen }"
+        @update:collapsed="handleDesktopCollapse"
       >
+        <div class="sider-version" :class="{ compact: isCollapsedLayout && !isMobile }">
+          <span v-if="!isCollapsedLayout || isMobile">功能导航</span>
+          <small>v{{ appVersion }}</small>
+        </div>
         <n-menu
-          :collapsed="collapsed"
-          :collapsed-width="64"
+          :collapsed="!isMobile && isCollapsedLayout"
+          :collapsed-width="72"
           :collapsed-icon-size="22"
-          :options="menuOptions"
+          :options="verticalMenuOptions"
           :value="activeMenuKey"
           @update:value="handleMenuUpdate"
         />
       </n-layout-sider>
-      <n-layout-content
-        class="app-main-content-wrapper"
-        content-style="padding: 24px; transition: background-color 0.3s;"
-        :native-scrollbar="false"
-      >
-      <div class="page-content-inner-wrapper">
+
+      <n-layout-content class="app-main-content-wrapper" :native-scrollbar="false">
+        <main class="page-content-inner-wrapper">
           <router-view v-slot="slotProps">
             <component :is="slotProps.Component" :task-status="props.taskStatus" />
           </router-view>
-        </div>
+        </main>
       </n-layout-content>
     </n-layout>
-    
-    <!-- 实时日志模态框 -->
-    <n-modal v-model:show="isRealtimeLogVisible" preset="card" style="width: 95%; max-width: 900px;" title="实时任务日志" class="modal-card-lite">
-       <n-log ref="logRef" :log="logContent" trim class="log-panel" style="height: 60vh; font-size: 13px; line-height: 1.6;"/>
+
+    <nav v-if="isMobile" class="mobile-bottom-navigation" aria-label="主要导航">
+      <button
+        v-for="item in mobileMenuOptions"
+        :key="item.key"
+        type="button"
+        :class="{ active: activeMenuKey === item.key }"
+        @click="handleMenuUpdate(item.key)"
+      >
+        <n-icon :component="item.icon" size="20" />
+        <span>{{ item.label }}</span>
+      </button>
+      <button type="button" @click="mobileMenuOpen = true">
+        <n-icon :component="GridOutline" size="20" />
+        <span>更多</span>
+      </button>
+    </nav>
+
+    <n-modal
+      v-model:show="isRealtimeLogVisible"
+      preset="card"
+      class="modal-card-lite"
+      style="width: 95%; max-width: 900px"
+      title="实时任务日志"
+    >
+      <n-log ref="logRef" :log="logContent" trim class="log-panel" />
     </n-modal>
 
-    <!-- 历史日志模态框 -->
     <LogViewer v-model:show="isHistoryLogVisible" />
+    <ThemeCustomizer
+      v-model:show="showThemeCustomizer"
+      :model-value="props.themeSettings"
+      :mobile="isMobile"
+      @update:model-value="emit('update:theme-settings', $event)"
+      @reset="emit('reset-theme-settings')"
+    />
   </n-layout>
 </template>
 
 <script setup>
-import { ref, computed, h, watch, nextTick, onMounted, onUnmounted } from 'vue';
-import { useRouter, useRoute } from 'vue-router';
+import { computed, h, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import {
-  NLayout, NLayoutHeader, NLayoutSider, NLayoutContent,
-  NMenu, NSwitch, NIcon, NModal, NDropdown, NButton,
-  NSelect, NTooltip, NCard, NText, NProgress, NButtonGroup, NLog,
-  useMessage, useDialog
+  NButton,
+  NDropdown,
+  NIcon,
+  NLayout,
+  NLayoutContent,
+  NLayoutHeader,
+  NLayoutSider,
+  NLog,
+  NMenu,
+  NModal,
+  NProgress,
+  NSpin,
+  NTooltip,
+  useDialog,
+  useMessage,
 } from 'naive-ui';
-import { useAuthStore } from './stores/auth';
-import { themes } from './theme.js';
-import LogViewer from './components/LogViewer.vue';
 import {
-  AnalyticsOutline as StatsIcon,
-  ListOutline as ReviewListIcon,
-  TimerOutline as SchedulerIcon,
-  OptionsOutline as GeneralIcon,
-  LogOutOutline as LogoutIcon,
-  HeartOutline as WatchlistIcon,
-  AlbumsOutline as CollectionsIcon,
-  PeopleOutline as ActorSubIcon,
-  InformationCircleOutline as AboutIcon,
-  CreateOutline as CustomCollectionsIcon,
-  ColorPaletteOutline as PaletteIcon,
-  Stop as StopIcon,
-  ShuffleOutline as ShuffleIcon,
-  SyncOutline as RestartIcon,
-  SparklesOutline as ResubscribeIcon,
-  TrashBinOutline as CleanupIcon,
-  PeopleCircleOutline as UserManagementIcon,
-  PersonCircleOutline as UserCenterIcon,
-  FilmOutline as DiscoverIcon,
-  ArchiveOutline as UnifiedSubIcon,
-  PricetagOutline as TagIcon,
-  CompassOutline,
-  ReaderOutline,
-  LibraryOutline, 
-  BookmarksOutline, 
-  SettingsOutline,
   ArchiveOutline,
-  BookOutline as HelpIcon,
-  MenuOutline, // 引入菜单图标
-  Moon as MoonIcon,
-  Sunny as SunnyIcon,
-  PieChartOutline as EmbyStatsIcon // ★★★ 新增：引入图表图标 ★★★
+  BookOutline,
+  ColorPaletteOutline,
+  GridOutline,
+  InformationCircleOutline,
+  LogOutOutline,
+  MenuOutline,
+  OptionsOutline,
+  PeopleCircleOutline,
+  PersonCircleOutline,
+  ReaderOutline,
+  RefreshOutline,
+  Stop,
+  TimerOutline,
 } from '@vicons/ionicons5';
 import axios from 'axios';
-import logo from './assets/logo.png'
+import { useAuthStore } from './stores/auth';
+import {
+  getVisibleMobileRoutes,
+  getVisibleNavigation,
+  getVisibleTopNavigation,
+} from './navigation.js';
+import LogViewer from './components/LogViewer.vue';
+import ThemeCustomizer from './components/ThemeCustomizer.vue';
+import logo from './assets/evh-logo.svg';
 
+const props = defineProps({
+  themeSettings: {
+    type: Object,
+    required: true,
+  },
+  taskStatus: Object,
+});
+
+const emit = defineEmits(['update:theme-settings', 'reset-theme-settings']);
+const router = useRouter();
+const route = useRoute();
+const authStore = useAuthStore();
 const message = useMessage();
 const dialog = useDialog();
 
-// --- 修改开始：使用原生 JS 判断移动端 ---
+const appVersion = ref(__APP_VERSION__);
 const isMobile = ref(false);
+const mobileMenuOpen = ref(false);
+const isRealtimeLogVisible = ref(false);
+const isHistoryLogVisible = ref(false);
+const showThemeCustomizer = ref(false);
+const logRef = ref(null);
 
-const checkMobile = () => {
-  // 768px 通常是平板/手机的分界线
-  isMobile.value = window.innerWidth < 768;
+const activeMenuKey = computed(() => route.name);
+const isHorizontal = computed(() => !isMobile.value && props.themeSettings.layout === 'horizontal');
+const isCollapsedLayout = computed(() => props.themeSettings.layout === 'collapsed');
+const hasActiveTask = computed(() => {
+  const action = props.taskStatus?.current_action;
+  return action && !['空闲', '无'].includes(action);
+});
+const usernameInitial = computed(() => (authStore.username || 'U').slice(0, 1).toUpperCase());
+const logContent = computed(() => props.taskStatus?.logs?.join('\n') || '等待任务日志...');
+const visibleNavigation = computed(() => getVisibleNavigation(authStore));
+const visibleTopNavigation = computed(() => getVisibleTopNavigation(authStore));
+const mobileMenuOptions = computed(() => getVisibleMobileRoutes(authStore));
+
+const renderIcon = (icon) => () => h(NIcon, null, { default: () => h(icon) });
+const themeLabelMap = {
+  auto: '跟随系统',
+  light: '浅色',
+  dark: '深色',
+  purple: '幻紫',
+  transparent: '透明',
 };
+const layoutLabelMap = {
+  vertical: '垂直',
+  collapsed: '折叠',
+  horizontal: '水平',
+};
+const userMenuProps = () => ({ class: 'user-profile-dropdown' });
+
+const renderUserMenuHeader = () => h('div', { class: 'user-dropdown-profile' }, [
+  h('span', { class: 'user-dropdown-profile-avatar' }, usernameInitial.value),
+  h('div', { class: 'user-dropdown-profile-copy' }, [
+    h('small', authStore.isAdmin ? '管理员' : '用户'),
+    h('strong', authStore.username || 'User'),
+  ]),
+]);
+
+const verticalMenuOptions = computed(() => [
+  ...visibleTopNavigation.value.map((item) => ({
+    label: item.label,
+    key: item.key,
+    icon: renderIcon(item.icon),
+  })),
+  ...visibleNavigation.value.map((section) => ({
+    type: 'group',
+    label: section.label,
+    key: section.key,
+    children: section.items.map((item) => ({
+      label: item.label,
+      key: item.key,
+      icon: renderIcon(item.icon),
+    })),
+  })),
+]);
+
+const horizontalMenuOptions = computed(() => [
+  ...visibleTopNavigation.value.map((item) => ({
+    label: item.label,
+    key: item.key,
+    icon: renderIcon(item.icon),
+  })),
+  ...visibleNavigation.value.map((section) => ({
+    label: section.label,
+    key: section.key,
+    children: section.items.map((item) => ({
+      label: item.label,
+      key: item.key,
+      icon: renderIcon(item.icon),
+    })),
+  })),
+]);
+
+const userOptions = computed(() => {
+  const options = [
+    { type: 'render', key: 'profile-header', render: renderUserMenuHeader },
+    { type: 'divider', key: 'profile-divider' },
+    { label: '个人中心', key: 'user-center', icon: renderIcon(PersonCircleOutline) },
+  ];
+  if (authStore.isAdmin) {
+    options.push(
+      { label: '系统设置', key: 'settings-general', icon: renderIcon(OptionsOutline) },
+      { label: '用户管理', key: 'user-management', icon: renderIcon(PeopleCircleOutline) },
+    );
+  }
+  options.push(
+    {
+      label: '界面布局',
+      key: 'layout-customizer',
+      icon: renderIcon(GridOutline),
+      extra: layoutLabelMap[props.themeSettings.layout] || '垂直',
+    },
+    {
+      label: '主题',
+      key: 'theme-customizer',
+      icon: renderIcon(ColorPaletteOutline),
+      extra: `${themeLabelMap[props.themeSettings.theme] || '跟随系统'} · ${layoutLabelMap[props.themeSettings.layout] || '垂直'}`,
+    },
+  );
+  if (authStore.isAdmin) {
+    options.push({ label: '关于 EVH', key: 'releases', icon: renderIcon(InformationCircleOutline) });
+  }
+  options.push(
+    { label: '帮助文档', key: 'help-docs', icon: renderIcon(BookOutline) },
+    { type: 'divider', key: 'actions-divider' },
+  );
+  if (authStore.isAdmin) {
+    options.push({ label: '重启容器', key: 'restart-container', icon: renderIcon(RefreshOutline) });
+  }
+  options.push({
+    label: '退出登录',
+    key: 'logout',
+    icon: renderIcon(LogOutOutline),
+    props: { class: 'user-dropdown-logout-option' },
+  });
+  return options;
+});
+
+function checkMobile() {
+  isMobile.value = window.innerWidth < 768;
+  if (!isMobile.value) mobileMenuOpen.value = false;
+}
+
+function handleMenuUpdate(key) {
+  if (!key || String(key).startsWith('section-')) return;
+  router.push({ name: key });
+  mobileMenuOpen.value = false;
+}
+
+function handleDesktopCollapse(collapsed) {
+  if (isMobile.value) return;
+  emit('update:theme-settings', {
+    ...props.themeSettings,
+    layout: collapsed ? 'collapsed' : 'vertical',
+  });
+}
+
+function applyLayout(layout) {
+  emit('update:theme-settings', { ...props.themeSettings, layout });
+}
+
+function applyTheme(theme) {
+  emit('update:theme-settings', { ...props.themeSettings, theme });
+}
+
+async function triggerStopTask() {
+  try {
+    await axios.post('/api/trigger_stop_task');
+    message.info('已发送停止任务请求。');
+  } catch (error) {
+    message.error(error.response?.data?.error || '发送停止任务请求失败，请查看日志。');
+  }
+}
+
+async function triggerRestart() {
+  message.info('正在发送重启指令...');
+  try {
+    await axios.post('/api/system/restart');
+    message.success('重启指令已发送，请稍后刷新页面。', { duration: 10000 });
+  } catch (error) {
+    if (error.response) {
+      message.error(error.response.data.error || '发送重启请求失败，请查看日志。');
+      return;
+    }
+    message.success('重启指令已发送，请稍后刷新页面。', { duration: 10000 });
+  }
+}
+
+async function handleUserSelect(key) {
+  if (key === 'user-center') {
+    router.push({ name: 'UserCenter' });
+  } else if (key === 'settings-general') {
+    router.push({ name: 'settings-general' });
+  } else if (key === 'user-management') {
+    router.push({ name: 'UserManagement' });
+  } else if (key === 'releases') {
+    router.push({ name: 'Releases' });
+  } else if (String(key).startsWith('layout:')) {
+    applyLayout(String(key).split(':')[1]);
+  } else if (String(key).startsWith('theme:')) {
+    applyTheme(String(key).split(':')[1]);
+  } else if (key === 'theme-customizer' || key === 'layout-customizer') {
+    showThemeCustomizer.value = true;
+  } else if (key === 'restart-container') {
+    dialog.warning({
+      title: '确认重启容器',
+      content: '确定要重启容器吗？应用将在短时间内无法访问。',
+      positiveText: '确定重启',
+      negativeText: '取消',
+      onPositiveClick: triggerRestart,
+    });
+  } else if (key === 'help-docs') {
+    window.open('https://github.com/cosmotown/emby-vision-hub', '_blank');
+  } else if (key === 'logout') {
+    await authStore.logout();
+    router.push({ name: 'Login' });
+  }
+}
+
+watch(() => route.path, () => {
+  mobileMenuOpen.value = false;
+});
+
+watch([() => props.taskStatus?.logs, isRealtimeLogVisible], async ([, visible]) => {
+  if (!visible) return;
+  await nextTick();
+  logRef.value?.scrollTo({ position: 'bottom', silent: true });
+}, { deep: true });
 
 onMounted(() => {
   checkMobile();
@@ -284,331 +459,209 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('resize', checkMobile);
 });
-
-const triggerStopTask = async () => {
-  try {
-    await axios.post('/api/trigger_stop_task');
-    message.info('已发送停止任务请求。');
-  } catch (error) {
-    message.error(error.response?.data?.error || '发送停止任务请求失败，请查看日志。');
-  }
-};
-
-// 1. 定义 props 和 emits
-const props = defineProps({
-  isDark: Boolean,
-  selectedTheme: String,
-  taskStatus: Object
-});
-const emit = defineEmits(['update:is-dark', 'update:selected-theme', 'edit-custom-theme']);
-
-// 2. 状态和路由
-const router = useRouter(); 
-const route = useRoute(); 
-const authStore = useAuthStore();
-
-// 侧边栏状态
-const collapsed = ref(true);
-const activeMenuKey = computed(() => route.name);
-const appVersion = ref(__APP_VERSION__);
-
-// 日志相关状态
-const isRealtimeLogVisible = ref(false);
-const isHistoryLogVisible = ref(false);
-const logRef = ref(null);
-
-// 监听路由变化，如果是移动端，跳转后自动收起侧边栏
-watch(() => route.path, () => {
-  if (isMobile.value) {
-    collapsed.value = true;
-  }
-});
-
-// 3. 从 theme.js 动态生成选项
-const themeOptions = [
-    ...Object.keys(themes).map(key => ({
-        label: themes[key].name,
-        value: key
-    })),
-    { type: 'divider', key: 'd1' },
-    { label: '自定义', value: 'custom' }
-];
-
-// 4. 所有函数
-const renderIcon = (iconComponent) => () => h(NIcon, null, { default: () => h(iconComponent) });
-
-// 计算实时日志内容
-const logContent = computed(() => props.taskStatus?.logs?.join('\n') || '等待任务日志...');
-
-// 监听日志变化，自动滚动到底部
-watch([() => props.taskStatus?.logs, isRealtimeLogVisible], async ([, isVisible]) => {
-  if (isVisible) {
-    await nextTick();
-    logRef.value?.scrollTo({ position: 'bottom', slient: true });
-  }
-}, { deep: true });
-
-const userOptions = computed(() => {
-  const options = [];
-
-  // 规则1: 只要是管理员，就能看到“重启容器”
-  if (authStore.isAdmin) {
-    options.push({
-      label: '重启容器',
-      key: 'restart-container',
-      icon: renderIcon(RestartIcon)
-    });
-  }
-
-  // 帮助文档
-  options.push({
-    label: '帮助文档',
-    key: 'help-docs',
-    icon: renderIcon(HelpIcon)
-  });
-
-  // 如果有任何管理项，就加一个分割线
-  if (options.length > 0) {
-    options.push({ type: 'divider', key: 'd1' });
-  }
-
-  // 规则2: 只要登录了，就能看到“退出登录”
-  options.push({
-    label: '退出登录',
-    key: 'logout',
-    icon: renderIcon(LogoutIcon)
-  });
-
-  return options;
-});
-
-const triggerRestart = async () => {
-  message.info('正在发送重启指令...');
-  try {
-    await axios.post('/api/system/restart');
-    message.success('重启指令已发送，应用正在后台重启。请稍后手动刷新页面。', { duration: 10000 });
-  } catch (error) {
-    if (error.response) {
-      message.error(error.response.data.error || '发送重启请求失败，请查看日志。');
-    } else {
-      message.success('重启指令已发送，应用正在后台重启。请稍后手动刷新页面。', { duration: 10000 });
-    }
-  }
-};
-
-const handleUserSelect = async (key) => {
-  if (key === 'restart-container') {
-    dialog.warning({
-      title: '确认重启容器',
-      content: '确定要重启容器吗？应用将在短时间内无法访问，重启后需要手动刷新页面。',
-      positiveText: '确定重启',
-      negativeText: '取消',
-      onPositiveClick: triggerRestart, 
-    });
-  } else if (key === 'help-docs') {
-    window.open('https://github.com/cosmotown/emby-toolkit', '_blank');
-  } else if (key === 'logout') {
-    await authStore.logout();
-    router.push({ name: 'Login' }); 
-  }
-};
-
-const menuOptions = computed(() => {
-  // 1. 先定义一个基础菜单组
-  const discoveryGroup = { 
-    label: '发现', 
-    key: 'group-discovery', 
-    icon: renderIcon(CompassOutline), 
-    children: [] 
-  };
-
-  // 2. 根据用户类型，动态地往这个组里添加菜单项
-  if (authStore.isAdmin) {
-    discoveryGroup.children.push({ 
-      label: '数据看板', 
-      key: 'DatabaseStats', 
-      icon: renderIcon(StatsIcon) 
-    });
-  }
-
-  if (authStore.isLoggedIn) {
-    // --- 普通用户可见 ---
-    discoveryGroup.children.push(
-      { label: '用户中心', key: 'UserCenter', icon: renderIcon(UserCenterIcon) },
-      { label: '影视探索', key: 'Discover', icon: renderIcon(DiscoverIcon) }
-    );
-    
-    // --- 管理员专属 ---
-    if (authStore.isAdmin) {
-        discoveryGroup.children.push(
-            { label: '播放统计', key: 'EmbyStats', icon: renderIcon(EmbyStatsIcon) }
-        );
-    }
-  }
-
-  // 3. 构建最终的菜单列表
-  const finalMenu = [discoveryGroup];
-
-  // 4. 如果是管理员，再把所有管理相关的菜单组加上去
-  if (authStore.isAdmin) {
-    finalMenu.push(
-      { 
-        label: '整理', 
-        key: 'group-management', 
-        icon: renderIcon(LibraryOutline), 
-        children: [ 
-          { label: '原生合集', key: 'Collections', icon: renderIcon(CollectionsIcon) }, 
-          { label: '自建合集', key: 'CustomCollectionsManager', icon: renderIcon(CustomCollectionsIcon) }, 
-          { label: '媒体去重', key: 'MediaCleanupPage', icon: renderIcon(CleanupIcon) },
-          { label: '人物清理', key: 'PersonCleanupPage', icon: renderIcon(ActorSubIcon) },
-          { label: '媒体整理', key: 'ResubscribePage', icon: renderIcon(ResubscribeIcon) },
-          { label: '自动标签', key: 'AutoTaggingPage', icon: renderIcon(TagIcon) },  
-          { label: '手动处理', key: 'ReviewList', icon: renderIcon(ReviewListIcon) }, 
-        ] 
-      },
-      { 
-        label: '订阅', 
-        key: 'group-subscriptions', 
-        icon: renderIcon(BookmarksOutline), 
-        children: [ 
-          { label: '智能追剧', key: 'Watchlist', icon: renderIcon(WatchlistIcon) }, 
-          { label: '演员订阅', key: 'ActorSubscriptions', icon: renderIcon(ActorSubIcon) }, 
-          { label: '统一订阅', key: 'UnifiedSubscriptions', icon: renderIcon(UnifiedSubIcon) },
-        ] 
-      },
-      { 
-        label: '系统', 
-        key: 'group-system', 
-        icon: renderIcon(SettingsOutline), 
-        children: [ 
-          { label: '通用设置', key: 'settings-general', icon: renderIcon(GeneralIcon) }, 
-          { label: '用户管理', key: 'UserManagement', icon: renderIcon(UserManagementIcon) },
-          { label: '任务中心', key: 'settings-scheduler', icon: renderIcon(SchedulerIcon) },
-          { label: '封面生成', key: 'CoverGeneratorConfig', icon: renderIcon(PaletteIcon) }, 
-          { label: '查看更新', key: 'Releases', icon: renderIcon(AboutIcon) }, 
-        ] 
-      }
-    );
-  }
-
-  return finalMenu;
-});
-
-function handleMenuUpdate(key) {
-  router.push({ name: key });
-}
-
-const setRandomTheme = () => {
-  const otherThemes = themeOptions.filter(t => t.type !== 'divider' && t.value !== props.selectedTheme);
-  if (otherThemes.length === 0) return;
-  const randomIndex = Math.floor(Math.random() * otherThemes.length);
-  const randomTheme = otherThemes[randomIndex];
-  emit('update:selected-theme', randomTheme.value);
-};
 </script>
 
-<style>
-/* MainLayout 的样式 */
-.app-header { padding: 0 16px; height: 60px; display: flex; align-items: center; font-size: 1.25em; font-weight: 600; flex-shrink: 0; }
-.app-main-content-wrapper { height: 100%; display: flex; flex-direction: column; }
-.page-content-inner-wrapper { flex-grow: 1; overflow-y: auto; }
-.n-menu .n-menu-item-group-title { font-size: 12px; font-weight: 500; color: #8e8e93; padding-left: 24px; margin-top: 16px; margin-bottom: 8px; }
-.n-menu .n-menu-item-group:first-child .n-menu-item-group-title { margin-top: 0; }
-html.dark .n-menu .n-menu-item-group-title { color: #828287; }
+<style scoped>
+.app-shell {
+  position: relative;
+  height: 100vh;
+  color: var(--app-text);
+  background: var(--app-background);
+}
 
-/* 任务状态条样式 */
+.app-backdrop {
+  position: fixed;
+  z-index: 0;
+  inset: 0;
+  pointer-events: none;
+  background-color: rgba(128, 128, 128, 0.30);
+  background-image:
+    linear-gradient(rgba(0, 0, 0, 0.30), rgba(0, 0, 0, 0.60)),
+    linear-gradient(rgba(128, 128, 128, 0.30), rgba(128, 128, 128, 0.30)),
+    var(--app-backdrop-image, none);
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: cover;
+  filter: blur(var(--transparent-background-blur, 16px));
+  opacity: var(--transparent-background-poster-opacity, 1);
+  transform: scale(var(--app-backdrop-scale, 1.03));
+}
+
+.app-header {
+  position: relative;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 68px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--app-border-subtle);
+  background: var(--app-surface);
+}
+
+.header-brand,
+.header-actions,
+.user-menu-button,
 .header-task-status {
-  flex: 2;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  margin: 0 20px;
-  overflow: hidden;
-  min-width: 0;
-}
-
-.status-content {
   display: flex;
   align-items: center;
-  background-color: rgba(0, 0, 0, 0.03);
-  padding: 4px 12px;
-  border-radius: 20px;
-  border: 1px solid rgba(0, 0, 0, 0.05);
-  max-width: 100%;
 }
 
-html.dark .status-content {
-  background-color: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.05);
+.header-brand { gap: 10px; }
+.header-actions { gap: 4px; }
+.brand-logo { width: 34px; height: 34px; object-fit: contain; }
+.brand-copy { display: flex; flex-direction: column; line-height: 1.05; letter-spacing: 0.08em; }
+.brand-copy strong { font-size: 14px; }
+.brand-copy span { margin-top: 4px; color: var(--app-text-muted); font-size: 9px; }
+.mobile-menu-button { font-size: 22px; }
+
+.header-task-status {
+  max-width: min(46vw, 620px);
+  gap: 10px;
+  padding: 7px 12px;
+  border: 1px solid var(--app-border-subtle);
+  border-radius: 999px;
+  background: var(--app-surface-soft);
 }
 
-.status-text {
+.task-copy { display: flex; min-width: 0; flex-direction: column; }
+.task-copy strong,
+.task-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-copy strong { font-size: 12px; }
+.task-copy span { color: var(--app-text-muted); font-size: 11px; }
+.task-progress { width: 88px; }
+
+.user-menu-button {
+  gap: 8px;
+  padding: 4px 6px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.user-avatar {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--app-primary);
   font-size: 13px;
+  font-weight: 700;
+}
+
+.user-menu-copy { display: flex; flex-direction: column; min-width: 70px; text-align: left; }
+.user-menu-copy strong { font-size: 12px; }
+.user-menu-copy small { color: var(--app-text-muted); font-size: 10px; }
+
+.horizontal-navigation {
+  position: relative;
+  z-index: 20;
+  height: 50px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--app-border-subtle);
+  background: var(--app-surface);
+}
+
+.app-header,
+.horizontal-navigation,
+.app-body,
+.mobile-bottom-navigation {
+  position: relative;
+}
+
+.app-body { z-index: 1; height: calc(100vh - 68px); background: var(--app-background); }
+.app-body.with-horizontal-navigation { height: calc(100vh - 118px); }
+
+.app-sider {
+  border-right: 1px solid var(--app-border-subtle);
+  background: var(--app-sidebar) !important;
+}
+
+.sider-version {
   display: flex;
   align-items: center;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  flex: 1;
-  min-width: 0;
+  justify-content: space-between;
+  min-height: 42px;
+  padding: 0 18px;
+  color: var(--app-sidebar-text);
+  opacity: 0.58;
+  font-size: 9px;
+  letter-spacing: 0.08em;
 }
 
-.status-divider {
-  margin: 0 8px;
-  opacity: 0.5;
-  flex-shrink: 0;
-}
+.sider-version.compact { justify-content: center; padding: 0; }
+.sider-version small { font-size: 10px; }
 
-.status-message {
-  opacity: 0.8;
-  max-width: 600px; 
-  overflow: hidden;
-  text-overflow: ellipsis;
-  display: inline-block;
-  vertical-align: bottom;
-}
+.app-main-content-wrapper { height: 100%; background: var(--app-background); }
+.page-content-inner-wrapper { min-height: 100%; padding: 0; box-sizing: border-box; }
+.log-panel { height: 60vh; font-size: 13px; line-height: 1.6; }
 
-/* 移动端适配样式 */
-@media (max-width: 768px) {
-  .app-header {
-    padding: 0 12px; /* 减小内边距 */
-  }
-  
-  .status-message {
-    max-width: 150px;
-  }
-  
-  .header-task-status {
-    margin: 0 8px;
-    flex: 1;
-  }
+.mobile-sider-mask,
+.mobile-bottom-navigation { display: none; }
 
-  /* 移动端侧边栏样式：悬浮在内容之上 */
+@media (max-width: 767px) {
+  .app-header { height: 60px; padding: 0 12px; }
+  .brand-copy span { display: none; }
+  .brand-copy strong { font-size: 12px; }
+  .brand-logo { width: 30px; height: 30px; }
+  .app-body { height: calc(100vh - 60px); }
+  .page-content-inner-wrapper { padding: 0 0 76px; }
+
   .mobile-sider {
-    position: absolute;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    z-index: 1000;
-    height: 100%;
-    box-shadow: 2px 0 8px rgba(0,0,0,0.15);
+    position: absolute !important;
+    inset: 0 auto 0 0;
+    z-index: 1001;
+    width: min(86vw, 300px) !important;
+    max-width: min(86vw, 300px) !important;
+    transform: translateX(-105%);
+    transition: transform 0.22s ease;
+    box-shadow: 16px 0 40px rgba(0, 0, 0, 0.24);
   }
 
-  /* 移动端侧边栏遮罩 */
+  .mobile-sider.is-open { transform: translateX(0); }
+
   .mobile-sider-mask {
     position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background-color: rgba(0,0,0,0.4);
-    z-index: 999;
+    inset: 0;
+    z-index: 1000;
+    display: block;
+    background: rgba(0, 0, 0, 0.48);
     backdrop-filter: blur(2px);
   }
-  
-  /* 调整移动端内容区域内边距 */
-  .n-layout-content .page-content-inner-wrapper {
-    padding: 12px !important; /* 覆盖内联样式 */
+
+  .mobile-bottom-navigation {
+    position: fixed;
+    right: 10px;
+    bottom: max(10px, env(safe-area-inset-bottom));
+    left: 10px;
+    z-index: 900;
+    display: flex;
+    justify-content: space-around;
+    padding: 7px 6px;
+    border: 1px solid var(--app-border-subtle);
+    border-radius: 18px;
+    background: color-mix(in srgb, var(--app-surface) 90%, transparent);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
+    backdrop-filter: blur(18px);
   }
+
+  .mobile-bottom-navigation button {
+    display: flex;
+    min-width: 52px;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    padding: 4px 6px;
+    border: 0;
+    border-radius: 10px;
+    color: var(--app-text-muted);
+    background: transparent;
+    font-size: 10px;
+  }
+
+  .mobile-bottom-navigation button.active { color: var(--app-primary); background: var(--app-primary-soft); }
 }
 </style>

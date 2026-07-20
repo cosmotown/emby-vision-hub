@@ -1,20 +1,20 @@
 import { defineConfig } from 'vitepress'
 
 export default defineConfig({
-  title: 'Emby Toolkit Wiki',
-  description: 'Emby Toolkit 项目文档',
-  base: '/emby-toolkit/',
+  title: 'EVH 文档',
+  description: 'Emby Vision Hub 项目文档',
+  base: '/emby-vision-hub/',
   ignoreDeadLinks: true,
 
   head: [
-    ['meta', { name: 'theme-color', content: '#2563eb' }],
+    ['meta', { name: 'theme-color', content: '#8D51F9' }],
     ['meta', { name: 'og:type', content: 'website' }],
     ['meta', { name: 'og:locale', content: 'zh_CN' }],
-    ['meta', { name: 'og:site_name', content: 'Emby Toolkit Wiki' }]
+    ['meta', { name: 'og:site_name', content: 'EVH 文档' }]
   ],
 
   themeConfig: {
-    siteTitle: 'Emby Toolkit Wiki',
+    siteTitle: 'EVH · Emby Vision Hub',
 
     nav: [
       { text: '首页', link: '/zh/' },
@@ -78,7 +78,8 @@ export default defineConfig({
           items: [
             { text: '项目结构', link: '/zh/dev/project-structure' },
             { text: '本地开发', link: '/zh/dev/local-dev' },
-            { text: 'API 概览', link: '/zh/dev/api-overview' }
+            { text: 'API 概览', link: '/zh/dev/api-overview' },
+            { text: '独立项目说明', link: '/zh/dev/repository-migration' }
           ]
         },
         {
@@ -91,8 +92,8 @@ export default defineConfig({
     },
 
     footer: {
-      message: 'Emby Toolkit - Emby 增强管理工具',
-      copyright: 'Copyright © 2026-present Emby Toolkit'
+      message: 'EVH - Emby 媒体库管理与自动化中枢',
+      copyright: 'Copyright © 2026-present CosmoTown · AGPL-3.0'
     },
 
     search: {
@@ -120,7 +121,7 @@ export default defineConfig({
     },
 
     editLink: {
-      pattern: 'https://github.com/cosmotown/emby-toolkit/edit/based-on-6.8.9/docs/:path',
+      pattern: 'https://github.com/cosmotown/emby-vision-hub/edit/main/docs/:path',
       text: '在 GitHub 上编辑此页'
     },
 

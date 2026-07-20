@@ -223,7 +223,7 @@ def api_test_telegram_connection():
     # 构造测试消息
     import time
     current_time = time.strftime("%Y-%m-%d %H:%M:%S")
-    text = f"🔔 *Emby Toolkit 测试消息*\n\n这是一条测试消息，证明您的机器人配置正确。\n⏱ 时间: `{current_time}`"
+    text = f"🔔 *EVH 测试消息*\n\n这是一条测试消息，证明您的机器人配置正确。\n⏱ 时间: `{current_time}`"
     
     # 处理 Chat ID (支持 @username)
     final_chat_id = str(chat_id).strip()

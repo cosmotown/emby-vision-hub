@@ -63,7 +63,7 @@ fi
 
 # 5. 启动主应用
 # 在这里，我们才使用 gosu 将权限降级为普通用户，以保证应用运行时的安全
-INFO "→ 启动 Emby Toolkit 主应用服务..."
+INFO "→ 启动 EVH 主应用服务..."
 if [ "${PUID}" -eq 0 ]; then
     # --- Root 模式 ---
     INFO "→ 检测到 PUID=0，以原生 Root 身份运行 (特权模式)..."

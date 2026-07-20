@@ -38,11 +38,7 @@
         <template #footer>
           <n-alert title="操作提示" type="info" :bordered="false">
             <ul style="margin: 0; padding-left: 20px;">
-              <li>自建合集是虚拟库的虚拟来源，任何通过规则筛选、RSS导入的合集都可以被虚拟成媒体库展示在首页（需通过配置的反代端口访问）。内置猫眼榜单提取自MP插件，感谢<a
-                  href="https://github.com/baozaodetudou"
-                  target="_blank"
-                  style="font-size: 0.85em; margin-left: 8px; color: var(--n-primary-color); text-decoration: underline;"
-                >逗猫佬</a>。</li>
+              <li>自建合集是虚拟库的虚拟来源，任何通过规则筛选、RSS导入的合集都可以被虚拟成媒体库展示在首页（需通过配置的反代端口访问）。猫眼榜单能力已整合进 EVH，可在此统一配置和维护。</li>
               <li>在创建或生成“筛选规则”合集前，请先点击 <n-icon :component="SyncIcon" /> 按钮同步一次媒体数据。封面模板、手动生成和定时更新统一在“封面生成”页面管理。</li>
               <li>您可以通过拖动卡片来对合集进行排序，Emby虚拟库实时联动更新排序。</li>
             </ul>

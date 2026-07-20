@@ -1,10 +1,10 @@
 ---
-title: Emby Toolkit Wiki
+title: EVH 文档
 ---
 
-# Emby Toolkit 文档
+# EVH · Emby Vision Hub 文档
 
-Emby Toolkit 是一个面向 Emby 媒体库的增强管理工具，围绕元数据补全、演员/角色翻译、合集与订阅、智能追剧、封面生成、实时监控等场景提供自动化能力，并带有 Web 管理界面与任务调度系统。
+EVH 是一个面向 Emby 媒体库的管理与自动化中枢，围绕 STRM 入库协调、元数据增强、合集与订阅、智能追剧、媒体整理、封面生成和运行诊断提供完整的 Web 管理体验。
 
 ## 快速入口
 

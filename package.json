@@ -1,7 +1,7 @@
 {
-  "name": "emby-toolkit-wiki",
-  "version": "1.0.0",
-  "description": "Emby Toolkit Wiki - Documentation site",
+  "name": "emby-vision-hub-docs",
+  "version": "7.2.0",
+  "description": "EVH - Emby Vision Hub documentation site",
   "type": "module",
   "scripts": {
     "docs:dev": "vitepress dev docs",
@@ -10,15 +10,15 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cosmotown/emby-toolkit.git"
+    "url": "git+https://github.com/cosmotown/emby-vision-hub.git"
   },
   "keywords": ["emby", "wiki", "documentation"],
-  "author": "Emby Toolkit",
-  "license": "MIT",
+  "author": "CosmoTown",
+  "license": "AGPL-3.0-only",
   "bugs": {
-    "url": "https://github.com/cosmotown/emby-toolkit/issues"
+    "url": "https://github.com/cosmotown/emby-vision-hub/issues"
   },
-  "homepage": "https://github.com/cosmotown/emby-toolkit#readme",
+  "homepage": "https://github.com/cosmotown/emby-vision-hub#readme",
   "devDependencies": {
     "vitepress": "^1.6.4",
     "vue": "^3.5.26"

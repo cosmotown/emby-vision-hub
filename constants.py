@@ -4,9 +4,9 @@ import os
 # ==============================================================================
 # ✨ 应用基础信息 (Application Basics)
 # ==============================================================================
-APP_VERSION = "7.1.19"  # 更新版本号
+APP_VERSION = "7.2.0"  # 更新版本号
 GITHUB_REPO_OWNER = "cosmotown"  # 您的 GitHub 用户名
-GITHUB_REPO_NAME = "emby-toolkit" # 您的 GitHub 仓库名
+GITHUB_REPO_NAME = "emby-vision-hub" # 您的 GitHub 仓库名
 DEFAULT_DOCKER_IMAGE_NAME = "tzyzero186/emby-toolkit:latest"
 LEGACY_UPSTREAM_DOCKER_IMAGE_NAME = "hbq0405/emby-toolkit:latest"
 ENV_VAR_DOCKER_IMAGE_NAME = "DOCKER_IMAGE_NAME"

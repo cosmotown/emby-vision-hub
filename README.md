@@ -1,10 +1,16 @@
-# Emby ToolKit (Emby 增强管理工具)
+<p align="center">
+  <img src="emby-actor-ui/public/evh-logo.svg" width="96" alt="EVH logo" />
+</p>
 
-[![中文文档](https://img.shields.io/badge/docs-read%20now-blue)](https://github.com/cosmotown/emby-toolkit/tree/based-on-6.8.9/docs/zh)
-[![GitHub license](https://img.shields.io/github/license/cosmotown/emby-toolkit.svg)](https://github.com/cosmotown/emby-toolkit/blob/based-on-6.8.9/LICENSE)
-<!-- 你可以添加更多的徽章，例如构建状态、Docker Hub 拉取次数等 -->
+# EVH · Emby Vision Hub
 
-一个用于处理和增强 Emby 媒体库的工具，包括但不限于演员/角色名称翻译、信息补全（从豆瓣、TMDb等）、合集检查及订阅、智能追剧、演员订阅、自建合集、虚拟库。
+[![中文文档](https://img.shields.io/badge/docs-中文文档-8D51F9)](https://github.com/cosmotown/emby-vision-hub/tree/main/docs/zh)
+[![GitHub license](https://img.shields.io/github/license/cosmotown/emby-vision-hub.svg)](https://github.com/cosmotown/emby-vision-hub/blob/main/LICENSE)
+[![Version](https://img.shields.io/badge/version-7.2.0-6E66ED)](https://github.com/cosmotown/emby-vision-hub/releases)
+
+EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 STRM 入库协调、元数据增强、智能订阅、媒体整理、合集与虚拟库、封面生成、任务调度、用户权限和运行诊断。
+
+项目从 7.2.0 起以 **Emby Vision Hub** 名称独立演进。现有容器名、配置目录、数据库名与 Docker 镜像地址暂时保持兼容，升级不需要迁移数据。
 
 ## ✨ 功能特性
 
@@ -16,7 +22,9 @@
 *   **智能追剧**：监控媒体库所有剧集，智能判断并更新状态，对缺失的季以及新出的季进行订阅操作（需配置MoviePilot）。
 *   **演员订阅**：追踪喜欢的演员，按配置订阅过去以及将来的资源（需配置MoviePilot）。
 *   **封面生成**：实时合成媒体库封面以及自建合集封面。
-*   **自建合集**：按各种规则筛选自己喜欢的合集并虚拟成媒体库展示在首页（实验性功能，目前已知手机端支持不好）。
+*   **自建合集**：按规则、榜单与外部数据源生成合集，并可虚拟为媒体库展示在首页。
+*   **媒体整理与清理**：提供重复媒体、人物、订阅和媒体文件的可控整理流程。
+*   **管理中心**：响应式 Web UI、五套 MoviePilot 风格主题、用户权限、日志、任务状态与更新管理。
 
 
 ## 🚀 快速开始
@@ -112,7 +120,7 @@
     *   容器启动后，通过浏览器访问 `http://<你的服务器IP>:5257`。
     *   首次启动请填写Emby连接信息，用Emby管理账户登录。
     *   进入通用设置页面，填写必要的配置信息。
-    *   **点击保存。** 这会在你挂载的 `/config` 目录下（即宿主机的 `/path/to/your/app_data/eemby-toolkit/config` 目录）创建 `config.ini` 文件。
+    *   **点击保存。** 这会在你挂载的 `/config` 目录中创建 `config.ini` 文件。
 
 ## 🔒 用户权限管理
 
@@ -144,3 +152,13 @@
 
 *   应用日志默认会输出到数据看板，同时会在配置目录生成日志文件。
 *   可以在数据看板查看历史日志，通过搜索定位完整处理过程。
+
+## 📚 文档与反馈
+
+- 文档源码：[docs/zh](https://github.com/cosmotown/emby-vision-hub/tree/main/docs/zh)
+- 问题反馈：[GitHub Issues](https://github.com/cosmotown/emby-vision-hub/issues)
+- 发布记录：[GitHub Releases](https://github.com/cosmotown/emby-vision-hub/releases)
+
+## ⚖️ 开源许可与项目关系
+
+EVH 以 [GNU AGPL-3.0](LICENSE) 发布，保留完整 Git 提交历史与许可证要求。它是基于原开源项目代码持续修改的独立演进版本；自 7.2.0 起由 CosmoTown 以 EVH 名称维护，并非 Emby、MoviePilot 或其他第三方服务的官方产品。修改版的主要变化与日期可在 Git 历史和 Release Notes 中查阅。

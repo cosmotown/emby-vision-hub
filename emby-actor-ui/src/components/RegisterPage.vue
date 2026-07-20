@@ -7,8 +7,9 @@
         
         <!-- 头部区域 -->
         <div class="register-header">
-          <img src="../assets/logo.png" alt="Logo" class="register-logo" />
-          <h2 class="register-title">Emby Toolkit</h2>
+          <img src="../assets/evh-logo.svg" alt="Emby Vision Hub" class="register-logo" />
+          <h2 class="register-title">Emby Vision Hub</h2>
+          <p class="public-brand-kicker">COSMOTOWN EDITION</p>
           <p class="register-subtitle">创建您的专属账户</p>
         </div>
 

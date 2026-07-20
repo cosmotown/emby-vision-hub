@@ -272,7 +272,7 @@ def _login_and_get_token() -> tuple[Optional[str], Optional[str]]:
     auth_url = f"{emby_url.rstrip('/')}/Users/AuthenticateByName"
     headers = {
         'Content-Type': 'application/json',
-        'X-Emby-Authorization': 'Emby Client="Emby Toolkit", Device="Toolkit", DeviceId="d4f3e4b4-9f5b-4b8f-8b8a-5c5c5c5c5c5c", Version="1.0.0"'
+        'X-Emby-Authorization': 'Emby Client="Emby Vision Hub", Device="EVH", DeviceId="d4f3e4b4-9f5b-4b8f-8b8a-5c5c5c5c5c5c", Version="7.2.0"'
     }
     payload = {"Username": admin_user, "Pw": admin_pass}
     

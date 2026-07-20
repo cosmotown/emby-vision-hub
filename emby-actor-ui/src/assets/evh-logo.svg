@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Emby Vision Hub</title>
+  <defs>
+    <linearGradient id="evh-gradient" x1="14" y1="10" x2="112" y2="120" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#B989FF"/>
+      <stop offset="0.5" stop-color="#8D51F9"/>
+      <stop offset="1" stop-color="#5A54E8"/>
+    </linearGradient>
+    <linearGradient id="evh-glow" x1="40" y1="30" x2="92" y2="98" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E7E3FC" stop-opacity="0.76"/>
+    </linearGradient>
+  </defs>
+  <path d="M64 5 111 32v64l-47 27L17 96V32L64 5Z" fill="url(#evh-gradient)"/>
+  <path d="M64 17 100 38v52l-36 21-36-21V38l36-21Z" fill="#17131F" fill-opacity="0.28"/>
+  <path d="M50 38v52l43-26-43-26Z" fill="url(#evh-glow)"/>
+  <path d="M31 27c13-13 31-18 49-13" fill="none" stroke="#FFF" stroke-opacity="0.58" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="31" cy="27" r="4" fill="#FFF"/>
+</svg>

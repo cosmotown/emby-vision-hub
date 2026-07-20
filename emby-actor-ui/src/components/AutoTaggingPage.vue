@@ -1,5 +1,5 @@
 <template>
-  <n-space vertical size="large">
+  <n-space vertical size="large" class="auto-tagging-page">
     <n-card title="🏷️ 自动标签管理" subtitle="根据媒体库和分级自动为入库影片追加 Emby 标签">
       <template #header-extra>
         <n-button type="primary" @click="addRule">添加规则</n-button>
@@ -11,6 +11,7 @@
         <li><b>追加/移除:</b> 手动操作也会遵循配置的过滤条件。</li>
       </n-alert>
 
+      <div class="auto-tagging-table-scroll">
       <n-table :bordered="false" :single-line="false">
         <thead>
           <tr>
@@ -69,6 +70,7 @@
           </tr>
         </tbody>
       </n-table>
+      </div>
 
       <template #footer>
         <n-space justify="end">
@@ -263,3 +265,36 @@ onMounted(() => {
   fetchRules();
 });
 </script>
+
+<style scoped>
+.auto-tagging-page {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 24px;
+}
+
+.auto-tagging-table-scroll {
+  width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+}
+
+.auto-tagging-table-scroll :deep(.n-table) {
+  min-width: 760px;
+}
+
+.auto-tagging-page :deep(.n-card-header) {
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+@media (max-width: 767px) {
+  .auto-tagging-page {
+    padding: 12px;
+  }
+
+  .auto-tagging-table-scroll :deep(.n-table) {
+    min-width: 680px;
+  }
+}
+</style>

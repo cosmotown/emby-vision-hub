@@ -1,35 +1,34 @@
 <!-- src/components/DiscoverPage.vue -->
 <template>
-  <n-layout :content-style="{ padding: isMobile ? '12px' : '24px' }">
-  <div>
+  <n-layout :content-style="{ padding: isMobile ? '12px' : '24px' }" class="discover-page-shell">
+  <div class="discover-page">
     <n-page-header title="影视探索" subtitle="发现您感兴趣的下一部作品" />
-      <n-grid :x-gap="24" :y-gap="24" :cols="isMobile ? 1 : 2" style="margin-top: 24px;">
-        <!-- 左侧筛选面板 (占1列) -->
-        <n-gi :span="1">
+      <div class="discover-top-grid">
+        <div>
           <n-card :bordered="false" class="dashboard-card">
             <template #header>
               <span class="card-title">筛选条件</span>
             </template>
-            <n-space vertical size="large">
-              <n-space align="center">
+            <div class="filter-form">
+              <div class="filter-row">
                 <label>搜索:</label>
                 <n-input
                   v-model:value="searchQuery"
                   placeholder="输入片名搜索..."
                   clearable
-                  style="min-width: 300px;"
+                  class="filter-control"
                 />
-              </n-space>
-              <n-space align="center">
+              </div>
+              <div class="filter-row">
                 <label>类型:</label>
-                <n-radio-group v-model:value="mediaType" :disabled="isSearchMode">
+                <n-radio-group v-model:value="mediaType" :disabled="isSearchMode" class="wrap-radio-group">
                   <n-radio-button value="movie" label="电影" />
                   <n-radio-button value="tv" label="电视剧" />
                 </n-radio-group>
-              </n-space>
-              <n-space align="center">
+              </div>
+              <div class="filter-row filter-row--top">
                 <label>排序:</label>
-                <n-radio-group v-model:value="filters['sort_by']" :disabled="isSearchMode">
+                <n-radio-group v-model:value="filters['sort_by']" :disabled="isSearchMode" class="wrap-radio-group">
                   <n-radio-button value="popularity.desc" label="热度降序" />
                   <n-radio-button value="popularity.asc" label="热度升序" />
                   <n-radio-button :value="mediaType === 'movie' ? 'primary_release_date.desc' : 'first_air_date.desc'" label="上映日期降序" />
@@ -37,25 +36,26 @@
                   <n-radio-button value="vote_average.desc" label="评分降序" />
                   <n-radio-button value="vote_average.asc" label="评分升序" />
                 </n-radio-group>
-              </n-space>
-              <n-space align="center">
+              </div>
+              <div class="filter-row filter-row--top">
                 <label>风格:</label>
-                <!-- 新增的“包含/排除”切换器 -->
-                <n-radio-group v-model:value="genreFilterMode" :disabled="isSearchMode">
-                  <n-radio-button value="include" label="包含" />
-                  <n-radio-button value="exclude" label="排除" />
-                </n-radio-group>
-                <n-select
-                  v-model:value="selectedGenres"
-                  :disabled="isSearchMode"
-                  multiple
-                  filterable
-                  :placeholder="genreFilterMode === 'include' ? '选择要包含的风格' : '选择要排除的风格'"
-                  :options="genreOptions"
-                  style="min-width: 300px;"
-                />
-              </n-space>
-              <n-space align="center">
+                <div class="filter-control-stack">
+                  <n-radio-group v-model:value="genreFilterMode" :disabled="isSearchMode" class="wrap-radio-group">
+                    <n-radio-button value="include" label="包含" />
+                    <n-radio-button value="exclude" label="排除" />
+                  </n-radio-group>
+                  <n-select
+                    v-model:value="selectedGenres"
+                    :disabled="isSearchMode"
+                    multiple
+                    filterable
+                    :placeholder="genreFilterMode === 'include' ? '选择要包含的风格' : '选择要排除的风格'"
+                    :options="genreOptions"
+                    class="filter-control"
+                  />
+                </div>
+              </div>
+              <div class="filter-row">
                 <label>分级:</label>
                 <n-select
                   v-model:value="selectedRating"
@@ -63,22 +63,22 @@
                   clearable
                   placeholder="选择内容分级"
                   :options="ratingOptions"
-                  style="min-width: 300px;"
+                  class="filter-control"
                 />
-              </n-space>
-              <n-space align="center">
-              <label>地区:</label>
-              <n-select
+              </div>
+              <div class="filter-row">
+                <label>地区:</label>
+                <n-select
                   v-model:value="selectedRegions"
                   :disabled="isSearchMode"
                   multiple
                   filterable
                   placeholder="选择国家/地区"
                   :options="countryOptions"
-                  style="min-width: 300px;"
-              />
-              </n-space>
-              <n-space align="center">
+                  class="filter-control"
+                />
+              </div>
+              <div class="filter-row">
                 <label>语言:</label>
                 <n-select
                   v-model:value="selectedLanguage"
@@ -87,19 +87,18 @@
                   clearable
                   placeholder="选择原始语言"
                   :options="languageOptions"
-                  style="min-width: 300px;"
+                  class="filter-control"
                 />
-              </n-space>
-              <n-space align="center">
+              </div>
+              <div class="filter-row">
                 <label>发行年份:</label>
-                <n-input-group>
+                <n-input-group class="filter-control year-range-control">
                   <n-input-number
                     v-model:value="yearFrom"
                     :disabled="isSearchMode"
                     :show-button="false"
                     placeholder="从 (例如 1990)"
                     clearable
-                    style="width: 150px;"
                   />
                   <n-input-number
                     v-model:value="yearTo"
@@ -107,11 +106,10 @@
                     :show-button="false"
                     placeholder="到 (例如 1999)"
                     clearable
-                    style="width: 150px;"
                   />
                 </n-input-group>
-              </n-space>
-              <n-space align="center">
+              </div>
+              <div class="filter-row">
                 <label>{{ studioLabel }}:</label>
                 <n-select
                   v-model:value="selectedStudios"
@@ -120,10 +118,10 @@
                   filterable
                   :placeholder="`选择${studioLabel} (映射)`"
                   :options="studioOptions"
-                  style="min-width: 300px;"
+                  class="filter-control"
                 />
-              </n-space>
-              <n-space align="center">
+              </div>
+              <div class="filter-row">
                 <label>关键词:</label>
                 <n-select
                   v-model:value="selectedKeywords"
@@ -132,10 +130,10 @@
                   filterable
                   placeholder="选择关键词"
                   :options="keywordOptions"
-                  style="min-width: 300px;"
+                  class="filter-control"
                 />
-              </n-space>
-              <n-space align="center">
+              </div>
+              <div class="filter-row">
                 <label>评分不低于:</label>
                 <n-input-number
                   v-model:value="filters.vote_average_gte"
@@ -144,14 +142,13 @@
                   :min="0"
                   :max="10"
                   placeholder="最低评分"
-                  style="width: 120px;"
+                  class="rating-control"
                 />
-              </n-space>
-            </n-space>
+              </div>
+            </div>
           </n-card>
-        </n-gi>
-        <!-- ★★★ 右侧“每日推荐”面板 ★★★ -->
-        <n-gi :span="1" v-if="!isMobile">
+        </div>
+        <div v-if="!isMobile">
           <n-card :bordered="false" class="dashboard-card recommendation-card">
             <!-- ★ 1. 修改卡片头，加入“换一个”按钮 -->
             <template #header>
@@ -229,8 +226,8 @@
               </div>
             <n-empty v-if="!isRecommendationLoading && !currentRecommendation" description="太棒了！热门电影似乎都在您的库中，今日无特别推荐。" />
           </n-card>
-        </n-gi>
-      </n-grid>
+        </div>
+      </div>
 
     <!-- 结果展示区域 -->
     <n-spin :show="loading && results.length === 0">
@@ -757,6 +754,85 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.discover-page {
+  min-width: 0;
+}
+
+.discover-top-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 24px;
+  margin-top: 24px;
+}
+
+.discover-top-grid > div {
+  min-width: 0;
+}
+
+.filter-form {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.filter-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 88px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.filter-row--top {
+  align-items: start;
+}
+
+.filter-row > label {
+  color: var(--app-text-muted);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: right;
+}
+
+.filter-control,
+.filter-control-stack,
+.wrap-radio-group {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.filter-control-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.wrap-radio-group {
+  display: flex !important;
+  flex-wrap: wrap;
+  gap: 6px;
+  height: auto !important;
+}
+
+.wrap-radio-group :deep(.n-radio-button) {
+  margin: 0 !important;
+  border: 1px solid var(--app-border-subtle) !important;
+  border-radius: calc(var(--app-radius) - 2px) !important;
+}
+
+.wrap-radio-group :deep(.n-radio-button--checked) {
+  border-color: var(--app-primary) !important;
+}
+
+.year-range-control :deep(.n-input-number) {
+  width: 50%;
+}
+
+.rating-control {
+  width: min(160px, 100%);
+}
+
 /* ★★★ 核心布局：响应式 Grid ★★★ */
 .responsive-grid {
   display: grid;
@@ -1041,5 +1117,61 @@ onUnmounted(() => {
   cursor: not-allowed;
   pointer-events: none;
   opacity: 0.5;
+}
+
+@media (max-width: 1180px) {
+  .discover-top-grid {
+    grid-template-columns: minmax(0, 1.15fr) minmax(300px, 0.85fr);
+  }
+
+  .recommendation-grid {
+    gap: 16px;
+  }
+
+  .recommendation-poster {
+    width: 120px;
+    height: 180px;
+  }
+}
+
+@media (max-width: 900px) {
+  .discover-top-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 767px) {
+  .discover-top-grid {
+    margin-top: 16px;
+  }
+
+  .filter-row {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 7px;
+  }
+
+  .filter-row > label {
+    text-align: left;
+  }
+
+  .wrap-radio-group :deep(.n-radio-button) {
+    flex: 1 1 auto;
+    text-align: center;
+  }
+
+  .year-range-control {
+    display: grid !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .year-range-control :deep(.n-input-number) {
+    width: 100%;
+  }
+
+  .responsive-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    margin-top: 16px;
+  }
 }
 </style>

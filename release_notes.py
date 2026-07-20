@@ -2,9 +2,33 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.0",
+        "published_at": "2026-07-21T02:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.0",
+        "changelog": """## EVH 全新界面与独立项目版本
+
+### 新增
+- 项目正式采用 EVH（Emby Vision Hub）名称，作为 Emby 媒体库管理与自动化中枢独立演进。
+- 登录、初始化、邀请注册和后台页面统一使用新的响应式界面、图标与品牌标题。
+- 套用 MoviePilot 风格的跟随系统、浅色、深色、幻紫和透明五套主题，并提供主色、圆角、边框、阴影、布局、透明度与模糊度实时调节。
+- 头像菜单集中承载个人中心、系统设置、用户管理、界面布局、主题、帮助、关于、重启和退出入口，缩短侧栏导航。
+- 合并 7.1.15 至 7.1.19 的演员补充、人物清理保护、豆瓣身份确认和 Webhook 追更定点刷新修复。
+
+### 优化
+- 重构影视探索筛选区和用户中心卡片布局，桌面、中等窗口和手机端均可自动换列与换行。
+- 逐页修复设置、封面生成、自动标签、合集、订阅与管理页面的横向溢出、标题错位和移动端操作区裁切。
+- 透明主题支持三档预设、底色透明度、玻璃模糊、背景透明度、背景磨砂和轻量/实时玻璃质量。
+- Webhook 追更对剧集容器使用非递归刷新，并只定点刷新本次新增分集，避免单集更新触发整库递归任务。
+
+### 兼容说明
+- 现有 `/config`、PostgreSQL 数据、容器名和 `tzyzero186/emby-toolkit` 镜像标识继续兼容，升级 7.2.0 不需要迁移业务数据。
+- 项目源代码继续按 AGPL-3.0 发布，并保留完整修改历史。
+""",
+    },
+    {
         "version": "v7.1.19",
         "published_at": "2026-07-21T01:35:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.19",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.19",
         "changelog": """## Webhook 追更定点刷新热修复
 
 ### 修复
@@ -21,7 +45,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.18",
         "published_at": "2026-07-21T01:05:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.18",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.18",
         "changelog": """## TMDb/豆瓣双身份演员补充
 
 ### 修复
@@ -42,7 +66,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.17",
         "published_at": "2026-07-21T00:45:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.17",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.17",
         "changelog": """## 豆瓣演员身份确认与同名去重修复
 
 ### 修复
@@ -59,7 +83,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.16",
         "published_at": "2026-07-21T00:20:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.16",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.16",
         "changelog": """## 豆瓣演员头像回退修复
 
 ### 修复
@@ -75,7 +99,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.15",
         "published_at": "2026-07-20T23:40:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.15",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.15",
         "changelog": """## 保护库人物与演员补充安全修复
 
 ### 修复
@@ -96,7 +120,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.14",
         "published_at": "2026-07-20T22:45:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.14",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.14",
         "changelog": """## 前后端版本标识同步修复
 
 ### 修复
@@ -110,7 +134,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.13",
         "published_at": "2026-07-20T22:35:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.13",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.13",
         "changelog": """## STRM 连续入库解阻热修复
 
 ### 修复
@@ -132,7 +156,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.12",
         "published_at": "2026-07-20T02:40:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.12",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.12",
         "changelog": """## STRM 整部剧删除解卡热修复
 
 ### 修复
@@ -154,7 +178,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.11",
         "published_at": "2026-07-20T02:00:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.11",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.11",
         "changelog": """## STRM 整库刷新保护热修复
 
 ### 修复
@@ -172,7 +196,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.10",
         "published_at": "2026-07-19T10:30:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.10",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.10",
         "changelog": """## STRM 精准监控与有限重试
 
 ### 新增
@@ -188,10 +212,6 @@ CUSTOM_RELEASES = [
 - 低频库存可补偿 watchdog 漏失事件，并只处理新增、指纹变化、重新出现或首次消失的路径；永久缺失条目确认后不再重复扫描。
 - 同文件名 STRM 内容被洗版替换时会响应 modified 事件，通知 Emby 更新该精确路径。
 
-### 项目维护
-- 更新页赞助二维码替换为 CosmoTown 微信收款码；帮助、反馈、README、Wiki 与旧设置页统一指向 `cosmotown/emby-toolkit`。
-- GitHub Pages 改为从实际维护分支发布，Docker 文档统一使用 `tzyzero186/emby-toolkit:latest`。
-
 ### 安全边界
 - Toolkit 只负责发现文件变化、通知并核对 Emby；不会调用 MP、115、神医或网盘删除接口，也不会直接修改 Emby 数据库。
 - 仅新增独立的 STRM 队列表与库存根表；不修改现有媒体、人物、虚拟库、Webhook、封面或 302 转发数据。
@@ -201,7 +221,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.9",
         "published_at": "2026-07-18T03:30:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.9",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.9",
         "changelog": """## STRM 精确入库与自动查漏
 
 ### 新增
@@ -229,7 +249,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.8",
         "published_at": "2026-07-15T01:30:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.8",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.8",
         "changelog": """## 保护库重复人物修复
 
 ### 修复
@@ -246,7 +266,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.7",
         "published_at": "2026-07-14T23:30:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.7",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.7",
         "changelog": """## 人物清理候选选择修复
 
 ### 修复
@@ -263,7 +283,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.6",
         "published_at": "2026-07-14T20:45:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.6",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.6",
         "changelog": """## 人物清理受保护媒体库
 
 ### 新增
@@ -280,7 +300,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.5",
         "published_at": "2026-07-14T18:42:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.5",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.5",
         "changelog": """## 幽灵人物人工核对
 
 ### 新增
@@ -298,7 +318,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.4",
         "published_at": "2026-07-13T19:25:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.4",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.4",
         "changelog": """## 人物头像代理安全修复
 
 ### 修复
@@ -313,7 +333,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.3",
         "published_at": "2026-07-13T00:34:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.3",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.3",
         "changelog": """## 维护与人物清理安全化
 
 ### 修复
@@ -337,7 +357,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.2",
         "published_at": "2026-07-12T21:45:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.2",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.2",
         "changelog": """## Webhook 队列诊断
 
 ### 新增
@@ -354,7 +374,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.1",
         "published_at": "2026-07-12T01:41:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.1",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.1",
         "changelog": """## 虚拟电影合集与媒体去重安全修复
 
 ### 修复
@@ -371,7 +391,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.1.0",
         "published_at": "2026-07-12T00:14:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.1.0",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.1.0",
         "changelog": """## Emby 入库可靠事件队列
 
 ### 新增
@@ -392,7 +412,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.24",
         "published_at": "2026-07-11T22:19:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.0.24",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.0.24",
         "changelog": """## 旋转堆叠构图收尾
 
 ### 修复
@@ -407,7 +427,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.23",
         "published_at": "2026-07-11T20:41:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.0.23",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.0.23",
         "changelog": """## 扇形接力换图与旋转堆叠坐标统一
 
 ### 修复
@@ -423,7 +443,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.22",
         "published_at": "2026-07-11T16:00:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/releases/tag/v7.0.22",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.0.22",
         "changelog": """## 动态素材去重与远端更新发现
 
 ### 修复
@@ -434,13 +454,13 @@ CUSTOM_RELEASES = [
 
 ### 调整
 - 动态背景统一增加约 12% 的轻遮罩，在保留清晰度的同时稍微压住过亮背景。
-- 更新页恢复远端版本发现：优先读取 `cosmotown/emby-toolkit` 的 GitHub Releases，没有 Release 时回退 Tags，并与本地详细更新记录合并。
+- 更新页恢复远端版本发现：优先读取项目仓库的 GitHub Releases，没有 Release 时回退 Tags，并与本地详细更新记录合并。
 """,
     },
     {
         "version": "v7.0.21",
         "published_at": "2026-07-11T14:00:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.21",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.21",
         "changelog": """## 动态封面轨道与亮度修正
 
 ### 修复
@@ -457,7 +477,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.20",
         "published_at": "2026-07-11T10:00:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.20",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.20",
         "changelog": """## 动态海报素材与背景修正
 
 ### 修复
@@ -474,7 +494,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.19",
         "published_at": "2026-07-11T09:00:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.19",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.19",
         "changelog": """## 自建合集封面忽略规则
 
 ### 修复
@@ -491,7 +511,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.18",
         "published_at": "2026-07-11T08:32:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.18",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.18",
         "changelog": """## 统一封面入口与动态模板修正
 
 ### 新增
@@ -511,7 +531,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.17",
         "published_at": "2026-07-11T01:23:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.17",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.17",
         "changelog": """## 动态背景清晰化与生成提速
 
 ### 修复
@@ -527,7 +547,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.16",
         "published_at": "2026-07-11T00:20:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.16",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.16",
         "changelog": """## 动态背景联动与节奏修正
 
 ### 修复
@@ -543,7 +563,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.15",
         "published_at": "2026-07-10T03:00:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.15",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.15",
         "changelog": """## 动态堆叠修正
 
 ### 修复
@@ -557,7 +577,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.14",
         "published_at": "2026-07-10T02:10:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.14",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.14",
         "changelog": """## 动态模板扩展与节奏优化
 
 ### 新增
@@ -574,7 +594,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.13",
         "published_at": "2026-07-10T01:15:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.13",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.13",
         "changelog": """## 动态聚焦封面修正
 
 ### 修复
@@ -589,7 +609,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.12",
         "published_at": "2026-07-10T00:30:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.12",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.12",
         "changelog": """## 动态封面体验修正
 
 ### 修复
@@ -605,7 +625,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.11",
         "published_at": "2026-07-09T20:45:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.11",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.11",
         "changelog": """## 新增动态 ChillPoster 模板
 
 ### 新增
@@ -621,7 +641,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.10",
         "published_at": "2026-07-09T20:10:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.10",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.10",
         "changelog": """## 前端版本显示与动态速度修正
 
 ### 修复
@@ -635,7 +655,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.9",
         "published_at": "2026-07-09T01:10:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.9",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.9",
         "changelog": """## 动态封面架构重做
 
 ### 修复
@@ -653,7 +673,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.8",
         "published_at": "2026-07-09T00:20:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.8",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.8",
         "changelog": """## 动态封面轻量化
 
 ### 修复
@@ -669,7 +689,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.7",
         "published_at": "2026-07-08T23:05:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.7",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.7",
         "changelog": """## 动态封面生成热修复
 
 ### 修复
@@ -685,7 +705,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.6",
         "published_at": "2026-07-08T22:30:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.6",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.6",
         "changelog": """## 封面上传闭环修复
 
 ### 修复
@@ -701,7 +721,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.5",
         "published_at": "2026-07-01T19:20:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.5",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.5",
         "changelog": """## ChillPoster 字体修复
 
 ### 修复
@@ -715,7 +735,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.4",
         "published_at": "2026-07-01T18:45:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.4",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.4",
         "changelog": """## ChillPoster 标题热修复
 
 ### 修复
@@ -726,7 +746,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.3",
         "published_at": "2026-07-01T06:05:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.3",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.3",
         "changelog": """## 封面生成热修复
 
 ### 修复
@@ -741,7 +761,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.2",
         "published_at": "2026-07-01T02:35:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.2",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.2",
         "changelog": """## 启动失败热修复
 
 ### 修复
@@ -752,7 +772,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.1",
         "published_at": "2026-07-01T02:10:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.1",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.1",
         "changelog": """## 封面与更新链路修复
 
 ### 修复
@@ -767,7 +787,7 @@ CUSTOM_RELEASES = [
     {
         "version": "v7.0.0",
         "published_at": "2026-07-01T01:20:00+08:00",
-        "url": "https://github.com/cosmotown/emby-toolkit/tree/v7.0.0",
+        "url": "https://github.com/cosmotown/emby-vision-hub/tree/v7.0.0",
         "changelog": """## 基于原 6.8.9 分支定制
 
 ### 新增

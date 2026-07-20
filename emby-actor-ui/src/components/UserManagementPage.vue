@@ -41,7 +41,13 @@ import UserTemplates from './UserTemplates.vue';
 
 <style scoped>
 .user-management-page {
-  padding: 10px;
+  padding: 24px;
+}
+
+@media (max-width: 767px) {
+  .user-management-page {
+    padding: 12px;
+  }
 }
 h1 {
   font-size: 24px;

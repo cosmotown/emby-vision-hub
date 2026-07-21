@@ -134,14 +134,20 @@ class PersonCleanupSafetyTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
         }
         merge_source = ast.unparse(functions['merge_protected_people_for_library'])
+        merge_names_source = ast.unparse(functions['merge_protected_names_for_library'])
         replace_candidates_source = ast.unparse(functions['replace_candidates'])
         task_source = (repo_root / 'tasks' / 'actors.py').read_text()
         schema_source = (repo_root / 'database' / 'connection.py').read_text()
 
         self.assertNotIn('DELETE FROM person_cleanup_protected_people', merge_source)
+        self.assertNotIn('DELETE FROM person_cleanup_protected_names', merge_names_source)
         self.assertIn('_exclude_protected_candidates', replace_candidates_source)
         self.assertIn('ON CONFLICT', merge_source)
+        self.assertIn('ON CONFLICT', merge_names_source)
         self.assertIn('merge_protected_people_for_library', task_source)
+        self.assertIn('merge_protected_names_for_library', task_source)
+        self.assertIn('_scan_protected_library_people', task_source)
+        self.assertIn('names_without_id', task_source)
         self.assertIn('get_protected_person_ids', task_source)
         self.assertIn('get_protected_person_names', task_source)
         self.assertIn('capture_library_ids=protected_library_ids', task_source)
@@ -150,6 +156,7 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertIn('person_name_protection_keys(person_name)', task_source)
         self.assertIn('person_cleanup_protected_libraries', schema_source)
         self.assertIn('person_cleanup_protected_people', schema_source)
+        self.assertIn('person_cleanup_protected_names', schema_source)
 
 
 if __name__ == '__main__':

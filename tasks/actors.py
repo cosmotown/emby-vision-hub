@@ -24,6 +24,76 @@ from services.person_cleanup_safety import (
 
 logger = logging.getLogger(__name__)
 
+def _scan_protected_library_people(processor, protected_libraries, batch_size: int = 500):
+    """Read every protected library page and preserve people even when Emby omits Person IDs."""
+    snapshots = {}
+    api_url = f"{processor.emby_url.rstrip('/')}/Items"
+    safe_batch_size = max(1, int(batch_size))
+
+    for protected_library in protected_libraries:
+        library_id = str(protected_library.get('library_id') or '').strip()
+        library_name = str(protected_library.get('library_name') or library_id).strip() or library_id
+        if not library_id:
+            continue
+
+        people_by_id = {}
+        names_without_id = set()
+        media_count = 0
+        start_index = 0
+
+        while True:
+            params = {
+                'api_key': processor.emby_api_key,
+                'ParentId': library_id,
+                'Recursive': 'true',
+                'IncludeItemTypes': 'Movie,Series,Episode,Video,MusicVideo',
+                'Fields': 'People',
+                'StartIndex': start_index,
+                'Limit': safe_batch_size,
+                'EnableTotalRecordCount': 'false',
+            }
+            try:
+                response = emby.emby_client.get(api_url, params=params, timeout=60)
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict) or 'Items' not in payload:
+                    raise ValueError('Emby 响应缺少 Items')
+                items = payload.get('Items') or []
+            except Exception as exc:
+                raise RuntimeError(
+                    f"受保护媒体库 '{library_name}' 读取失败，已拒绝继续人物清理: {exc}"
+                ) from exc
+
+            if not items:
+                break
+
+            media_count += len(items)
+            for item in items:
+                for person in item.get('People') or []:
+                    person_id = str(person.get('Id') or '').strip()
+                    person_name = str(person.get('Name') or '').strip()
+                    if person_id:
+                        people_by_id[person_id] = person_name
+                    elif person_name:
+                        names_without_id.add(person_name)
+
+            start_index += len(items)
+            if len(items) < safe_batch_size:
+                break
+
+        if media_count > 0 and not people_by_id and not names_without_id:
+            raise RuntimeError(
+                f"受保护媒体库 '{library_name}' 包含媒体但未返回任何人物，已拒绝生成或删除候选"
+            )
+
+        snapshots[library_id] = {
+            'people_by_id': people_by_id,
+            'names_without_id': names_without_id,
+            'media_count': media_count,
+        }
+
+    return snapshots
+
 
 def task_scan_ghost_actor_candidates(processor):
     task_name = "扫描幽灵人物"
@@ -60,16 +130,15 @@ def task_scan_ghost_actor_candidates(processor):
         referenced_person_ids = reference_scan['person_ids']
         logger.info(f"  ➜ 已建立 {len(referenced_person_ids)} 位在用人物的安全白名单。")
 
-        protected_snapshots = reference_scan.get('people_by_library') or {}
+        protected_snapshots = _scan_protected_library_people(
+            processor,
+            protected_libraries,
+        )
         for protected_library in protected_libraries:
             library_id = str(protected_library.get('library_id') or '')
-            library_people = protected_snapshots.get(library_id)
-            if library_people is None:
-                logger.warning(
-                    f"  ➜ 受保护媒体库 '{protected_library.get('library_name') or library_id}' "
-                    "本次未返回人物快照，保留原保护记录。"
-                )
-                continue
+            snapshot = protected_snapshots.get(library_id) or {}
+            library_people = snapshot.get('people_by_id') or {}
+            names_without_id = snapshot.get('names_without_id') or set()
             person_cleanup_db.merge_protected_people_for_library(
                 library_id,
                 [
@@ -77,10 +146,14 @@ def task_scan_ghost_actor_candidates(processor):
                     for person_id, person_name in library_people.items()
                 ],
             )
+            person_cleanup_db.merge_protected_names_for_library(
+                library_id,
+                names_without_id,
+            )
 
         protected_person_ids = person_cleanup_db.get_protected_person_ids()
         protected_person_names = person_cleanup_db.get_protected_person_names()
-        if protected_person_ids:
+        if protected_person_ids or protected_person_names:
             referenced_person_ids = referenced_person_ids | protected_person_ids
             logger.info(
                 f"  ➜ 受保护媒体库快照额外保护 {len(protected_person_ids)} 个人物 ID、"
@@ -113,7 +186,8 @@ def task_scan_ghost_actor_candidates(processor):
         saved_count = person_cleanup_db.replace_candidates(candidates)
         message = (
             f"只读扫描完成：发现 {saved_count} 位待人工复核的幽灵人物候选；"
-            f"保护库快照覆盖 {len(protected_person_ids)} 位人物。"
+            f"保护库快照覆盖 {len(protected_person_ids)} 个 ID、"
+            f"{len(protected_person_names)} 个姓名。"
         )
         logger.info(f"  ➜ {message}")
         task_manager.update_status_from_thread(100, message)
@@ -135,6 +209,32 @@ def task_delete_selected_ghost_actors(processor, person_ids):
     if not requested_ids or len(candidate_map) != len(requested_ids):
         task_manager.update_status_from_thread(-1, "删除已取消：包含不在候选列表中的人物")
         return
+
+    protected_libraries = person_cleanup_db.list_protected_libraries()
+    try:
+        protected_snapshots = _scan_protected_library_people(
+            processor,
+            protected_libraries,
+        )
+    except Exception as exc:
+        logger.error(f"删除前保护库复核失败: {exc}", exc_info=True)
+        task_manager.update_status_from_thread(-1, f"删除已取消：{exc}")
+        return
+
+    for protected_library in protected_libraries:
+        library_id = str(protected_library.get('library_id') or '')
+        snapshot = protected_snapshots.get(library_id) or {}
+        person_cleanup_db.merge_protected_people_for_library(
+            library_id,
+            [
+                {'person_id': person_id, 'person_name': person_name}
+                for person_id, person_name in (snapshot.get('people_by_id') or {}).items()
+            ],
+        )
+        person_cleanup_db.merge_protected_names_for_library(
+            library_id,
+            snapshot.get('names_without_id') or set(),
+        )
 
     deleted_count = 0
     linked_count = 0

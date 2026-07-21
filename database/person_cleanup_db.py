@@ -114,9 +114,13 @@ def list_protected_libraries() -> List[Dict[str, Any]]:
             cursor.execute(
                 """
                 SELECT library_id, library_name, updated_at,
-                       (SELECT COUNT(*)
-                        FROM person_cleanup_protected_people people
-                        WHERE people.library_id = libraries.library_id) AS protected_person_count
+                       ((SELECT COUNT(*)
+                         FROM person_cleanup_protected_people people
+                         WHERE people.library_id = libraries.library_id)
+                        +
+                        (SELECT COUNT(*)
+                         FROM person_cleanup_protected_names names
+                         WHERE names.library_id = libraries.library_id)) AS protected_person_count
                 FROM person_cleanup_protected_libraries libraries
                 ORDER BY library_name ASC, library_id ASC
                 """
@@ -186,6 +190,40 @@ def merge_protected_people_for_library(
     return len(normalized)
 
 
+def merge_protected_names_for_library(
+    library_id: str,
+    person_names: Iterable[str],
+) -> int:
+    normalized = {}
+    for person_name in person_names:
+        raw_name = str(person_name or '').strip()
+        if not raw_name:
+            continue
+        for protection_key in person_name_protection_keys(raw_name):
+            if protection_key:
+                normalized[protection_key] = raw_name
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            if normalized:
+                cursor.executemany(
+                    """
+                    INSERT INTO person_cleanup_protected_names (
+                        library_id, normalized_name, person_name, captured_at
+                    )
+                    VALUES (%s, %s, %s, NOW())
+                    ON CONFLICT (library_id, normalized_name) DO UPDATE SET
+                        person_name = EXCLUDED.person_name,
+                        captured_at = NOW()
+                    """,
+                    [
+                        (str(library_id), protection_key, normalized[protection_key])
+                        for protection_key in sorted(normalized)
+                    ],
+                )
+    return len(normalized)
+
+
 def get_protected_person_ids() -> set[str]:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -198,8 +236,12 @@ def get_protected_person_names() -> set[str]:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT DISTINCT person_name
+                SELECT person_name
                 FROM person_cleanup_protected_people
+                WHERE NULLIF(BTRIM(person_name), '') IS NOT NULL
+                UNION
+                SELECT person_name
+                FROM person_cleanup_protected_names
                 WHERE NULLIF(BTRIM(person_name), '') IS NOT NULL
                 """
             )

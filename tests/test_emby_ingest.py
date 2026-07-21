@@ -48,6 +48,75 @@ class EmbyIngestTests(unittest.TestCase):
     def test_empty_config_path_never_becomes_current_directory(self):
         self.assertEqual([], emby_ingest.normalize_paths(["", "  ", None], require_existing=False))
 
+    @mock.patch("services.emby_ingest.emby.get_all_libraries_with_paths")
+    def test_notification_paths_group_files_by_media_title_directory(
+        self,
+        get_libraries,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            tv_root = os.path.join(directory, "电视剧")
+            movie_root = os.path.join(directory, "电影")
+
+            first_show = os.path.join(
+                tv_root,
+                "剧集甲 (2024) {tmdb-1001}",
+            )
+            second_show = os.path.join(
+                tv_root,
+                "剧集乙 (2025) {tmdb-1002}",
+            )
+            movie_directory = os.path.join(
+                movie_root,
+                "电影甲 (2026) {tmdb-2001}",
+            )
+
+            first_season = os.path.join(first_show, "Season 01")
+            second_season = os.path.join(second_show, "Season 01")
+
+            os.makedirs(first_season)
+            os.makedirs(second_season)
+            os.makedirs(movie_directory)
+
+            paths = [
+                os.path.join(first_season, "S01E01.strm"),
+                os.path.join(first_season, "S01E02.strm"),
+                os.path.join(second_season, "S01E01.strm"),
+                os.path.join(movie_directory, "电影甲.strm"),
+            ]
+
+            for index, path in enumerate(paths):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(
+                        f"http://example.invalid/media/{index}\n"
+                    )
+
+            get_libraries.return_value = [
+                {
+                    "info": {"Id": "tv-library"},
+                    "paths": [tv_root],
+                },
+                {
+                    "info": {"Id": "movie-library"},
+                    "paths": [movie_root],
+                },
+            ]
+
+            targets = emby_ingest._notification_paths(
+                paths,
+                "http://emby",
+                "token",
+            )
+
+        self.assertEqual(
+            sorted([
+                first_show,
+                second_show,
+                movie_directory,
+            ]),
+            targets,
+        )
+        self.assertNotIn(tv_root, targets)
+        self.assertNotIn(movie_root, targets)
     def test_strm_inventory_tracks_each_exact_path_and_fingerprint(self):
         with tempfile.TemporaryDirectory() as directory:
             first, second = self._make_strm_files(directory, 2)

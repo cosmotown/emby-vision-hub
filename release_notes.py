@@ -2,6 +2,29 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.3",
+        "published_at": "2026-07-21T18:18:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.3",
+        "changelog": """## 人物翻译稳定性修复
+
+### 修复
+- 修复使用 TMDb `original_name` 翻译人物名后，无法映射回 Emby 当前 Person 项目，导致翻译成功但人物名未写回的问题。
+- 人物中文化任务现在会先将 AI 返回的原始姓名映射回对应的 Emby 姓名，再更新正确的 Person。
+- 人物翻译批次由 50 人降至 20 人，降低大批量请求耗时和失败概率。
+- OpenAI 兼容接口请求超时由 300 秒收紧为 120 秒，并关闭 SDK 自动重试，避免单次异常请求长时间占用任务。
+- 120 秒超时针对当前实际约 97 秒的慢请求保留了合理余量。
+
+### 影响范围
+- 不在 Webhook 入库流程中实时批量改写全局 Person 姓名。
+- Webhook 继续负责当前媒体的元数据与角色信息。
+- “中文化人物名”独立任务负责扫描和更新 Emby 外文 Person。
+
+### 测试
+- `ai_translator.py` 与 `tasks/actors.py` Python 语法检查通过。
+- Git diff 空白及格式检查通过。
+""",
+    },
+    {
         "version": "v7.2.2",
         "published_at": "2026-07-21T15:32:37+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.2",

@@ -2,6 +2,27 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.2",
+        "published_at": "2026-07-21T15:32:37+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.2",
+        "changelog": """## 原生合集封面兼容修复
+
+### 修复
+- 修复历史 Emby `/Items/.../Images/Primary` 路径被错误拼接到 TMDb 图片域名而持续产生 HTTP 404 的问题。
+- `/Items/...` 与 `/emby/Items/...` 图片路径统一通过 EVH 的 Emby 图片代理加载。
+- TMDb 相对图片路径和完整 HTTP(S) 图片地址继续使用原有安全代理规则。
+
+### 影响范围
+- 本次仅修复“原生合集”页面的合集封面显示。
+- 不修改媒体文件、入库状态、订阅、Webhook 或 STRM 刷新流程。
+- 无需删除或迁移 `collections_info` 中已有的历史记录。
+
+### 测试
+- 前端 Vite 生产构建通过。
+- 已验证 Emby 路径、带 `/emby` 前缀路径、TMDb 相对路径、完整外部 URL 和空图片路径。
+""",
+    },
+    {
         "version": "v7.2.1",
         "published_at": "2026-07-21T12:38:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.1",

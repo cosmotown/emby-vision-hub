@@ -80,10 +80,101 @@ def normalize_paths(file_paths: Iterable[str], require_existing: bool = True) ->
     return sorted(paths)
 
 
-def _notification_paths(file_paths: Iterable[str]) -> List[str]:
-    paths = set(file_paths)
-    paths.update(os.path.dirname(path) for path in list(paths))
-    return sorted(paths)
+def _notification_paths(
+    file_paths: Iterable[str],
+    base_url: str,
+    api_key: str,
+) -> List[str]:
+    """
+    将同一媒体作品的多个文件聚合为一个作品目录通知。
+
+    电视剧、动漫、纪录片、特摄剧和目录化电影：
+    通知媒体库根目录下的作品目录。
+
+    直接平铺在电影库根目录的电影：
+    仍然通知具体文件。
+
+    本函数永远不返回媒体库根目录。
+    """
+    paths = normalize_paths(file_paths)
+    if not paths:
+        return []
+
+    libraries = emby.get_all_libraries_with_paths(base_url, api_key)
+    library_roots = sorted(
+        {
+            os.path.normpath(str(root_path))
+            for library in libraries
+            for root_path in (library.get('paths') or [])
+            if str(root_path or '').strip()
+        },
+        key=len,
+        reverse=True,
+    )
+
+    targets: Set[str] = set()
+
+    for path in paths:
+        normalized_path = os.path.normcase(os.path.normpath(path))
+        matched_root: Optional[str] = None
+
+        for root_path in library_roots:
+            normalized_root = os.path.normcase(
+                os.path.normpath(root_path)
+            )
+
+            try:
+                inside_root = (
+                    os.path.commonpath(
+                        [normalized_path, normalized_root]
+                    )
+                    == normalized_root
+                )
+            except ValueError:
+                inside_root = False
+
+            if inside_root:
+                matched_root = root_path
+                break
+
+        # 无法匹配媒体库根目录时，宁可通知具体文件，
+        # 也绝不向上扩大成媒体库根目录。
+        if not matched_root:
+            targets.add(path)
+            continue
+
+        relative_path = os.path.relpath(path, matched_root)
+        parts = [
+            part
+            for part in relative_path.split(os.sep)
+            if part not in ('', '.')
+        ]
+
+        # 文件直接平铺在媒体库根目录：
+        # 只能通知具体文件，不能通知媒体库根目录。
+        if len(parts) <= 1:
+            targets.add(path)
+            continue
+
+        # 取媒体库根目录下的第一级目录，即作品目录。
+        item_directory = os.path.normpath(
+            os.path.join(matched_root, parts[0])
+        )
+
+        if (
+            os.path.normcase(item_directory)
+            == os.path.normcase(os.path.normpath(matched_root))
+        ):
+            targets.add(path)
+        else:
+            targets.add(item_directory)
+
+    logger.info(
+        f"  ➜ STRM 精确通知聚合：{len(paths)} 个文件 -> "
+        f"{len(targets)} 个作品目标。"
+    )
+
+    return sorted(targets)
 
 
 def _deletion_notification_paths(
@@ -457,7 +548,12 @@ def _refresh_parent_targets(
         logger.info(f"  ➜ STRM 入库刷新 Emby 锚点: '{anchor_name}' ({anchor_id})")
         refreshed = False
         try:
-            refreshed = emby.refresh_item_by_id(anchor_id, base_url, api_key)
+            refreshed = emby.refresh_item_by_id(
+                anchor_id,
+                base_url,
+                api_key,
+                recursive=False,
+            )
         finally:
             _finish_anchor_refresh(refresh_key, refreshed)
         if not refreshed:
@@ -498,7 +594,7 @@ def refresh_and_verify_paths(
     # old lock scope turned every batch into another 45-second queue slot.
     with INGEST_REFRESH_LOCK:
         refresh_ok = emby.notify_media_paths_updated(
-            _notification_paths(paths),
+            _notification_paths(paths, base_url, api_key),
             base_url,
             api_key,
         )
@@ -525,7 +621,11 @@ def refresh_and_verify_paths(
             retry_paths = sorted(missing | failed)
             with INGEST_REFRESH_LOCK:
                 refresh_ok = emby.notify_media_paths_updated(
-                    _notification_paths(retry_paths),
+                    _notification_paths(
+                        retry_paths,
+                        base_url,
+                        api_key,
+                    ),
                     base_url,
                     api_key,
                 ) and refresh_ok

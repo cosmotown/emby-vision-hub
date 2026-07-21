@@ -1864,6 +1864,10 @@ class MediaProcessor:
         ))
 
         if not episode_ids:
+            logger.info(
+                f"  ➜ [追更刷新] '{item_name_for_log}' 未取得具体分集 ID，"
+                "仅非递归刷新当前媒体容器，不刷新其子项目。"
+            )
             return emby.refresh_emby_item_metadata(
                 item_emby_id=item_id,
                 emby_server_url=self.emby_url,
@@ -1871,6 +1875,7 @@ class MediaProcessor:
                 user_id_for_ops=self.emby_user_id,
                 replace_all_metadata_param=True,
                 item_name_for_log=item_name_for_log,
+                recursive_override=False,
             )
 
         logger.info(

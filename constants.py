@@ -9,6 +9,13 @@ GITHUB_REPO_OWNER = "cosmotown"  # 您的 GitHub 用户名
 GITHUB_REPO_NAME = "emby-vision-hub" # 您的 GitHub 仓库名
 DEFAULT_DOCKER_IMAGE_NAME = "tzyzero186/emby-vision-hub:latest"
 LEGACY_UPSTREAM_DOCKER_IMAGE_NAME = "hbq0405/emby-toolkit:latest"
+LEGACY_OWN_DOCKER_IMAGE_NAME = "tzyzero186/emby-toolkit:latest"
+LEGACY_DOCKER_IMAGE_NAMES = frozenset({
+    LEGACY_UPSTREAM_DOCKER_IMAGE_NAME,
+    "hbq0405/emby-toolkit",
+    LEGACY_OWN_DOCKER_IMAGE_NAME,
+    "tzyzero186/emby-toolkit",
+})
 ENV_VAR_DOCKER_IMAGE_NAME = "DOCKER_IMAGE_NAME"
 CONFIG_OPTION_DOCKER_IMAGE_NAME = "docker_image_name"
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "").lower() in ("1", "true", "yes", "on")

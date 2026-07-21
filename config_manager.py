@@ -171,6 +171,14 @@ DYNAMIC_CONFIG_DEF = {
 # 其他模块可以通过 from config_manager import APP_CONFIG 来访问
 APP_CONFIG: Dict[str, Any] = {}
 
+def _normalize_docker_image_name(value: Any) -> str:
+    """将已知旧镜像名迁移到当前 EVH 镜像；未知自定义镜像保持原样。"""
+    configured_image = str(value or "").strip()
+    if configured_image in constants.LEGACY_DOCKER_IMAGE_NAMES:
+        return constants.DEFAULT_DOCKER_IMAGE_NAME
+    return configured_image
+
+
 # --- 加载配置 ---
 def load_config():
     """
@@ -249,6 +257,28 @@ def load_config():
         # 使用 'dynamic_app_config' 作为唯一的键来获取所有动态配置
         dynamic_config_from_db = settings_db.get_setting('dynamic_app_config') or {}
         
+        if not isinstance(dynamic_config_from_db, dict):
+            logger.warning("数据库中的 dynamic_app_config 不是字典，已忽略异常值。")
+            dynamic_config_from_db = {}
+
+        stored_docker_image = dynamic_config_from_db.get(
+            constants.CONFIG_OPTION_DOCKER_IMAGE_NAME
+        )
+        migrated_docker_image = _normalize_docker_image_name(stored_docker_image)
+        if stored_docker_image and migrated_docker_image != str(stored_docker_image).strip():
+            dynamic_config_from_db[constants.CONFIG_OPTION_DOCKER_IMAGE_NAME] = migrated_docker_image
+            try:
+                settings_db.save_setting('dynamic_app_config', dynamic_config_from_db)
+            except Exception:
+                logger.warning(
+                    "旧 Docker 镜像配置已在内存中迁移，但写回数据库失败。",
+                    exc_info=True,
+                )
+            logger.warning(
+                "检测到旧 Docker 镜像配置 '%s'，已迁移为 '%s'。",
+                stored_docker_image,
+                migrated_docker_image,
+            )
         # 将数据库中的配置与 DYNAMIC_CONFIG_DEF 中定义的默认值合并
         # 这样可以确保即使数据库中的配置不完整，或者未来代码中新增了配置项，程序也能正常工作
         final_dynamic_config = {}
@@ -288,6 +318,12 @@ def save_config(new_config: Dict[str, Any]):
         # 步骤 2: 将前端传入的新配置更新（合并）到这个完整的配置对象中
         # 这确保了只更新变化的键，而不会丢失其他键
         full_dynamic_config.update(new_config)
+        if constants.CONFIG_OPTION_DOCKER_IMAGE_NAME in full_dynamic_config:
+            full_dynamic_config[constants.CONFIG_OPTION_DOCKER_IMAGE_NAME] = (
+                _normalize_docker_image_name(
+                    full_dynamic_config[constants.CONFIG_OPTION_DOCKER_IMAGE_NAME]
+                )
+            )
         
         # 步骤 3: (可选但推荐) 创建一个最终要保存的字典，确保只包含在 DYNAMIC_CONFIG_DEF 中定义的合法键
         # 这样可以防止任何意外的键被存入数据库
@@ -309,12 +345,15 @@ def save_config(new_config: Dict[str, Any]):
         raise
 
 def get_docker_image_name() -> str:
-    configured_image = APP_CONFIG.get(constants.CONFIG_OPTION_DOCKER_IMAGE_NAME)
-    if configured_image == constants.LEGACY_UPSTREAM_DOCKER_IMAGE_NAME:
-        configured_image = ""
+    configured_image = _normalize_docker_image_name(
+        APP_CONFIG.get(constants.CONFIG_OPTION_DOCKER_IMAGE_NAME)
+    )
+    environment_image = _normalize_docker_image_name(
+        os.environ.get(constants.ENV_VAR_DOCKER_IMAGE_NAME)
+    )
     return (
         configured_image
-        or os.environ.get(constants.ENV_VAR_DOCKER_IMAGE_NAME)
+        or environment_image
         or constants.DEFAULT_DOCKER_IMAGE_NAME
     )
 

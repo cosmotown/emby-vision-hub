@@ -1,7 +1,7 @@
 # release_notes.py
 
 CUSTOM_RELEASES = [
-        {
+    {
         "version": "v7.2.1",
         "published_at": "2026-07-21T12:38:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.1",

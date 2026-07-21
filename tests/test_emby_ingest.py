@@ -107,7 +107,12 @@ class EmbyIngestTests(unittest.TestCase):
         ]
 
         self.assertTrue(emby_ingest._refresh_parent_targets(paths, "http://emby", "token"))
-        refresh_item.assert_called_once_with("series-1", "http://emby", "token")
+        refresh_item.assert_called_once_with(
+            "series-1",
+            "http://emby",
+            "token",
+            recursive=False,
+        )
 
     @mock.patch("services.emby_ingest.emby.refresh_item_by_id", return_value=True)
     @mock.patch("services.emby_ingest.emby.find_nearest_library_anchor_details")
@@ -133,7 +138,12 @@ class EmbyIngestTests(unittest.TestCase):
         self.assertTrue(emby_ingest._refresh_parent_targets(first_batch, "http://emby", "token"))
         self.assertTrue(emby_ingest._refresh_parent_targets(second_batch, "http://emby", "token"))
 
-        refresh_item.assert_called_once_with("series-1", "http://emby", "token")
+        refresh_item.assert_called_once_with(
+            "series-1",
+            "http://emby",
+            "token",
+            recursive=False,
+        )
 
     @mock.patch("services.emby_ingest.emby.refresh_item_by_id")
     @mock.patch("services.emby_ingest.emby.find_nearest_library_anchor_details")

@@ -255,12 +255,16 @@ class EmbyIngestTests(unittest.TestCase):
                 (set(), {path}, set()),
                 ({path}, set(), set()),
             ]
-            result = emby_ingest.refresh_and_verify_paths(
-                [path],
-                "http://emby",
-                "token",
-                verify_delays=(8, 20),
-            )
+            with mock.patch(
+                "services.emby_ingest._notification_paths",
+                side_effect=lambda paths, *_args: list(paths),
+            ):
+                result = emby_ingest.refresh_and_verify_paths(
+                    [path],
+                    "http://emby",
+                    "token",
+                    verify_delays=(8, 20),
+                )
 
         self.assertEqual(1, result["indexed"])
         self.assertEqual([path], result["confirmed_paths"])
@@ -301,6 +305,9 @@ class EmbyIngestTests(unittest.TestCase):
             ), mock.patch(
                 "services.emby_ingest.check_indexed_paths",
                 side_effect=confirm_all,
+            ), mock.patch(
+                "services.emby_ingest._notification_paths",
+                side_effect=lambda paths, *_args: list(paths),
             ), mock.patch(
                 "services.emby_ingest.time.sleep",
                 side_effect=fake_sleep,

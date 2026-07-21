@@ -30,7 +30,6 @@ jobs:
         with:
           images: |
             ${{ secrets.DOCKERHUB_USERNAME }}/emby-vision-hub
-            ${{ secrets.DOCKERHUB_USERNAME }}/emby-toolkit
           tags: |
             # 规则1: 如果事件是推送到一个分支，就用分支名作为 Docker 标签。
             # 这会自动为默认分支(main)打上 'latest' 标签。

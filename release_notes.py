@@ -2,6 +2,38 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.4",
+        "published_at": "2026-07-21T22:21:09+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.4",
+        "changelog": """## 人物清理隔离、演员补充与自动更新修复
+
+### 人物清理安全
+- 受保护媒体库现在同时按 Emby Person ID 和规范化姓名建立独立快照；人物没有 TMDb、IMDb、豆瓣等外部 ID 时也会受到保护。
+- 受保护媒体库扫描失败、返回异常空快照或删除前无法完成实时复核时，人物清理将失败关闭，不生成或执行不安全删除。
+- 快照成功更新后会立即从候选列表中移除受保护人物；删除阶段再次复核，避免旧候选被误删。
+
+### 演员补充稳定性
+- 缺失的演员 ProviderIds 改为批量从 Emby 获取，消除逐人请求造成的 N+1 延迟。
+- 本地缓存只有在确实包含 ProviderIds 时才视为命中，空身份记录会继续向 Emby 查询。
+- 每位演员写入使用独立 SAVEPOINT；单个演员冲突只回滚当前演员，不再撤销本批次此前已成功写入的数据。
+
+### 自动更新与镜像
+- 自动迁移历史 `tzyzero186/emby-toolkit` 和上游 `hbq0405/emby-toolkit` 配置到 `tzyzero186/emby-vision-hub:latest`，并尝试写回数据库。
+- 未知自定义镜像仍保持原值并继续由更新器严格校验，不扩大受管理镜像范围。
+- Docker 发布工作流停止继续发布旧 `emby-toolkit` 镜像别名，只发布 `emby-vision-hub`。
+
+### 升级说明
+- v7.2.3 若仍保存旧镜像配置，首次升级到 v7.2.4 可能仍会被旧版更新器拦截，需要手动拉取并重建一次容器。
+- 进入 v7.2.4 后旧配置会自动迁移，后续自动更新恢复正常。
+
+### 测试
+- 人物清理、演员写入隔离和镜像迁移共 15 项测试全部通过。
+- 相关 Python 文件语法检查与 `git diff --check` 全部通过。
+- 已核对“同步媒体元数据”任务只写入 `media_metadata`，不会进入演员或 Person 写回流程。
+
+""",
+    },
+    {
         "version": "v7.2.3",
         "published_at": "2026-07-21T18:18:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.3",

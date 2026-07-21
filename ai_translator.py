@@ -108,7 +108,12 @@ class AITranslator:
         try:
             if self.provider == 'openai':
                 if not OPENAI_AVAILABLE: raise ImportError("OpenAI SDK 未安装")
-                self.client = OpenAI(api_key=self.api_key, base_url=self.base_url if self.base_url else None)
+                self.client = OpenAI(
+                    api_key=self.api_key,
+                    base_url=self.base_url if self.base_url else None,
+                    timeout=120,
+                    max_retries=0,
+                )
                 logger.info(f"  ➜ OpenAI 初始化成功")
             
             elif self.provider == 'zhipuai':
@@ -376,7 +381,7 @@ class AITranslator:
                 ],
                 temperature=0.0,
                 response_format={"type": "json_object"},
-                timeout=300
+                timeout=120
             )
             response_content = chat_completion.choices[0].message.content
             return _safe_json_loads(response_content) or {}
@@ -398,7 +403,7 @@ class AITranslator:
                 ],
                 temperature=0.0,
                 response_format={"type": "json_object"},
-                timeout=300
+                timeout=120
             )
             response_content = chat_completion.choices[0].message.content
             return _safe_json_loads(response_content) or {}
@@ -506,7 +511,7 @@ class AITranslator:
                 ],
                 temperature=0.0,
                 response_format={"type": "json_object"},
-                timeout=300
+                timeout=120
             )
             response_content = chat_completion.choices[0].message.content
             return _safe_json_loads(response_content) or {}

@@ -83,7 +83,7 @@ class WebhookTargetedRefreshTests(unittest.TestCase):
         self.assertEqual(refresh.call_count, 2)
 
     @patch('core_processor.emby.refresh_emby_item_metadata', return_value=True)
-    def test_non_followup_keeps_existing_auto_recursive_policy(self, refresh):
+    def test_missing_episode_ids_disable_recursive_refresh(self, refresh):
         processor = MediaProcessor.__new__(MediaProcessor)
         processor.emby_url = 'http://emby.invalid'
         processor.emby_api_key = 'secret-value'
@@ -95,7 +95,10 @@ class WebhookTargetedRefreshTests(unittest.TestCase):
 
         self.assertTrue(submitted)
         self.assertEqual(refresh.call_count, 1)
-        self.assertNotIn('recursive_override', refresh.call_args.kwargs)
+        self.assertEqual(
+            refresh.call_args.kwargs['recursive_override'],
+            False,
+        )
 
 
 if __name__ == '__main__':

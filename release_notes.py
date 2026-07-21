@@ -2,6 +2,34 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.5",
+        "published_at": "2026-07-22T01:37:06+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.5",
+        "changelog": """## 人物清理精确关联核验修复
+
+### 人物清理安全
+- 删除前复核不再只依赖 Emby `PersonIds` 查询结果；会逐项检查作品 `People` 中是否真的包含目标 Emby Person ID。
+- 同名但 Person ID 不同的人物不会被误判为目标人物；只有无 ID 的 People 记录才允许使用规范化姓名作为保守兜底。
+- Emby 未返回可核验的 People、响应异常或请求失败时继续失败关闭，不允许删除。
+
+### 保护库与身份核对
+- 受保护媒体库快照现在保存所有人物姓名，不再只保存缺少 Person ID 的姓名。
+- 同身份人物核对扩展为 TMDb、IMDb 和豆瓣三类外部 ID。
+- 人工核对接口会同时返回 Emby 查询命中数与精确人物关联数，便于识别同身份别名记录。
+
+### 影响范围
+- 不包含数据库结构变更。
+- 不会自动删除人物；仍需先只读扫描、人工核对，并在删除前再次实时复核。
+- 演员映射同步和演员数据补充流程保持不变。
+
+### 测试
+- 人物清理、演员写入隔离和镜像迁移相关 16 项后端测试全部通过。
+- 前端 Vite 生产构建通过。
+- Python 语法检查与 `git diff --check` 通过。
+
+""",
+    },
+    {
         "version": "v7.2.4",
         "published_at": "2026-07-21T22:21:09+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.4",

@@ -3298,16 +3298,17 @@ class MediaProcessor:
         emby_config_for_upsert = {"url": self.emby_url, "api_key": self.emby_api_key, "user_id": self.emby_user_id}
 
         for actor in final_cast_perfect:
-            # 直接将 actor 字典和 emby_config 传递给 upsert_person 函数
+            # upsert_person 内部使用 SAVEPOINT；失败只回滚当前演员，不影响本批次已成功写入。
             map_id, action = self.actor_db_manager.upsert_person(cursor, actor, emby_config_for_upsert)
-            
+
             if action not in ["ERROR", "SKIPPED", "CONFLICT_ERROR", "UNKNOWN_ERROR"]:
                 processed_count += 1
             else:
-                # 如果发生错误，回滚当前演员的操作，并为下一个演员开启新事务
-                # 这是为了防止一个演员的错误导致整个批次失败
-                cursor.connection.rollback()
-                cursor.execute("BEGIN")
+                logger.warning(
+                    "  ➜ 演员 '%s' 数据库回写未保留，结果=%s；继续处理下一位演员。",
+                    actor.get("name") or actor.get("id") or "未知演员",
+                    action,
+                )
 
         logger.info(f"  ➜ 成功处理了 {processed_count} 位演员的数据库回写/更新。")
 

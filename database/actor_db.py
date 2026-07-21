@@ -8,7 +8,7 @@ from datetime import datetime
 from .connection import get_db_connection
 from . import request_db
 from utils import contains_chinese
-from handler.emby import get_emby_item_details
+from handler.emby import get_emby_item_details, get_emby_items_by_id
 from config_manager import APP_CONFIG
 import extensions 
 import utils
@@ -183,10 +183,10 @@ class ActorDBManager:
                 db_results = cursor.fetchall()
 
                 for row in db_results:
-                    emby_id = row["emby_person_id"]
-                    ids_found_in_db.add(emby_id)
-                    
-                    # 构建 ProviderIds 字典并注入回结果
+                    emby_id = str(row["emby_person_id"])
+
+                    # 只有本地确实存在外部 ID 时才算命中；
+                    # 空映射必须继续向 Emby 批量补查，不能被缓存记录提前截断。
                     provider_ids = {}
                     if row.get("tmdb_person_id"):
                         provider_ids["Tmdb"] = str(row.get("tmdb_person_id"))
@@ -194,10 +194,11 @@ class ActorDBManager:
                         provider_ids["Imdb"] = row.get("imdb_id")
                     if row.get("douban_celebrity_id"):
                         provider_ids["Douban"] = str(row.get("douban_celebrity_id"))
-                    
-                    if emby_id in enriched_actors_map:
+
+                    if provider_ids and emby_id in enriched_actors_map:
+                        ids_found_in_db.add(emby_id)
                         enriched_actors_map[emby_id]["ProviderIds"] = provider_ids
-                
+
                 logger.info(f"  ➜ [演员数据管家] 从数据库缓存中找到了 {len(ids_found_in_db)} 位演员的外部ID。")
         except Exception as e:
             logger.error(f"  ➜ [演员数据管家] 批量查询演员外部ID时失败: {e}", exc_info=True)
@@ -206,20 +207,25 @@ class ActorDBManager:
         ids_to_fetch_from_api = [pid for pid in emby_ids_to_check if pid not in ids_found_in_db]
 
         if ids_to_fetch_from_api:
-            logger.info(f"  ➜ [演员数据管家] 将通过 Emby API 为剩余 {len(ids_to_fetch_from_api)} 位演员获取外部ID...")
-            
-            for person_id in ids_to_fetch_from_api:
-                person_details = get_emby_item_details(
-                    item_id=person_id, 
-                    emby_server_url=emby_config['url'], 
-                    emby_api_key=emby_config['api_key'], 
-                    user_id=emby_config['user_id'],
-                    fields="ProviderIds" # 我们只需要这一个字段
-                )
-                
-                if person_details and person_details.get("ProviderIds"):
-                    if person_id in enriched_actors_map:
-                        enriched_actors_map[person_id]["ProviderIds"] = person_details.get("ProviderIds")
+            logger.info(f"  ➜ [演员数据管家] 将通过 Emby API 为剩余 {len(ids_to_fetch_from_api)} 位演员批量获取外部ID...")
+
+            person_details_list = get_emby_items_by_id(
+                base_url=emby_config['url'],
+                api_key=emby_config['api_key'],
+                user_id=emby_config['user_id'],
+                item_ids=ids_to_fetch_from_api,
+                fields="ProviderIds",
+            )
+            fetched_count = 0
+            for person_details in person_details_list:
+                person_id = str(person_details.get("Id") or "").strip()
+                provider_ids = person_details.get("ProviderIds") or {}
+                if person_id in enriched_actors_map and provider_ids:
+                    enriched_actors_map[person_id]["ProviderIds"] = provider_ids
+                    fetched_count += 1
+            logger.info(
+                f"  ➜ [演员数据管家] Emby 批量补查完成，成功补充 {fetched_count} 位演员的外部ID。"
+            )
 
         # --- 阶段三：返回最终的列表 ---
         return list(enriched_actors_map.values())
@@ -289,6 +295,33 @@ class ActorDBManager:
         return rehydrated_list
 
     def upsert_person(self, cursor: psycopg2.extensions.cursor, person_data: Dict[str, Any], emby_config: Dict[str, Any]) -> Tuple[int, str]:
+        """每位演员使用独立 SAVEPOINT；失败只回滚当前演员。"""
+        savepoint_name = "actor_upsert"
+        try:
+            cursor.execute(f"SAVEPOINT {savepoint_name}")
+            map_id, action = self._upsert_person_without_savepoint(
+                cursor,
+                person_data,
+                emby_config,
+            )
+            if action in {"ERROR", "SKIPPED", "CONFLICT_ERROR", "UNKNOWN_ERROR"}:
+                cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+            cursor.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+            return map_id, action
+        except Exception as exc:
+            try:
+                cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+                cursor.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+            except Exception:
+                logger.error("恢复演员写入 SAVEPOINT 失败。", exc_info=True)
+            logger.error(
+                "演员写入 SAVEPOINT 发生未知异常，已仅回滚当前演员: %s",
+                exc,
+                exc_info=True,
+            )
+            return -1, "ERROR"
+
+    def _upsert_person_without_savepoint(self, cursor: psycopg2.extensions.cursor, person_data: Dict[str, Any], emby_config: Dict[str, Any]) -> Tuple[int, str]:
         """
         通过为 ON CONFLICT DO UPDATE 增加 WHERE 条件，实现真正的条件更新。
         这能准确区分数据实际被“更新”和数据因无变化而“未变”的情况，从而解决统计不准的问题。
@@ -452,13 +485,9 @@ class ActorDBManager:
             return map_id, action
 
         except psycopg2.IntegrityError as ie:
-            conn = cursor.connection
-            conn.rollback()
             logger.error(f"upsert_person 发生数据库完整性冲突，可能是 emby_id 或其他唯一键重复。emby_id={emby_id}, tmdb_id={tmdb_id}: {ie}")
             return -1, "ERROR"
         except Exception as e:
-            conn = cursor.connection
-            conn.rollback()
             logger.error(f"upsert_person 发生未知异常，emby_person_id={emby_id}: {e}", exc_info=True)
             return -1, "ERROR"
         

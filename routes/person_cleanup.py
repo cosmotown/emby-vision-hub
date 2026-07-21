@@ -151,6 +151,7 @@ def verify_person_cleanup_candidate(person_id):
         extensions.media_processor_instance.emby_api_key,
         normalized_id,
         limit=50,
+        person_name=candidate.get('person_name'),
     )
     reference_status = classify_reference_check(references)
     if reference_status == 'verification_failed':
@@ -174,6 +175,8 @@ def verify_person_cleanup_candidate(person_id):
         'provider_ids': candidate.get('provider_ids_json') or {},
         'status': reference_status,
         'reference_count': references['count'],
+        'query_reference_count': int(references.get('query_count') or references['count']),
+        'identity_alias_only': bool(references.get('identity_alias_only')),
         'items': items,
         'emby_url': (
             config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_PUBLIC_URL)
@@ -198,7 +201,7 @@ def verify_person_cleanup_candidate(person_id):
             provider_pairs,
         )
         if matching_people is None:
-            error = '候选本身无关联，但无法完成 TMDb/IMDb 同身份人物对照'
+            error = '候选本身无关联，但无法完成 TMDb/IMDb/豆瓣同身份人物对照'
             person_cleanup_db.mark_candidate_checked(normalized_id, error)
             return jsonify({'error': error}), 502
 
@@ -211,6 +214,7 @@ def verify_person_cleanup_candidate(person_id):
                 extensions.media_processor_instance.emby_api_key,
                 matching_id,
                 limit=50,
+                person_name=matching_person.get('Name'),
             )
             if classify_reference_check(matching_references) == 'verification_failed':
                 error = f'无法核对同身份人物 {matching_person.get("Name") or matching_id} 的关联作品'
@@ -242,9 +246,9 @@ def verify_person_cleanup_candidate(person_id):
     if identity_matches:
         response['message'] = f'候选本身关联为 0；找到 {len(identity_matches)} 位同身份人物，请结合其作品人工判断'
     elif provider_pairs:
-        response['message'] = '候选本身关联为 0；未在 Emby 中找到其他同 TMDb/IMDb 人物'
+        response['message'] = '候选本身关联为 0；未在 Emby 中找到其他同 TMDb/IMDb/豆瓣人物'
     else:
-        response['message'] = '候选本身关联为 0；缺少 TMDb/IMDb，无法进行同身份对照'
+        response['message'] = '候选本身关联为 0；缺少 TMDb/IMDb/豆瓣，无法进行同身份对照'
     return jsonify(response)
 
 

@@ -50,6 +50,52 @@ def find_ghost_candidates(
     ]
 
 
+def media_item_has_exact_person_reference(
+    item: Dict[str, Any],
+    person_id: str,
+    person_name: Optional[str] = None,
+) -> Optional[bool]:
+    '''
+    Verify the actual embedded People list instead of trusting Emby's PersonIds
+    filter alone. Some duplicate Person records share provider identities and the
+    filter can return media linked to a different Person row.
+
+    Returns:
+      True  -> the exact Person ID is embedded, or a name-only People row matches.
+      False -> People is usable and the target is not embedded.
+      None  -> People is missing/empty, so deletion must fail closed.
+    '''
+    people = item.get('People')
+    if not isinstance(people, list) or not people:
+        return None
+
+    target_id = str(person_id or '').strip()
+    target_name_keys = person_name_protection_keys(person_name)
+    saw_usable_person = False
+
+    for person in people:
+        if not isinstance(person, dict):
+            continue
+        embedded_id = str(person.get('Id') or '').strip()
+        embedded_name = str(person.get('Name') or '').strip()
+
+        if embedded_id:
+            saw_usable_person = True
+            if embedded_id == target_id:
+                return True
+            # An ID-bearing row with the same name is still a different Person.
+            continue
+
+        if embedded_name:
+            saw_usable_person = True
+            if target_name_keys and not person_name_protection_keys(
+                embedded_name
+            ).isdisjoint(target_name_keys):
+                return True
+
+    return False if saw_usable_person else None
+
+
 def classify_reference_check(result: Optional[Dict[str, Any]]) -> str:
     """Only an explicit zero count is safe enough to proceed with deletion."""
     if not isinstance(result, dict):
@@ -69,7 +115,7 @@ def build_identity_provider_pairs(provider_ids: Any) -> List[str]:
             return []
     if not isinstance(provider_ids, dict):
         return []
-    supported = {'tmdb': 'tmdb', 'imdb': 'imdb'}
+    supported = {'tmdb': 'tmdb', 'imdb': 'imdb', 'douban': 'douban'}
     pairs = []
     for key, value in provider_ids.items():
         provider = supported.get(str(key).strip().lower())

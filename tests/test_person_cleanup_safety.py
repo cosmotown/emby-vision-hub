@@ -6,6 +6,7 @@ from services.person_cleanup_safety import (
     build_identity_provider_pairs,
     classify_reference_check,
     find_ghost_candidates,
+    media_item_has_exact_person_reference,
     normalize_person_name,
     person_name_protection_keys,
 )
@@ -82,10 +83,47 @@ class PersonCleanupSafetyTests(unittest.TestCase):
                 'Douban': '67890',
                 'Bad': 'value,other',
             }),
-            ['imdb.nm0012345', 'tmdb.12345'],
+            ['douban.67890', 'imdb.nm0012345', 'tmdb.12345'],
         )
         self.assertEqual(build_identity_provider_pairs('{"Tmdb": "12345"}'), ['tmdb.12345'])
         self.assertEqual(build_identity_provider_pairs(None), [])
+
+    def test_exact_reference_requires_embedded_person_id_or_name_only_match(self):
+        self.assertTrue(
+            media_item_has_exact_person_reference(
+                {'People': [{'Id': 'p1', 'Name': '演员甲'}]},
+                'p1',
+                '演员甲',
+            )
+        )
+        self.assertFalse(
+            media_item_has_exact_person_reference(
+                {'People': [{'Id': 'other', 'Name': '演员甲'}]},
+                'p1',
+                '演员甲',
+            )
+        )
+        self.assertTrue(
+            media_item_has_exact_person_reference(
+                {'People': [{'Name': '演员甲'}]},
+                'p1',
+                '演员甲',
+            )
+        )
+        self.assertIsNone(
+            media_item_has_exact_person_reference(
+                {'People': []},
+                'p1',
+                '演员甲',
+            )
+        )
+        self.assertIsNone(
+            media_item_has_exact_person_reference(
+                {},
+                'p1',
+                '演员甲',
+            )
+        )
 
     def test_legacy_destructive_tasks_are_disabled_and_unregistered(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -124,6 +162,10 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertIn('get_person_media_references', actor_source)
         self.assertIn("reference_status == 'verification_failed'", actor_source)
         self.assertIn("reference_status == 'linked'", actor_source)
+        self.assertIn('person_name=person_name', actor_source)
+        emby_source = (repo_root / 'handler' / 'emby.py').read_text()
+        self.assertIn("'Fields': 'SeriesName,ProductionYear,People'", emby_source)
+        self.assertIn('media_item_has_exact_person_reference', emby_source)
 
     def test_protected_library_snapshots_are_merged_not_replaced(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -147,7 +189,7 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertIn('merge_protected_people_for_library', task_source)
         self.assertIn('merge_protected_names_for_library', task_source)
         self.assertIn('_scan_protected_library_people', task_source)
-        self.assertIn('names_without_id', task_source)
+        self.assertIn('all_person_names', task_source)
         self.assertIn('get_protected_person_ids', task_source)
         self.assertIn('get_protected_person_names', task_source)
         self.assertIn('capture_library_ids=protected_library_ids', task_source)

@@ -37,7 +37,7 @@ def _scan_protected_library_people(processor, protected_libraries, batch_size: i
             continue
 
         people_by_id = {}
-        names_without_id = set()
+        all_person_names = set()
         media_count = 0
         start_index = 0
 
@@ -72,23 +72,23 @@ def _scan_protected_library_people(processor, protected_libraries, batch_size: i
                 for person in item.get('People') or []:
                     person_id = str(person.get('Id') or '').strip()
                     person_name = str(person.get('Name') or '').strip()
+                    if person_name:
+                        all_person_names.add(person_name)
                     if person_id:
                         people_by_id[person_id] = person_name
-                    elif person_name:
-                        names_without_id.add(person_name)
 
             start_index += len(items)
             if len(items) < safe_batch_size:
                 break
 
-        if media_count > 0 and not people_by_id and not names_without_id:
+        if media_count > 0 and not people_by_id and not all_person_names:
             raise RuntimeError(
                 f"受保护媒体库 '{library_name}' 包含媒体但未返回任何人物，已拒绝生成或删除候选"
             )
 
         snapshots[library_id] = {
             'people_by_id': people_by_id,
-            'names_without_id': names_without_id,
+            'all_person_names': all_person_names,
             'media_count': media_count,
         }
 
@@ -138,7 +138,7 @@ def task_scan_ghost_actor_candidates(processor):
             library_id = str(protected_library.get('library_id') or '')
             snapshot = protected_snapshots.get(library_id) or {}
             library_people = snapshot.get('people_by_id') or {}
-            names_without_id = snapshot.get('names_without_id') or set()
+            names_without_id = snapshot.get('all_person_names') or set()
             person_cleanup_db.merge_protected_people_for_library(
                 library_id,
                 [
@@ -233,7 +233,7 @@ def task_delete_selected_ghost_actors(processor, person_ids):
         )
         person_cleanup_db.merge_protected_names_for_library(
             library_id,
-            snapshot.get('names_without_id') or set(),
+            snapshot.get('all_person_names') or set(),
         )
 
     deleted_count = 0
@@ -270,6 +270,7 @@ def task_delete_selected_ghost_actors(processor, person_ids):
             processor.emby_api_key,
             person_id,
             limit=1,
+            person_name=person_name,
         )
         reference_status = classify_reference_check(references)
         if reference_status == 'verification_failed':

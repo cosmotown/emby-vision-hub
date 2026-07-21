@@ -2232,38 +2232,88 @@ def get_person_media_references(
     api_key: str,
     person_id: str,
     limit: int = 1,
+    person_name: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Return current media references for a Person, or None when verification failed."""
+    '''
+    Return exact current media references for a Person.
+
+    Emby's PersonIds filter may return media associated with another Person row
+    that shares the same TMDb/IMDb/Douban identity. Therefore every returned
+    item's embedded People list is inspected before it counts as a reference.
+    Any missing/empty People payload fails closed.
+    '''
     if not base_url or not api_key or not person_id:
         return None
 
-    api_url = f"{base_url.rstrip('/')}/Items"
-    params = {
-        'PersonIds': str(person_id),
-        'Recursive': 'true',
-        'IncludeItemTypes': 'Movie,Series,Episode,Video,MusicVideo',
-        'Fields': 'SeriesName,ProductionYear',
-        'Limit': max(1, int(limit)),
-        'EnableTotalRecordCount': 'true',
-    }
-    try:
-        response = emby_client.get(
-            api_url,
-            headers={'X-Emby-Token': api_key},
-            params=params,
-            timeout=20,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        items = payload.get('Items') or []
-        return {
-            'count': int(payload.get('TotalRecordCount', len(items)) or 0),
-            'items': items,
-        }
-    except Exception as exc:
-        logger.error(f"复核人物 {person_id} 的媒体关联失败: {exc}")
-        return None
+    from services.person_cleanup_safety import (
+        media_item_has_exact_person_reference,
+    )
 
+    api_url = f"{base_url.rstrip('/')}/Items"
+    display_limit = max(1, int(limit))
+    batch_size = 200
+    start_index = 0
+    exact_count = 0
+    exact_items = []
+    query_match_count = 0
+
+    while True:
+        params = {
+            'PersonIds': str(person_id),
+            'Recursive': 'true',
+            'IncludeItemTypes': 'Movie,Series,Episode,Video,MusicVideo',
+            'Fields': 'SeriesName,ProductionYear,People',
+            'StartIndex': start_index,
+            'Limit': batch_size,
+            'EnableTotalRecordCount': 'false',
+        }
+        try:
+            response = emby_client.get(
+                api_url,
+                headers={'X-Emby-Token': api_key},
+                params=params,
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get('Items'), list):
+                raise ValueError('Emby 人物关联响应格式异常')
+            items = payload.get('Items') or []
+        except Exception as exc:
+            logger.error(f"复核人物 {person_id} 的媒体关联失败: {exc}")
+            return None
+
+        if not items:
+            break
+
+        query_match_count += len(items)
+        for item in items:
+            exact_match = media_item_has_exact_person_reference(
+                item,
+                person_id,
+                person_name=person_name,
+            )
+            if exact_match is None:
+                logger.error(
+                    f"复核人物 {person_id} 失败：作品 "
+                    f"{item.get('Name') or item.get('Id') or '未知'} 未返回可核验 People"
+                )
+                return None
+            if exact_match:
+                exact_count += 1
+                if len(exact_items) < display_limit:
+                    exact_items.append(item)
+
+        start_index += len(items)
+        if len(items) < batch_size:
+            break
+
+    return {
+        'count': exact_count,
+        'items': exact_items,
+        'query_count': query_match_count,
+        'identity_alias_only': query_match_count > 0 and exact_count == 0,
+    }
 
 def get_people_by_provider_ids(
     base_url: str,

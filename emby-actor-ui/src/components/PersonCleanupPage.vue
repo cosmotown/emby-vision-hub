@@ -192,24 +192,24 @@
           </div>
 
           <div v-if="verificationResult.status === 'orphan'">
-            <n-divider>TMDb / IMDb 同身份对照</n-divider>
+            <n-divider>TMDb / IMDb / 豆瓣同身份对照</n-divider>
             <n-alert
               v-if="verificationResult.identity_comparison === 'unavailable'"
               type="warning"
               title="缺少外部身份"
             >
-              该候选没有 TMDb 或 IMDb ID，无法查找 Emby 中的同身份人物，请结合姓名和头像人工判断。
+              该候选没有 TMDb、IMDb 或豆瓣 ID，无法查找 Emby 中的同身份人物，请结合姓名和头像人工判断。
             </n-alert>
             <n-alert
               v-else-if="verificationResult.identity_comparison === 'no_match'"
               type="info"
               title="没有同身份人物"
             >
-              已按 TMDb/IMDb 精确查询，Emby 中没有找到其他同身份 Person 记录。
+              已按 TMDb/IMDb/豆瓣精确查询，Emby 中没有找到其他同身份 Person 记录。
             </n-alert>
             <template v-else>
               <n-alert type="info" title="发现同身份人物" style="margin-bottom: 12px;">
-                以下人物与当前候选拥有相同 TMDb/IMDb 身份，仅作为人工判断依据；不会自动删除或撤销当前候选。
+                以下人物与当前候选拥有相同 TMDb/IMDb/豆瓣身份，仅作为人工判断依据；不会自动删除或撤销当前候选。
               </n-alert>
               <div
                 v-for="match in verificationResult.identity_matches"

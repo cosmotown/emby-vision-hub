@@ -137,10 +137,14 @@ def _notification_paths(
                 matched_root = root_path
                 break
 
-        # 无法匹配媒体库根目录时，宁可通知具体文件，
-        # 也绝不向上扩大成媒体库根目录。
+        # 无法确认所属媒体库时不发送单文件通知。
+        # 该文件会在后续入库确认中保持 pending，
+        # 并进入有限重试队列，避免通知范围意外扩大。
         if not matched_root:
-            targets.add(path)
+            logger.warning(
+                f"  ⚠️ STRM 路径未匹配到 Emby 媒体库根目录，"
+                f"本轮跳过通知并等待有限重试: {path}"
+            )
             continue
 
         relative_path = os.path.relpath(path, matched_root)

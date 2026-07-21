@@ -615,7 +615,26 @@ const getCollectionPosterUrl = (posterPath) => {
   if (!posterPath) {
     return '/img/poster-placeholder.png';
   }
-  const fullTmdbUrl = `https://image.tmdb.org/t/p/w300${posterPath}`;
+
+  const normalizedPath = String(posterPath).trim();
+
+  // 兼容旧数据库中保存的 Emby 图片路径。
+  const embyPathIndex = normalizedPath.indexOf('/Items/');
+  if (embyPathIndex >= 0) {
+    const embyPath = normalizedPath.slice(embyPathIndex);
+    return `/image_proxy${embyPath}`;
+  }
+
+  // 已经是完整外部地址时，直接交给安全图片代理。
+  if (/^https?:\/\//i.test(normalizedPath)) {
+    return `/api/image_proxy?url=${encodeURIComponent(normalizedPath)}`;
+  }
+
+  // 正常的 TMDb 相对图片路径。
+  const tmdbPath = normalizedPath.startsWith('/')
+    ? normalizedPath
+    : `/${normalizedPath}`;
+  const fullTmdbUrl = `https://image.tmdb.org/t/p/w300${tmdbPath}`;
   return `/api/image_proxy?url=${encodeURIComponent(fullTmdbUrl)}`;
 };
 const getTmdbImageUrl = (posterPath) => posterPath ? `https://image.tmdb.org/t/p/w300${posterPath}` : '/img/poster-placeholder.png';

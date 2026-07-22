@@ -2,6 +2,33 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.6",
+        "published_at": "2026-07-22T21:01:12+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.6",
+        "changelog": """## 人物关联详情回退与核对状态修复
+
+### 人物清理安全
+- Emby `PersonIds` 列表查询返回作品但缺少 `People` 时，会集中收集作品 ID，并通过批量详情接口补取人物明细，避免逐作品 N+1 请求。
+- 详情补取后按目标 Emby Person ID 重新精确核验；只有无 ID 的 People 记录才允许使用规范化姓名作为保守兜底。
+- 列表与详情都无法提供可核验 People 时返回 `people_unavailable` 并失败关闭，绝不会判定为可删除人物。
+
+### 核对状态与界面
+- 明确区分连接失败、响应异常、People 不可用、精确关联、明确无关联和身份别名六类状态。
+- 人工核对不再把 People 不可用误报为“无法连接 Emby”，并会展示无法核验的关联作品。
+- 删除任务复用同一详情回退逻辑；连接、响应或 People 核验失败时全部跳过删除，发现精确关联时撤销候选。
+
+### 兼容与影响范围
+- 保留 v7.2.4 的保护库快照、演员批量 ProviderIds 获取和 PostgreSQL SAVEPOINT 写入隔离。
+- 保留 v7.2.5 的精确 Person ID、TMDb、IMDb 与豆瓣同身份核验。
+- 不包含数据库结构变更，不会自动执行人物删除。
+
+### 测试
+- 人物清理、演员写入隔离和镜像迁移相关 26 项后端测试全部通过。
+- Python 语法检查、前端 Vite 生产构建和 `git diff --check` 全部通过。
+
+""",
+    },
+    {
         "version": "v7.2.5",
         "published_at": "2026-07-22T01:37:06+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.5",

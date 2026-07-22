@@ -12,12 +12,32 @@ from extensions import admin_required, processor_ready_required, task_lock_requi
 from services.person_cleanup_safety import (
     build_identity_provider_pairs,
     classify_reference_check,
+    reference_check_failure_message,
 )
 from tasks.actors import task_delete_selected_ghost_actors, task_scan_ghost_actor_candidates
 
 
 logger = logging.getLogger(__name__)
 person_cleanup_bp = Blueprint('person_cleanup_bp', __name__, url_prefix='/api/person-cleanup')
+
+
+def _serialize_reference_items(items):
+    return [
+        {
+            'id': str(item.get('Id') or ''),
+            'name': item.get('Name') or '未命名作品',
+            'type': item.get('Type') or '',
+            'series_name': item.get('SeriesName') or '',
+            'production_year': item.get('ProductionYear'),
+        }
+        for item in items or []
+        if isinstance(item, dict)
+    ]
+
+
+def _refreshed_candidate(person_id, fallback):
+    refreshed = person_cleanup_db.get_candidates_by_ids([person_id])
+    return refreshed[0] if refreshed else fallback
 
 
 @person_cleanup_bp.route('/candidates', methods=['GET'])
@@ -154,30 +174,24 @@ def verify_person_cleanup_candidate(person_id):
         person_name=candidate.get('person_name'),
     )
     reference_status = classify_reference_check(references)
-    if reference_status == 'verification_failed':
-        error = '无法连接 Emby 完成人物关联核对'
-        person_cleanup_db.mark_candidate_checked(normalized_id, error)
-        return jsonify({'error': error}), 502
-
-    items = []
-    for item in references.get('items') or []:
-        items.append({
-            'id': str(item.get('Id') or ''),
-            'name': item.get('Name') or '未命名作品',
-            'type': item.get('Type') or '',
-            'series_name': item.get('SeriesName') or '',
-            'production_year': item.get('ProductionYear'),
-        })
+    safe_references = references if isinstance(references, dict) else {}
+    reference_count = safe_references.get('count')
+    if not isinstance(reference_count, int) or isinstance(reference_count, bool):
+        reference_count = 0
+    query_reference_count = safe_references.get('query_count')
+    if not isinstance(query_reference_count, int) or isinstance(query_reference_count, bool):
+        query_reference_count = reference_count
 
     response = {
         'person_id': normalized_id,
         'person_name': candidate.get('person_name') or '未知人物',
         'provider_ids': candidate.get('provider_ids_json') or {},
         'status': reference_status,
-        'reference_count': references['count'],
-        'query_reference_count': int(references.get('query_count') or references['count']),
-        'identity_alias_only': bool(references.get('identity_alias_only')),
-        'items': items,
+        'reference_count': reference_count,
+        'query_reference_count': query_reference_count,
+        'identity_alias_only': reference_status == 'identity_alias_only',
+        'items': _serialize_reference_items(safe_references.get('items')),
+        'unverified_items': _serialize_reference_items(safe_references.get('unverified_items')),
         'emby_url': (
             config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_PUBLIC_URL)
             or config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_SERVER_URL)
@@ -185,6 +199,20 @@ def verify_person_cleanup_candidate(person_id):
         ).rstrip('/'),
         'emby_server_id': extensions.EMBY_SERVER_ID or '',
     }
+
+    if reference_status in {'connection_failed', 'invalid_response', 'people_unavailable'}:
+        error = reference_check_failure_message(reference_status)
+        person_cleanup_db.mark_candidate_checked(normalized_id, error)
+        response.update({
+            'error': error,
+            'message': error,
+            'candidate': _refreshed_candidate(normalized_id, candidate),
+            'candidate_removed': False,
+            'verification_complete': False,
+        })
+        return jsonify(response), 409 if reference_status == 'people_unavailable' else 502
+
+    response['verification_complete'] = True
 
     if reference_status == 'linked':
         person_cleanup_db.remove_candidate(normalized_id)
@@ -201,9 +229,20 @@ def verify_person_cleanup_candidate(person_id):
             provider_pairs,
         )
         if matching_people is None:
-            error = '候选本身无关联，但无法完成 TMDb/IMDb/豆瓣同身份人物对照'
+            error = reference_check_failure_message(
+                'invalid_response',
+                context='TMDb/IMDb/豆瓣同身份人物对照',
+            )
             person_cleanup_db.mark_candidate_checked(normalized_id, error)
-            return jsonify({'error': error}), 502
+            response.update({
+                'status': 'invalid_response',
+                'candidate_reference_status': reference_status,
+                'error': error,
+                'message': error,
+                'candidate': _refreshed_candidate(normalized_id, candidate),
+                'verification_complete': False,
+            })
+            return jsonify(response), 502
 
         for matching_person in matching_people:
             matching_id = str(matching_person.get('Id') or '').strip()
@@ -216,25 +255,27 @@ def verify_person_cleanup_candidate(person_id):
                 limit=50,
                 person_name=matching_person.get('Name'),
             )
-            if classify_reference_check(matching_references) == 'verification_failed':
-                error = f'无法核对同身份人物 {matching_person.get("Name") or matching_id} 的关联作品'
+            matching_status = classify_reference_check(matching_references)
+            if matching_status in {'connection_failed', 'invalid_response', 'people_unavailable'}:
+                context = f'同身份人物 {matching_person.get("Name") or matching_id} 的关联作品核对'
+                error = reference_check_failure_message(matching_status, context=context)
                 person_cleanup_db.mark_candidate_checked(normalized_id, error)
-                return jsonify({'error': error}), 502
+                response.update({
+                    'status': matching_status,
+                    'candidate_reference_status': reference_status,
+                    'error': error,
+                    'message': error,
+                    'candidate': _refreshed_candidate(normalized_id, candidate),
+                    'verification_complete': False,
+                })
+                return jsonify(response), 409 if matching_status == 'people_unavailable' else 502
             identity_matches.append({
                 'person_id': matching_id,
                 'person_name': matching_person.get('Name') or '未知人物',
                 'provider_ids': matching_person.get('ProviderIds') or {},
+                'status': matching_status,
                 'reference_count': matching_references['count'],
-                'items': [
-                    {
-                        'id': str(item.get('Id') or ''),
-                        'name': item.get('Name') or '未命名作品',
-                        'type': item.get('Type') or '',
-                        'series_name': item.get('SeriesName') or '',
-                        'production_year': item.get('ProductionYear'),
-                    }
-                    for item in matching_references.get('items') or []
-                ],
+                'items': _serialize_reference_items(matching_references.get('items')),
             })
 
     person_cleanup_db.mark_candidate_checked(normalized_id)
@@ -243,12 +284,19 @@ def verify_person_cleanup_candidate(person_id):
     response['candidate_removed'] = False
     response['identity_matches'] = identity_matches
     response['identity_comparison'] = 'matched' if identity_matches else ('no_match' if provider_pairs else 'unavailable')
-    if identity_matches:
-        response['message'] = f'候选本身关联为 0；找到 {len(identity_matches)} 位同身份人物，请结合其作品人工判断'
-    elif provider_pairs:
-        response['message'] = '候选本身关联为 0；未在 Emby 中找到其他同 TMDb/IMDb/豆瓣人物'
+    if reference_status == 'identity_alias_only':
+        base_message = (
+            f'PersonIds 查询返回 {query_reference_count} 部作品，但完整 People 明细均未引用当前 Person ID；'
+            '当前精确关联为 0'
+        )
     else:
-        response['message'] = '候选本身关联为 0；缺少 TMDb/IMDb/豆瓣，无法进行同身份对照'
+        base_message = '候选本身精确关联为 0'
+    if identity_matches:
+        response['message'] = f'{base_message}；找到 {len(identity_matches)} 位同身份人物，请结合其作品人工判断'
+    elif provider_pairs:
+        response['message'] = f'{base_message}；未在 Emby 中找到其他同 TMDb/IMDb/豆瓣人物'
+    else:
+        response['message'] = f'{base_message}；缺少 TMDb/IMDb/豆瓣，无法进行同身份对照'
     return jsonify(response)
 
 

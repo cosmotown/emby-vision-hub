@@ -97,13 +97,49 @@ def media_item_has_exact_person_reference(
 
 
 def classify_reference_check(result: Optional[Dict[str, Any]]) -> str:
-    """Only an explicit zero count is safe enough to proceed with deletion."""
+    """Classify a reference check without turning malformed data into an orphan."""
     if not isinstance(result, dict):
-        return 'verification_failed'
+        return 'invalid_response'
+
+    explicit_status = result.get('status')
+    failure_statuses = {
+        'connection_failed',
+        'invalid_response',
+        'people_unavailable',
+    }
+    if explicit_status in failure_statuses:
+        return explicit_status
+
     count = result.get('count')
     if not isinstance(count, int) or isinstance(count, bool) or count < 0:
-        return 'verification_failed'
+        return 'invalid_response'
+
+    if explicit_status == 'linked':
+        return 'linked' if count > 0 else 'invalid_response'
+    if explicit_status == 'orphan':
+        return 'orphan' if count == 0 else 'invalid_response'
+    if explicit_status == 'identity_alias_only':
+        query_count = result.get('query_count')
+        if count == 0 and isinstance(query_count, int) and query_count > 0:
+            return 'identity_alias_only'
+        return 'invalid_response'
+    if explicit_status is not None:
+        return 'invalid_response'
+
+    # Backward-compatible handling for callers/tests that only return a count.
     return 'orphan' if count == 0 else 'linked'
+
+
+def reference_check_failure_message(status: str, context: str = '人物关联核对') -> str:
+    """Return a precise, fail-closed message for an unsuccessful verification."""
+    if status == 'connection_failed':
+        return f'无法连接 Emby 完成{context}；该人物已受保护，不允许删除'
+    if status == 'people_unavailable':
+        return (
+            'Emby 已返回可能关联作品，但作品人物明细不可核验；'
+            '该人物已受保护，不允许删除'
+        )
+    return f'Emby 返回异常，无法完成{context}；该人物已受保护，不允许删除'
 
 
 def build_identity_provider_pairs(provider_ids: Any) -> List[str]:

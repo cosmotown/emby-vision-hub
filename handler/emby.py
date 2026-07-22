@@ -1934,7 +1934,9 @@ def get_emby_items_by_id(
     api_key: str,
     user_id: str, # 参数保留以兼容旧的调用，但内部不再使用
     item_ids: List[str],
-    fields: Optional[str] = None
+    fields: Optional[str] = None,
+    *,
+    raise_on_error: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     【V4 - 4.9+ 终极兼容版】
@@ -1942,6 +1944,7 @@ def get_emby_items_by_id(
     - 核心变更: 适配 Emby 4.9+ API, 切换到 /Items 端点。
     - 关键修正: 在查询 Person 等全局项目时，不能传递 UserId，否则新版API会返回空结果。
       此函数现在不再将 UserId 传递给 API，以确保能获取到演员详情。
+    - raise_on_error=True 时任一批次失败都会抛出异常，供删除安全核验失败关闭。
     """
     if not all([base_url, api_key]) or not item_ids: # UserId 不再是必须检查的参数
         return []
@@ -1976,10 +1979,14 @@ def get_emby_items_by_id(
             response.raise_for_status()
             
             data = response.json()
+            if not isinstance(data, dict) or not isinstance(data.get("Items"), list):
+                raise ValueError("Emby 批量项目响应格式异常")
             batch_items = data.get("Items", [])
             all_items.extend(batch_items) # 将获取到的结果合并到总列表中
             
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, ValueError, TypeError) as e:
+            if raise_on_error:
+                raise
             # 记录当前批次的错误，但继续处理下一批
             logger.error(f"根据ID列表批量获取Emby项目时，处理批次 {i+1} 失败: {e}")
             continue
@@ -2233,17 +2240,24 @@ def get_person_media_references(
     person_id: str,
     limit: int = 1,
     person_name: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
+) -> Dict[str, Any]:
     '''
     Return exact current media references for a Person.
 
     Emby's PersonIds filter may return media associated with another Person row
     that shares the same TMDb/IMDb/Douban identity. Therefore every returned
     item's embedded People list is inspected before it counts as a reference.
-    Any missing/empty People payload fails closed.
+    List results that omit People are repaired through one batched detail lookup.
+    Any item that remains unverifiable fails closed.
     '''
     if not base_url or not api_key or not person_id:
-        return None
+        return {
+            'status': 'invalid_response',
+            'count': None,
+            'items': [],
+            'query_count': 0,
+            'identity_alias_only': False,
+        }
 
     from services.person_cleanup_safety import (
         media_item_has_exact_person_reference,
@@ -2253,9 +2267,17 @@ def get_person_media_references(
     display_limit = max(1, int(limit))
     batch_size = 200
     start_index = 0
-    exact_count = 0
-    exact_items = []
-    query_match_count = 0
+    query_items = []
+
+    def failed_result(status: str, unverified_items=None) -> Dict[str, Any]:
+        return {
+            'status': status,
+            'count': None,
+            'items': [],
+            'query_count': len(query_items),
+            'identity_alias_only': False,
+            'unverified_items': list(unverified_items or []),
+        }
 
     while True:
         params = {
@@ -2279,40 +2301,127 @@ def get_person_media_references(
             if not isinstance(payload, dict) or not isinstance(payload.get('Items'), list):
                 raise ValueError('Emby 人物关联响应格式异常')
             items = payload.get('Items') or []
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            logger.error(f"复核人物 {person_id} 的媒体关联连接失败: {exc}")
+            return failed_result('connection_failed')
+        except (requests.exceptions.RequestException, ValueError, TypeError) as exc:
+            logger.error(f"复核人物 {person_id} 的媒体关联响应异常: {exc}")
+            return failed_result('invalid_response')
         except Exception as exc:
-            logger.error(f"复核人物 {person_id} 的媒体关联失败: {exc}")
-            return None
+            logger.error(f"复核人物 {person_id} 的媒体关联发生未知响应异常: {exc}")
+            return failed_result('invalid_response')
 
         if not items:
             break
 
-        query_match_count += len(items)
-        for item in items:
-            exact_match = media_item_has_exact_person_reference(
-                item,
-                person_id,
-                person_name=person_name,
-            )
-            if exact_match is None:
-                logger.error(
-                    f"复核人物 {person_id} 失败：作品 "
-                    f"{item.get('Name') or item.get('Id') or '未知'} 未返回可核验 People"
-                )
-                return None
-            if exact_match:
-                exact_count += 1
-                if len(exact_items) < display_limit:
-                    exact_items.append(item)
+        if any(not isinstance(item, dict) for item in items):
+            logger.error(f"复核人物 {person_id} 的媒体关联响应包含非法作品项")
+            return failed_result('invalid_response')
+        query_items.extend(items)
 
         start_index += len(items)
         if len(items) < batch_size:
             break
 
+    items_needing_details = []
+    detail_ids = []
+    for item in query_items:
+        if media_item_has_exact_person_reference(
+            item,
+            person_id,
+            person_name=person_name,
+        ) is not None:
+            continue
+        items_needing_details.append(item)
+        item_id = str(item.get('Id') or '').strip()
+        if item_id:
+            detail_ids.append(item_id)
+
+    details_by_id = {}
+    if items_needing_details:
+        unique_detail_ids = list(dict.fromkeys(detail_ids))
+        if len(unique_detail_ids) != len(items_needing_details):
+            logger.error(
+                f"复核人物 {person_id} 失败：存在缺少 ID 或重复 ID 的不可核验作品"
+            )
+            return failed_result('people_unavailable', items_needing_details)
+        try:
+            detail_items = get_emby_items_by_id(
+                base_url,
+                api_key,
+                '',
+                item_ids=unique_detail_ids,
+                fields='People',
+                raise_on_error=True,
+            )
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            logger.error(f"复核人物 {person_id} 的作品详情连接失败: {exc}")
+            return failed_result('connection_failed', items_needing_details)
+        except (requests.exceptions.RequestException, ValueError, TypeError) as exc:
+            logger.error(f"复核人物 {person_id} 的作品详情响应异常: {exc}")
+            return failed_result('invalid_response', items_needing_details)
+        except Exception as exc:
+            logger.error(f"复核人物 {person_id} 的作品详情发生未知响应异常: {exc}")
+            return failed_result('invalid_response', items_needing_details)
+
+        if any(not isinstance(item, dict) for item in detail_items):
+            logger.error(f"复核人物 {person_id} 的作品详情响应包含非法项目")
+            return failed_result('invalid_response', items_needing_details)
+        details_by_id = {
+            str(item.get('Id')): item
+            for item in detail_items
+            if str(item.get('Id') or '').strip()
+        }
+
+    exact_count = 0
+    exact_items = []
+    unverified_items = []
+    for item in query_items:
+        item_for_check = item
+        if media_item_has_exact_person_reference(
+            item,
+            person_id,
+            person_name=person_name,
+        ) is None:
+            item_id = str(item.get('Id') or '').strip()
+            detail = details_by_id.get(item_id)
+            if detail:
+                item_for_check = {**item, 'People': detail.get('People')}
+
+        exact_match = media_item_has_exact_person_reference(
+            item_for_check,
+            person_id,
+            person_name=person_name,
+        )
+        if exact_match is None:
+            unverified_items.append(item)
+            continue
+        if exact_match:
+            exact_count += 1
+            if len(exact_items) < display_limit:
+                exact_items.append(item_for_check)
+
+    if unverified_items:
+        logger.error(
+            f"复核人物 {person_id} 失败：{len(unverified_items)} 部作品详情仍未返回可核验 People"
+        )
+        return failed_result('people_unavailable', unverified_items)
+
+    query_match_count = len(query_items)
+    if exact_count > 0:
+        status = 'linked'
+    elif query_match_count > 0:
+        status = 'identity_alias_only'
+    else:
+        status = 'orphan'
+
     return {
+        'status': status,
         'count': exact_count,
         'items': exact_items,
         'query_count': query_match_count,
-        'identity_alias_only': query_match_count > 0 and exact_count == 0,
+        'identity_alias_only': status == 'identity_alias_only',
+        'unverified_items': [],
     }
 
 def get_people_by_provider_ids(

@@ -20,6 +20,7 @@ from services.person_cleanup_safety import (
     classify_reference_check,
     find_ghost_candidates,
     person_name_protection_keys,
+    reference_check_failure_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -273,14 +274,22 @@ def task_delete_selected_ghost_actors(processor, person_ids):
             person_name=person_name,
         )
         reference_status = classify_reference_check(references)
-        if reference_status == 'verification_failed':
+        if reference_status in {'connection_failed', 'invalid_response', 'people_unavailable'}:
             failed_count += 1
-            person_cleanup_db.mark_candidate_checked(person_id, "无法连接 Emby 完成删除前复核")
+            error = reference_check_failure_message(reference_status, context='删除前复核')
+            person_cleanup_db.mark_candidate_checked(person_id, error)
+            logger.warning(f"  ➜ 跳过 '{person_name}'：{error}")
             continue
         if reference_status == 'linked':
             linked_count += 1
             person_cleanup_db.remove_candidate(person_id)
             logger.warning(f"  ➜ 跳过 '{person_name}'：删除前发现新的媒体关联。")
+            continue
+        if reference_status not in {'orphan', 'identity_alias_only'}:
+            failed_count += 1
+            error = reference_check_failure_message('invalid_response', context='删除前复核')
+            person_cleanup_db.mark_candidate_checked(person_id, error)
+            logger.warning(f"  ➜ 跳过 '{person_name}'：{error}")
             continue
 
         if not emby.delete_person_custom_api(

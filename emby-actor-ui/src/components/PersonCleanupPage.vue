@@ -120,8 +120,8 @@
         </n-alert>
         <template v-else-if="verificationResult">
           <n-alert
-            :type="verificationResult.status === 'orphan' ? 'success' : 'warning'"
-            :title="verificationResult.status === 'orphan' ? '当前关联作品为 0' : `发现 ${verificationResult.reference_count} 部关联作品`"
+            :type="verificationAlertType"
+            :title="verificationAlertTitle"
             style="margin-bottom: 16px;"
           >
             {{ verificationResult.message }}
@@ -131,7 +131,7 @@
             <n-descriptions-item label="Emby ID">{{ verificationResult.person_id }}</n-descriptions-item>
             <n-descriptions-item label="外部 ID">{{ providerIdText(verificationResult.provider_ids) }}</n-descriptions-item>
             <n-descriptions-item label="核对结果">
-              {{ verificationResult.reference_count }} 部当前关联作品
+              {{ verificationSummary }}
             </n-descriptions-item>
           </n-descriptions>
 
@@ -191,7 +191,19 @@
             </n-text>
           </div>
 
-          <div v-if="verificationResult.status === 'orphan'">
+          <div v-if="verificationResult.unverified_items?.length">
+            <n-divider>无法核验的人物明细</n-divider>
+            <n-alert type="warning" title="以下作品已返回，但 People 明细仍不可用" style="margin-bottom: 10px;">
+              这些作品不会被当作“无关联”；当前人物保持受保护状态。
+            </n-alert>
+            <n-list bordered>
+              <n-list-item v-for="item in verificationResult.unverified_items" :key="`unverified-${item.id}`">
+                {{ item.series_name || item.name }}
+              </n-list-item>
+            </n-list>
+          </div>
+
+          <div v-if="['orphan', 'identity_alias_only'].includes(verificationResult.status)">
             <n-divider>TMDb / IMDb / 豆瓣同身份对照</n-divider>
             <n-alert
               v-if="verificationResult.identity_comparison === 'unavailable'"
@@ -326,6 +338,36 @@ const currentAction = computed(() => props.taskStatus?.current_action || '');
 const isBackgroundBusy = computed(() => Boolean(props.taskStatus?.is_running));
 const isScanRunning = computed(() => isBackgroundBusy.value && currentAction.value.includes('扫描幽灵人物'));
 const isDeleteRunning = computed(() => isBackgroundBusy.value && currentAction.value.includes('删除') && currentAction.value.includes('幽灵人物'));
+const verificationAlertType = computed(() => ({
+  orphan: 'success',
+  identity_alias_only: 'info',
+  linked: 'warning',
+  people_unavailable: 'warning',
+  connection_failed: 'error',
+  invalid_response: 'error',
+}[verificationResult.value?.status] || 'error'));
+const verificationAlertTitle = computed(() => ({
+  orphan: '当前精确关联作品为 0',
+  identity_alias_only: '仅发现其他 Person 的关联作品',
+  linked: `发现 ${verificationResult.value?.reference_count || 0} 部精确关联作品`,
+  people_unavailable: '作品人物明细不可核验',
+  connection_failed: '无法连接 Emby',
+  invalid_response: 'Emby 响应异常',
+}[verificationResult.value?.status] || '核对失败'));
+const verificationSummary = computed(() => {
+  const result = verificationResult.value;
+  if (!result) return '-';
+  if (result.status === 'people_unavailable') {
+    return `${result.query_reference_count || 0} 部可能关联作品，People 不可核验`;
+  }
+  if (['connection_failed', 'invalid_response'].includes(result.status)) {
+    return '核对未完成，禁止删除';
+  }
+  if (result.status === 'identity_alias_only') {
+    return `${result.query_reference_count || 0} 部查询命中，当前 Person ID 精确关联为 0`;
+  }
+  return `${result.reference_count || 0} 部当前精确关联作品`;
+});
 
 const imageUrl = (personId) => `/image_proxy/Items/${personId}/Images/Primary?maxWidth=160&quality=85`;
 const isVerifiedOrphan = (row) => Boolean(row.last_checked_at && !row.last_error);
@@ -473,7 +515,17 @@ const verifyCandidate = async (row) => {
       message.success(response.data.message || '核对完成，可以人工勾选');
     }
   } catch (error) {
-    verifyError.value = error.response?.data?.error || '无法完成人物关联核对';
+    const result = error.response?.data;
+    if (result?.status) {
+      verificationResult.value = result;
+      if (result.candidate) {
+        const index = candidates.value.findIndex((item) => item.person_id === row.person_id);
+        if (index >= 0) candidates.value[index] = result.candidate;
+      }
+      message.warning(result.message || result.error || '核对未完成，该人物禁止删除');
+    } else {
+      verifyError.value = result?.error || '无法完成人物关联核对';
+    }
   } finally {
     verifyLoading.value = false;
   }

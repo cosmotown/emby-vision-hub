@@ -1,8 +1,9 @@
 import unittest
 import ast
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
 import requests
@@ -28,10 +29,18 @@ class PersonCleanupSafetyTests(unittest.TestCase):
             for node in handler_tree.body
             if isinstance(node, ast.FunctionDef) and node.name == 'get_person_media_references'
         )
+        get_item_people_node = next(
+            node
+            for node in handler_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == 'get_emby_item_people_details'
+        )
         cls.emby_globals = {
             'Any': Any,
             'Dict': Dict,
+            'List': List,
             'Optional': Optional,
+            'ThreadPoolExecutor': ThreadPoolExecutor,
+            'as_completed': as_completed,
             'requests': requests,
             'logger': MagicMock(),
             'emby_client': MagicMock(),
@@ -39,7 +48,7 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         }
         exec(
             compile(
-                ast.Module(body=[get_references_node], type_ignores=[]),
+                ast.Module(body=[get_item_people_node, get_references_node], type_ignores=[]),
                 'handler/emby.py',
                 'exec',
             ),
@@ -47,6 +56,9 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         )
         cls.get_person_media_references = staticmethod(
             cls.emby_globals['get_person_media_references']
+        )
+        cls.get_emby_item_people_details = staticmethod(
+            cls.emby_globals['get_emby_item_people_details']
         )
 
     def test_candidate_scan_excludes_every_referenced_person(self):
@@ -215,6 +227,28 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertEqual(result['count'], 1)
         detail_fetch.assert_not_called()
 
+    def test_individual_people_details_use_global_item_endpoint(self):
+        def response_for_url(url, **_kwargs):
+            item_id = url.rsplit('/', 1)[-1]
+            response = MagicMock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {'Id': item_id, 'People': [{'Id': 'p1'}]}
+            return response
+
+        client = MagicMock()
+        client.get.side_effect = response_for_url
+        with patch.dict(self.emby_globals, {'emby_client': client}):
+            details = self.get_emby_item_people_details(
+                'http://emby', 'token', ['m1', 'm2'], max_workers=2
+            )
+
+        self.assertEqual([item['Id'] for item in details], ['m1', 'm2'])
+        self.assertEqual(client.get.call_count, 2)
+        self.assertEqual(
+            {call.args[0] for call in client.get.call_args_list},
+            {'http://emby/Items/m1', 'http://emby/Items/m2'},
+        )
+
     def test_list_people_with_other_id_is_identity_alias_only(self):
         list_item = {
             'Id': 'm1',
@@ -291,6 +325,66 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertEqual(result['status'], 'people_unavailable')
         self.assertIsNone(result['count'])
         self.assertEqual(result['unverified_items'][0]['Name'], 'AOZ-313')
+
+    def test_unresolved_batch_detail_uses_bounded_individual_fallback(self):
+        list_items = [
+            {'Id': 'm1', 'Name': '作品一'},
+            {'Id': 'm2', 'Name': '作品二'},
+        ]
+        detail_fetch = MagicMock(return_value=[
+            {'Id': 'm1', 'People': [{'Id': 'other'}]},
+            {'Id': 'm2', 'People': []},
+        ])
+        individual_fetch = MagicMock(return_value=[
+            {'Id': 'm2', 'People': [{'Id': 'p1', 'Name': '演员甲'}]},
+        ])
+        client = MagicMock()
+        client.get.return_value = self._emby_items_response(list_items)
+        with patch.dict(self.emby_globals, {
+            'emby_client': client,
+            'get_emby_items_by_id': detail_fetch,
+            'get_emby_item_people_details': individual_fetch,
+        }):
+            result = self.get_person_media_references(
+                'http://emby', 'token', 'p1', person_name='演员甲'
+            )
+
+        self.assertEqual(result['status'], 'linked')
+        self.assertEqual(result['count'], 1)
+        individual_fetch.assert_called_once_with('http://emby', 'token', ['m2'])
+
+    def test_individual_detail_without_people_still_fails_closed(self):
+        client = MagicMock()
+        client.get.return_value = self._emby_items_response([{'Id': 'm1'}])
+        with patch.dict(self.emby_globals, {
+            'emby_client': client,
+            'get_emby_items_by_id': MagicMock(return_value=[{'Id': 'm1', 'People': []}]),
+            'get_emby_item_people_details': MagicMock(return_value=[{'Id': 'm1', 'People': []}]),
+        }):
+            result = self.get_person_media_references('http://emby', 'token', 'p1')
+
+        self.assertEqual(result['status'], 'people_unavailable')
+        self.assertIsNone(result['count'])
+
+    def test_too_many_individual_details_fail_closed_without_unbounded_requests(self):
+        list_items = [{'Id': f'm{index}'} for index in range(201)]
+        client = MagicMock()
+        client.get.side_effect = [
+            self._emby_items_response(list_items[:200]),
+            self._emby_items_response(list_items[200:]),
+        ]
+        individual_fetch = MagicMock()
+        with patch.dict(self.emby_globals, {
+            'emby_client': client,
+            'get_emby_items_by_id': MagicMock(
+                return_value=[{'Id': item['Id'], 'People': []} for item in list_items]
+            ),
+            'get_emby_item_people_details': individual_fetch,
+        }):
+            result = self.get_person_media_references('http://emby', 'token', 'p1')
+
+        self.assertEqual(result['status'], 'people_unavailable')
+        individual_fetch.assert_not_called()
 
     def test_detail_connection_failure_has_distinct_status(self):
         client = MagicMock()
@@ -503,6 +597,7 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertIn("'Fields': 'SeriesName,ProductionYear,People'", emby_source)
         self.assertIn('media_item_has_exact_person_reference', emby_source)
         self.assertIn('get_emby_items_by_id', emby_source)
+        self.assertIn('get_emby_item_people_details', emby_source)
 
     def test_protected_library_snapshots_are_merged_not_replaced(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -536,6 +631,25 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertIn('person_cleanup_protected_libraries', schema_source)
         self.assertIn('person_cleanup_protected_people', schema_source)
         self.assertIn('person_cleanup_protected_names', schema_source)
+
+    def test_protected_person_count_does_not_add_name_keys(self):
+        db_tree = ast.parse((self.repo_root / 'database' / 'person_cleanup_db.py').read_text())
+        list_node = next(
+            node
+            for node in db_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == 'list_protected_libraries'
+        )
+        source = ast.unparse(list_node)
+
+        self.assertIn('AS protected_person_count', source)
+        self.assertIn('AS protected_name_count', source)
+        self.assertNotIn(')) + (SELECT COUNT(*)', source)
+
+    def test_unverified_person_cleanup_rows_are_not_selectable(self):
+        source = (self.repo_root / 'emby-actor-ui' / 'src' / 'components' / 'PersonCleanupPage.vue').read_text()
+
+        self.assertIn("disabled: (row) => !isVerifiedOrphan(row)", source)
+        self.assertIn('必须先通过“核对详情”', source)
 
 
 if __name__ == '__main__':

@@ -48,6 +48,34 @@ class EmbyIngestTests(unittest.TestCase):
     def test_empty_config_path_never_becomes_current_directory(self):
         self.assertEqual([], emby_ingest.normalize_paths(["", "  ", None], require_existing=False))
 
+    def test_inventory_matches_production_style_strm_layout_without_real_links(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "STRM"
+            relative_files = [
+                Path("电影") / "测试电影 (2026)" / "测试电影 (2026).strm",
+                Path("电视剧") / "测试剧集 (2026)" / "Season 1" / "测试剧集 S01E01.strm",
+                Path("动漫") / "测试动画 (2026)" / "Season 1" / "测试动画 S01E01.strm",
+                Path("特摄剧") / "测试特摄 (2026)" / "Season 1" / "测试特摄 S01E01.strm",
+                Path("小姐姐") / "测试作品 (2026)" / "测试作品.strm",
+                Path("特摄剧场版") / "测试剧场版 (2026)" / "测试剧场版.strm",
+                Path("演唱会") / "测试演唱会 (2026)" / "测试演唱会.strm",
+                Path("纪录片") / "测试纪录片 (2026)" / "测试纪录片.strm",
+                Path("music") / "测试歌手" / "测试音乐.strm",
+                Path("音乐") / "测试歌手" / "测试音乐.strm",
+                Path("JSON") / "测试索引.strm",
+                Path("HC") / "测试缓存.strm",
+            ]
+            for index, relative_path in enumerate(relative_files):
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"https://example.invalid/strm/{index}\n", encoding="utf-8")
+
+            inventory = emby_ingest.collect_strm_inventory(str(root))
+
+        self.assertEqual(len(relative_files), len(inventory))
+        self.assertTrue(any("电视剧/测试剧集 (2026)/Season 1" in path for path in inventory))
+        self.assertTrue(all(path.lower().endswith('.strm') for path in inventory))
+
     @mock.patch("services.emby_ingest.emby.get_all_libraries_with_paths")
     def test_notification_paths_group_files_by_media_title_directory(
         self,

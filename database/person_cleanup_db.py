@@ -114,13 +114,12 @@ def list_protected_libraries() -> List[Dict[str, Any]]:
             cursor.execute(
                 """
                 SELECT library_id, library_name, updated_at,
-                       ((SELECT COUNT(*)
-                         FROM person_cleanup_protected_people people
-                         WHERE people.library_id = libraries.library_id)
-                        +
-                        (SELECT COUNT(*)
-                         FROM person_cleanup_protected_names names
-                         WHERE names.library_id = libraries.library_id)) AS protected_person_count
+                       (SELECT COUNT(*)
+                        FROM person_cleanup_protected_people people
+                        WHERE people.library_id = libraries.library_id) AS protected_person_count,
+                       (SELECT COUNT(*)
+                        FROM person_cleanup_protected_names names
+                        WHERE names.library_id = libraries.library_id) AS protected_name_count
                 FROM person_cleanup_protected_libraries libraries
                 ORDER BY library_name ASC, library_id ASC
                 """

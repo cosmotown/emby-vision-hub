@@ -20,6 +20,7 @@ import DiscoverPage from '../components/DiscoverPage.vue';
 import UserCenterPage from '../components/UserCenterPage.vue'
 import SetupPage from '../components/Setup.vue';
 import EmbyStatsPage from '../components/EmbyStatsPage.vue';
+import MobileMorePage from '../components/MobileMorePage.vue';
 
 // --- 2. 定义路由规则 (带 meta.public 标签) ---
 const routes = [
@@ -178,6 +179,12 @@ const routes = [
     name: 'Discover',
     component: DiscoverPage,
     meta: { requiresAuth: true }, // 必须登录才能访问
+  },
+  {
+    path: '/more',
+    name: 'MobileMore',
+    component: MobileMorePage,
+    meta: { requiresAuth: true },
   },
 ];
 

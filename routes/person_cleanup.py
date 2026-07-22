@@ -95,6 +95,7 @@ def get_person_cleanup_protected_libraries():
             'collection_type': info.get('CollectionType') or '',
             'selected': library_id in protected,
             'protected_person_count': int(protected_info.get('protected_person_count') or 0),
+            'protected_name_count': int(protected_info.get('protected_name_count') or 0),
             'missing': False,
         })
     for library_id, protected_info in protected.items():
@@ -106,6 +107,7 @@ def get_person_cleanup_protected_libraries():
             'collection_type': '',
             'selected': True,
             'protected_person_count': int(protected_info.get('protected_person_count') or 0),
+            'protected_name_count': int(protected_info.get('protected_name_count') or 0),
             'missing': True,
         })
     return jsonify({'libraries': result})

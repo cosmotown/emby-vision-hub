@@ -286,6 +286,14 @@
       <!-- 2. 媒体库分布 (图表 + 统计) -->
       <n-card size="small" :bordered="false" title="媒体库分布" style="margin-top: 12px;">
         <v-chart class="chart" :option="resolutionChartOptions" autoresize style="height: 200px;" />
+        <div v-if="resolutionBreakdown.length" class="mobile-resolution-breakdown">
+          <div v-for="item in resolutionBreakdown" :key="item.name" class="mobile-resolution-item">
+            <span class="resolution-dot" :style="{ backgroundColor: item.color }" />
+            <span>{{ item.name }}</span>
+            <strong>{{ item.count }}</strong>
+            <small>{{ item.percentage }}%</small>
+          </div>
+        </div>
         <n-grid :cols="2" :x-gap="12" :y-gap="12" style="text-align: center; margin-top: 10px;">
           <n-gi>
             <n-statistic label="电影">
@@ -510,6 +518,21 @@ const resolutionChartOptions = computed(() => {
   };
 });
 
+const resolutionColors = ['#5470C6', '#91CC75', '#FAC858', '#73C0DE'];
+const resolutionBreakdown = computed(() => {
+  const chartData = stats.media_library.resolution_stats || [];
+  const total = chartData.reduce((sum, item) => sum + Number(item.count || 0), 0);
+  return chartData.map((item, index) => {
+    const count = Number(item.count || 0);
+    return {
+      name: item.resolution || '未知',
+      count,
+      percentage: total ? Math.round((count / total) * 100) : 0,
+      color: resolutionColors[index % resolutionColors.length],
+    };
+  });
+});
+
 const getIconPath = (groupName) => groupName ? `/icons/site/${groupName}.png` : '';
 const handleIconError = (e) => {
   const img = e.target;
@@ -564,4 +587,9 @@ onUnmounted(() => {
 .mobile-value { font-size: 18px; font-weight: 600; }
 .mobile-row { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px; }
 .mobile-ranking-name { font-weight: 500; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mobile-resolution-breakdown { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; margin: -2px 4px 14px; }
+.mobile-resolution-item { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto auto; align-items: center; gap: 6px; min-width: 0; font-size: 12px; }
+.mobile-resolution-item span:nth-child(2) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mobile-resolution-item small { color: var(--n-text-color-3); }
+.resolution-dot { width: 8px; height: 8px; border-radius: 50%; }
 </style>

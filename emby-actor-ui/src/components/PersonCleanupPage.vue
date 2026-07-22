@@ -1,6 +1,6 @@
 <template>
-  <n-layout content-style="padding: 24px;">
-    <n-page-header>
+  <n-layout class="person-cleanup-page" content-style="padding: 24px;">
+    <n-page-header class="person-cleanup-header">
       <template #title>
         <n-space align="center">
           <span>人物清理</span>
@@ -10,7 +10,7 @@
         </n-space>
       </template>
       <template #extra>
-        <n-space>
+        <n-space class="person-cleanup-actions">
           <n-button :loading="loading" @click="fetchCandidates">刷新</n-button>
           <n-button
             type="primary"
@@ -33,7 +33,7 @@
     </n-page-header>
 
     <n-alert type="warning" title="安全说明" style="margin: 20px 0;">
-      扫描只生成候选，不会删除人物。“核对详情”用于人工参考，不是勾选前置条件。删除仅处理人工勾选项，并会在每次删除前重新查询 Emby；发现任何关联作品或复核失败都会跳过。删除接口需要神医 Pro 支持。
+      扫描只生成候选，不会删除人物。候选必须先通过“核对详情”，确认当前 Person ID 精确关联为 0 后才能勾选。删除前还会再次查询 Emby；发现关联作品、连接失败、响应异常或 People 仍不可用都会跳过。删除接口需要神医 Pro 支持。
     </n-alert>
 
     <section class="protected-libraries-panel">
@@ -73,6 +73,9 @@
                 <n-tag v-if="library.protected_person_count" size="small" :bordered="false">
                   已保护 {{ library.protected_person_count }} 人
                 </n-tag>
+                <n-tag v-if="library.protected_name_count" size="small" :bordered="false" type="info">
+                  姓名键 {{ library.protected_name_count }} 个
+                </n-tag>
               </n-space>
             </n-checkbox>
           </n-space>
@@ -109,7 +112,7 @@
 
     <n-modal v-model:show="verifyModalVisible" :mask-closable="!verifyLoading">
       <n-card
-        style="width: min(760px, 92vw); max-height: 82vh; overflow: auto;"
+        class="person-verify-card"
         :title="`核对详情：${verifyingCandidate?.person_name || '人物'}`"
         closable
         @close="verifyModalVisible = false"
@@ -378,7 +381,11 @@ const formatDate = (value) => {
 };
 
 const columns = [
-  { type: 'selection', multiple: true },
+  {
+    type: 'selection',
+    multiple: true,
+    disabled: (row) => !isVerifiedOrphan(row),
+  },
   {
     title: '头像',
     key: 'avatar',
@@ -512,7 +519,11 @@ const verifyCandidate = async (row) => {
     } else if (response.data.candidate) {
       const index = candidates.value.findIndex((item) => item.person_id === row.person_id);
       if (index >= 0) candidates.value[index] = response.data.candidate;
-      message.success(response.data.message || '核对完成，可以人工勾选');
+      if (response.data.status === 'identity_alias_only') {
+        message.info(response.data.message || '仅命中同身份的其他 Person，当前人物已可勾选');
+      } else {
+        message.success(response.data.message || '核对完成，可以人工勾选');
+      }
     }
   } catch (error) {
     const result = error.response?.data;
@@ -536,7 +547,11 @@ const fetchCandidates = async () => {
   try {
     const response = await axios.get('/api/person-cleanup/candidates');
     candidates.value = response.data.candidates || [];
-    const validIds = new Set(candidates.value.map((item) => item.person_id));
+    const validIds = new Set(
+      candidates.value
+        .filter(isVerifiedOrphan)
+        .map((item) => item.person_id),
+    );
     selectedIds.value = selectedIds.value.filter((personId) => validIds.has(personId));
     loadError.value = '';
   } catch (error) {
@@ -651,5 +666,43 @@ onMounted(() => {
 
 .identity-match:last-child {
   border-bottom: 0;
+}
+
+.person-verify-card {
+  width: min(760px, calc(100vw - 32px));
+  max-height: min(82vh, calc(100dvh - 48px));
+  overflow: auto;
+}
+
+@media (max-width: 767px) {
+  .person-cleanup-page :deep(.n-layout-scroll-container) {
+    padding: 14px 12px 96px !important;
+  }
+
+  .person-cleanup-header :deep(.n-page-header__main) {
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .person-cleanup-header :deep(.n-page-header__extra) {
+    width: 100%;
+  }
+
+  .person-cleanup-actions {
+    width: 100%;
+  }
+
+  .person-cleanup-actions :deep(.n-button) {
+    flex: 1 1 30%;
+  }
+
+  .protected-libraries-panel :deep(.n-space) {
+    max-width: 100%;
+  }
+
+  .person-verify-card {
+    width: calc(100vw - 20px);
+    max-height: calc(100dvh - 20px);
+  }
 }
 </style>

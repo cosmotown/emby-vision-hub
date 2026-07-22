@@ -3,9 +3,6 @@
     <div class="app-backdrop" aria-hidden="true" />
     <n-layout-header class="app-header" :bordered="false">
       <div class="header-brand">
-        <n-button v-if="isMobile" text class="mobile-menu-button" aria-label="打开功能导航" @click="mobileMenuOpen = true">
-          <template #icon><n-icon :component="MenuOutline" /></template>
-        </n-button>
         <img :src="logo" alt="Emby Vision Hub" class="brand-logo" />
         <div class="brand-copy">
           <strong>EMBY VISION HUB</strong>
@@ -94,31 +91,24 @@
       class="app-body"
       :class="{ 'with-horizontal-navigation': isHorizontal }"
     >
-      <div
-        v-if="isMobile && mobileMenuOpen"
-        class="mobile-sider-mask"
-        @click="mobileMenuOpen = false"
-      />
-
       <n-layout-sider
-        v-if="!isHorizontal || isMobile"
+        v-if="!isMobile && !isHorizontal"
         :bordered="false"
         collapse-mode="width"
         :collapsed-width="72"
         :width="248"
-        :collapsed="!isMobile && isCollapsedLayout"
-        :show-trigger="isMobile ? false : 'bar'"
+        :collapsed="isCollapsedLayout"
+        show-trigger="bar"
         :native-scrollbar="false"
         class="app-sider"
-        :class="{ 'mobile-sider': isMobile, 'is-open': mobileMenuOpen }"
         @update:collapsed="handleDesktopCollapse"
       >
-        <div class="sider-version" :class="{ compact: isCollapsedLayout && !isMobile }">
-          <span v-if="!isCollapsedLayout || isMobile">功能导航</span>
+        <div class="sider-version" :class="{ compact: isCollapsedLayout }">
+          <span v-if="!isCollapsedLayout">功能导航</span>
           <small>v{{ appVersion }}</small>
         </div>
         <n-menu
-          :collapsed="!isMobile && isCollapsedLayout"
+          :collapsed="isCollapsedLayout"
           :collapsed-width="72"
           :collapsed-icon-size="22"
           :options="verticalMenuOptions"
@@ -147,7 +137,11 @@
         <n-icon :component="item.icon" size="20" />
         <span>{{ item.label }}</span>
       </button>
-      <button type="button" @click="mobileMenuOpen = true">
+      <button
+        type="button"
+        :class="{ active: activeMenuKey === 'MobileMore' }"
+        @click="handleMenuUpdate('MobileMore')"
+      >
         <n-icon :component="GridOutline" size="20" />
         <span>更多</span>
       </button>
@@ -201,7 +195,6 @@ import {
   GridOutline,
   InformationCircleOutline,
   LogOutOutline,
-  MenuOutline,
   OptionsOutline,
   PeopleCircleOutline,
   PersonCircleOutline,
@@ -238,7 +231,6 @@ const dialog = useDialog();
 
 const appVersion = ref(__APP_VERSION__);
 const isMobile = ref(false);
-const mobileMenuOpen = ref(false);
 const isRealtimeLogVisible = ref(false);
 const isHistoryLogVisible = ref(false);
 const showThemeCustomizer = ref(false);
@@ -329,13 +321,7 @@ const userOptions = computed(() => {
   }
   options.push(
     {
-      label: '界面布局',
-      key: 'layout-customizer',
-      icon: renderIcon(GridOutline),
-      extra: layoutLabelMap[props.themeSettings.layout] || '垂直',
-    },
-    {
-      label: '主题',
+      label: '主题与外观',
       key: 'theme-customizer',
       icon: renderIcon(ColorPaletteOutline),
       extra: `${themeLabelMap[props.themeSettings.theme] || '跟随系统'} · ${layoutLabelMap[props.themeSettings.layout] || '垂直'}`,
@@ -362,13 +348,15 @@ const userOptions = computed(() => {
 
 function checkMobile() {
   isMobile.value = window.innerWidth < 768;
-  if (!isMobile.value) mobileMenuOpen.value = false;
+}
+
+function openThemeCustomizer() {
+  showThemeCustomizer.value = true;
 }
 
 function handleMenuUpdate(key) {
   if (!key || String(key).startsWith('section-')) return;
   router.push({ name: key });
-  mobileMenuOpen.value = false;
 }
 
 function handleDesktopCollapse(collapsed) {
@@ -423,7 +411,7 @@ async function handleUserSelect(key) {
     applyLayout(String(key).split(':')[1]);
   } else if (String(key).startsWith('theme:')) {
     applyTheme(String(key).split(':')[1]);
-  } else if (key === 'theme-customizer' || key === 'layout-customizer') {
+  } else if (key === 'theme-customizer') {
     showThemeCustomizer.value = true;
   } else if (key === 'restart-container') {
     dialog.warning({
@@ -441,10 +429,6 @@ async function handleUserSelect(key) {
   }
 }
 
-watch(() => route.path, () => {
-  mobileMenuOpen.value = false;
-});
-
 watch([() => props.taskStatus?.logs, isRealtimeLogVisible], async ([, visible]) => {
   if (!visible) return;
   await nextTick();
@@ -454,10 +438,12 @@ watch([() => props.taskStatus?.logs, isRealtimeLogVisible], async ([, visible]) 
 onMounted(() => {
   checkMobile();
   window.addEventListener('resize', checkMobile);
+  window.addEventListener('evh:open-theme-customizer', openThemeCustomizer);
 });
 
 onUnmounted(() => {
   window.removeEventListener('resize', checkMobile);
+  window.removeEventListener('evh:open-theme-customizer', openThemeCustomizer);
 });
 </script>
 
@@ -599,7 +585,6 @@ onUnmounted(() => {
 .page-content-inner-wrapper { min-height: 100%; padding: 0; box-sizing: border-box; }
 .log-panel { height: 60vh; font-size: 13px; line-height: 1.6; }
 
-.mobile-sider-mask,
 .mobile-bottom-navigation { display: none; }
 
 @media (max-width: 767px) {
@@ -609,28 +594,6 @@ onUnmounted(() => {
   .brand-logo { width: 30px; height: 30px; }
   .app-body { height: calc(100vh - 60px); }
   .page-content-inner-wrapper { padding: 0 0 76px; }
-
-  .mobile-sider {
-    position: absolute !important;
-    inset: 0 auto 0 0;
-    z-index: 1001;
-    width: min(86vw, 300px) !important;
-    max-width: min(86vw, 300px) !important;
-    transform: translateX(-105%);
-    transition: transform 0.22s ease;
-    box-shadow: 16px 0 40px rgba(0, 0, 0, 0.24);
-  }
-
-  .mobile-sider.is-open { transform: translateX(0); }
-
-  .mobile-sider-mask {
-    position: absolute;
-    inset: 0;
-    z-index: 1000;
-    display: block;
-    background: rgba(0, 0, 0, 0.48);
-    backdrop-filter: blur(2px);
-  }
 
   .mobile-bottom-navigation {
     position: fixed;

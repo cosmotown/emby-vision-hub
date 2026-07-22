@@ -2234,6 +2234,50 @@ def delete_item(item_id: str, emby_server_url: str, emby_api_key: str, user_id: 
         return False    
 
 # --- 清理幽灵演员 ---
+def get_emby_item_people_details(
+    base_url: str,
+    api_key: str,
+    item_ids: List[str],
+    max_workers: int = 6,
+) -> List[Dict[str, Any]]:
+    """最后一层兼容兜底：并发读取少量单作品详情中的 People。"""
+    normalized_ids = list(dict.fromkeys(
+        str(item_id).strip() for item_id in item_ids if str(item_id).strip()
+    ))
+    if not base_url or not api_key or not normalized_ids:
+        return []
+
+    headers = {'X-Emby-Token': api_key}
+
+    def fetch_one(item_id: str) -> Dict[str, Any]:
+        response = emby_client.get(
+            f"{base_url.rstrip('/')}/Items/{item_id}",
+            headers=headers,
+            params={'Fields': 'People', 'PersonFields': 'ProviderIds'},
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError(f'Emby 作品 {item_id} 详情响应格式异常')
+        payload_id = str(payload.get('Id') or item_id).strip()
+        if payload_id != item_id:
+            raise ValueError(f'Emby 作品 {item_id} 详情返回了不匹配的 ID')
+        return {**payload, 'Id': item_id}
+
+    worker_count = max(1, min(int(max_workers), 6, len(normalized_ids)))
+    details_by_id = {}
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_id = {
+            executor.submit(fetch_one, item_id): item_id
+            for item_id in normalized_ids
+        }
+        for future in as_completed(future_to_id):
+            item_id = future_to_id[future]
+            details_by_id[item_id] = future.result()
+    return [details_by_id[item_id] for item_id in normalized_ids]
+
+
 def get_person_media_references(
     base_url: str,
     api_key: str,
@@ -2247,7 +2291,8 @@ def get_person_media_references(
     Emby's PersonIds filter may return media associated with another Person row
     that shares the same TMDb/IMDb/Douban identity. Therefore every returned
     item's embedded People list is inspected before it counts as a reference.
-    List results that omit People are repaired through one batched detail lookup.
+    List results that omit People are repaired through one batched detail lookup,
+    followed by a bounded concurrent per-item fallback only for unresolved works.
     Any item that remains unverifiable fails closed.
     '''
     if not base_url or not api_key or not person_id:
@@ -2372,6 +2417,50 @@ def get_person_media_references(
             for item in detail_items
             if str(item.get('Id') or '').strip()
         }
+
+        unresolved_detail_ids = []
+        for item in items_needing_details:
+            item_id = str(item.get('Id') or '').strip()
+            detail = details_by_id.get(item_id)
+            item_for_check = {**item, 'People': detail.get('People')} if detail else item
+            if media_item_has_exact_person_reference(
+                item_for_check,
+                person_id,
+                person_name=person_name,
+            ) is None:
+                unresolved_detail_ids.append(item_id)
+
+        if unresolved_detail_ids:
+            if len(unresolved_detail_ids) > 200:
+                logger.error(
+                    f"复核人物 {person_id} 失败：仍有 {len(unresolved_detail_ids)} 部作品需要单项详情，"
+                    "超过安全兜底上限 200，保持禁止删除"
+                )
+                return failed_result('people_unavailable', items_needing_details)
+            try:
+                individual_details = get_emby_item_people_details(
+                    base_url,
+                    api_key,
+                    unresolved_detail_ids,
+                )
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                logger.error(f"复核人物 {person_id} 的单作品详情连接失败: {exc}")
+                return failed_result('connection_failed', items_needing_details)
+            except (requests.exceptions.RequestException, ValueError, TypeError) as exc:
+                logger.error(f"复核人物 {person_id} 的单作品详情响应异常: {exc}")
+                return failed_result('invalid_response', items_needing_details)
+            except Exception as exc:
+                logger.error(f"复核人物 {person_id} 的单作品详情发生未知响应异常: {exc}")
+                return failed_result('invalid_response', items_needing_details)
+
+            if any(not isinstance(item, dict) for item in individual_details):
+                logger.error(f"复核人物 {person_id} 的单作品详情响应包含非法项目")
+                return failed_result('invalid_response', items_needing_details)
+            details_by_id.update({
+                str(item.get('Id')): item
+                for item in individual_details
+                if str(item.get('Id') or '').strip()
+            })
 
     exact_count = 0
     exact_items = []

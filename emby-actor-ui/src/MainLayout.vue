@@ -593,7 +593,17 @@ onUnmounted(() => {
   .brand-copy strong { font-size: 12px; }
   .brand-logo { width: 30px; height: 30px; }
   .app-body { height: calc(100vh - 60px); }
-  .page-content-inner-wrapper { padding: 0 0 76px; }
+  .page-content-inner-wrapper {
+    height: calc(100dvh - 60px);
+    max-height: calc(100dvh - 60px);
+    min-height: 0;
+    padding: 0 0 76px;
+    box-sizing: border-box;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    -webkit-overflow-scrolling: touch;
+  }
 
   .mobile-bottom-navigation {
     position: fixed;

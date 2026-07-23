@@ -50,7 +50,10 @@ class _FakeConnection:
 
 class SettingsDbTests(unittest.TestCase):
     def test_missing_app_settings_table_is_first_run_empty_state(self):
-        connection = _FakeConnection(_UndefinedTable())
+        # Other test modules may have imported the real psycopg2 package before
+        # this module is collected.  Always raise the exception class currently
+        # used by settings_db so the test is independent of discovery order.
+        connection = _FakeConnection(settings_db.psycopg2.errors.UndefinedTable())
         with mock.patch.object(settings_db, "get_db_connection", return_value=connection):
             self.assertIsNone(settings_db.get_setting("dynamic_app_config"))
 

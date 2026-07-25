@@ -156,33 +156,138 @@ def cancel_subscription(tmdb_id: str, item_type: str, config: Dict[str, Any], se
         logger.error(f"  ➜ 调用 MoviePilot 取消订阅 API 时发生未知错误: {e}", exc_info=True)
         return False
 
-def check_subscription_exists(tmdb_id: str, item_type: str, config: Dict[str, Any], season: Optional[int] = None) -> bool:
-    """
-    【查询订阅】检查订阅是否存在。
-    """
+class MoviePilotSubscriptionLookupError(RuntimeError):
+    pass
+
+def _normalize_subscription_state(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    value = str(value).strip().upper()
+    return value or None
+
+def _normalize_episode_count(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
     try:
-        moviepilot_url = config.get(constants.CONFIG_OPTION_MOVIEPILOT_URL, '').rstrip('/')
-        access_token = _get_access_token(config)
-        if not access_token:
-            return False
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
-        media_id_param = f"tmdb:{tmdb_id}"
-        api_url = f"{moviepilot_url}/api/v1/subscribe/media/{media_id_param}"
-        headers = {"Authorization": f"Bearer {access_token}"}
-        
+def get_subscription_details(
+    tmdb_id: str,
+    item_type: str,
+    config: Dict[str, Any],
+    season: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    try:
+        base_url = config.get(
+            constants.CONFIG_OPTION_MOVIEPILOT_URL, ""
+        ).rstrip("/")
+        token = _get_access_token(config)
+        if not base_url or not token:
+            raise MoviePilotSubscriptionLookupError(
+                "MoviePilot 地址或认证信息不可用"
+            )
+
+        headers = {"Authorization": f"Bearer {token}"}
+        media_id = f"tmdb:{tmdb_id}"
         params = {}
-        if item_type in ['Series', 'Season'] and season is not None:
-            params['season'] = season
+        if item_type in ("Series", "Season") and season is not None:
+            params["season"] = season
 
-        response = requests.get(api_url, headers=headers, params=params, timeout=15)
-        
+        lookup = requests.get(
+            f"{base_url}/api/v1/subscribe/media/{media_id}",
+            headers=headers,
+            params=params,
+            timeout=15,
+        )
+        if lookup.status_code == 404:
+            return None
+        if lookup.status_code != 200:
+            raise MoviePilotSubscriptionLookupError(
+                f"订阅查询失败: {lookup.status_code} - {lookup.text}"
+            )
+
+        lookup_data = lookup.json()
+        if not isinstance(lookup_data, dict):
+            raise MoviePilotSubscriptionLookupError("订阅查询响应不是对象")
+
+        sub_id = lookup_data.get("id")
+        if not sub_id:
+            return None
+
+        detail = requests.get(
+            f"{base_url}/api/v1/subscribe/{sub_id}",
+            headers=headers,
+            timeout=15,
+        )
+        if detail.status_code != 200:
+            raise MoviePilotSubscriptionLookupError(
+                f"订阅详情查询失败: {detail.status_code} - {detail.text}"
+            )
+
+        detail_data = detail.json()
+        if not isinstance(detail_data, dict):
+            raise MoviePilotSubscriptionLookupError("订阅详情响应不是对象")
+
+        merged = dict(lookup_data)
+        merged.update(detail_data)
+        state = _normalize_subscription_state(
+            merged.get("state", merged.get("status"))
+        )
+        if state is None:
+            raise MoviePilotSubscriptionLookupError(
+                f"订阅详情缺少 state (ID:{sub_id})"
+            )
+
+        return {
+            "id": sub_id,
+            "state": state,
+            "total_episode": _normalize_episode_count(
+                merged.get("total_episode")
+            ),
+            "lack_episode": _normalize_episode_count(
+                merged.get("lack_episode")
+            ),
+            "_detail_payload": dict(detail_data),
+        }
+    except MoviePilotSubscriptionLookupError:
+        raise
+    except Exception as exc:
+        raise MoviePilotSubscriptionLookupError(
+            f"获取完整订阅详情失败: {exc}"
+        ) from exc
+
+def check_subscription_exists(
+    tmdb_id: str,
+    item_type: str,
+    config: Dict[str, Any],
+    season: Optional[int] = None,
+) -> bool:
+    try:
+        base_url = config.get(
+            constants.CONFIG_OPTION_MOVIEPILOT_URL, ""
+        ).rstrip("/")
+        token = _get_access_token(config)
+        if not token:
+            return False
+        params = {}
+        if item_type in ("Series", "Season") and season is not None:
+            params["season"] = season
+        response = requests.get(
+            f"{base_url}/api/v1/subscribe/media/tmdb:{tmdb_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=15,
+        )
         if response.status_code == 200:
             data = response.json()
-            if data and data.get('id'):
-                return True
+            return bool(isinstance(data, dict) and data.get("id"))
         return False
-    except Exception as e:
-        logger.warning(f"  ➜ 检查 MoviePilot 订阅状态时发生错误: {e}")
+    except Exception as exc:
+        logger.warning(
+            f"  ➜ 检查 MoviePilot 订阅状态时发生错误: {exc}"
+        )
         return False
 
 # ======================================================================
@@ -229,84 +334,149 @@ def subscribe_series_to_moviepilot(series_info: dict, season_number: Optional[in
     
     return subscribe_with_custom_payload(payload, config)
 
-def update_subscription_status(tmdb_id: int, season: Optional[int], status: str, config: Dict[str, Any], total_episodes: Optional[int] = None) -> bool:
-    """
-    调用 MoviePilot 接口更新订阅状态。
-    兼容电影 (season=None) 和 剧集 (season=int)。
-    status: 'R' (运行/订阅), 'S' (暂停/停止), 'P' (待定)
-    """
+def update_subscription_status(
+    tmdb_id: int,
+    season: Optional[int],
+    status: str,
+    config: Dict[str, Any],
+    total_episodes: Optional[int] = None,
+    subscription_details: Optional[Dict[str, Any]] = None,
+) -> bool:
     try:
-        moviepilot_url = config.get(constants.CONFIG_OPTION_MOVIEPILOT_URL, '').rstrip('/')
-        access_token = _get_access_token(config)
-        if not access_token:
-            return False
-        
-        headers = {"Authorization": f"Bearer {access_token}"}
-
-        # 1. 查询订阅 ID (subid)
-        media_id_param = f"tmdb:{tmdb_id}"
-        get_url = f"{moviepilot_url}/api/v1/subscribe/media/{media_id_param}"
-        get_params = {}
-        
-        # ★★★ 修改点：只有当 season 有值时才传参，电影不传 season ★★★
-        if season is not None:
-            get_params['season'] = season
-        
-        get_res = requests.get(get_url, headers=headers, params=get_params, timeout=10)
-        
-        sub_id = None
-        if get_res.status_code == 200:
-            data = get_res.json()
-            if data and isinstance(data, dict):
-                sub_id = data.get('id')
-        
-        if not sub_id:
-            # 如果没找到订阅ID，说明可能还没订阅，或者已经被删除了
+        details = subscription_details
+        if details is None:
+            details = get_subscription_details(
+                str(tmdb_id),
+                "Series" if season is not None else "Movie",
+                config,
+                season=season,
+            )
+        if not isinstance(details, dict) or not details.get("id"):
             return False
 
-        # 2. 更新状态
-        status_url = f"{moviepilot_url}/api/v1/subscribe/status/{sub_id}"
-        status_params = {"state": status}
-        requests.put(status_url, headers=headers, params=status_params, timeout=10)
-        
-        # 3. 如果提供了 total_episodes，更新订阅详情 ★★★
-        if total_episodes is not None:
-            # A. 获取完整的订阅详情
-            detail_url = f"{moviepilot_url}/api/v1/subscribe/{sub_id}"
-            detail_res = requests.get(detail_url, headers=headers, timeout=10)
-            
-            if detail_res.status_code == 200:
-                sub_data = detail_res.json()
-                
-                old_total = sub_data.get('total_episode', 0)
-                old_lack = sub_data.get('lack_episode', 0)
-                
-                # 只有当当前集数不等于目标集数时才更新
-                if old_total != total_episodes:
-                    # B. 修改总集数
-                    sub_data['total_episode'] = total_episodes
-                    
-                    if old_total > total_episodes:
-                        diff = old_total - total_episodes
-                        # 确保不小于 0
+        sub_id = details["id"]
+        current_state = _normalize_subscription_state(
+            details.get("state")
+        )
+        target_state = _normalize_subscription_state(status)
+        current_total = _normalize_episode_count(
+            details.get("total_episode")
+        )
+        target_total = _normalize_episode_count(total_episodes)
+
+        if current_state is None or target_state is None:
+            logger.warning(
+                f"  ➜ MoviePilot 状态不可核验 (ID:{sub_id})，本轮跳过。"
+            )
+            return False
+
+        status_changed = current_state != target_state
+        total_changed = (
+            target_total is not None
+            and current_total is not None
+            and current_total != target_total
+        )
+
+        if target_total is not None and current_total is None:
+            logger.warning(
+                f"  ➜ MoviePilot 总集数不可核验 (ID:{sub_id})，"
+                "不会执行详情 PUT。"
+            )
+
+        if not status_changed and not total_changed:
+            logger.debug(
+                f"  ➜ [MP同步] 订阅 ID:{sub_id} 无真实变化，跳过所有 PUT。"
+            )
+            return True
+
+        base_url = config.get(
+            constants.CONFIG_OPTION_MOVIEPILOT_URL, ""
+        ).rstrip("/")
+        token = _get_access_token(config)
+        if not base_url or not token:
+            return False
+        headers = {"Authorization": f"Bearer {token}"}
+        success = True
+
+        # 先更新详情，再更新状态，避免旧详情载荷覆盖新状态。
+        if total_changed:
+            raw_payload = details.get("_detail_payload")
+            if not isinstance(raw_payload, dict):
+                logger.warning(
+                    f"  ➜ 完整订阅载荷不可用 (ID:{sub_id})，跳过详情 PUT。"
+                )
+                success = False
+            else:
+                payload = dict(raw_payload)
+                old_total = _normalize_episode_count(
+                    payload.get("total_episode")
+                )
+                if old_total is None:
+                    logger.warning(
+                        f"  ➜ 完整订阅载荷缺少 total_episode (ID:{sub_id})。"
+                    )
+                    success = False
+                elif old_total != target_total:
+                    old_lack = _normalize_episode_count(
+                        payload.get("lack_episode")
+                    )
+                    old_lack = old_lack if old_lack is not None else 0
+                    payload["total_episode"] = target_total
+
+                    if old_total > target_total:
+                        diff = old_total - target_total
                         new_lack = max(0, old_lack - diff)
-                        sub_data['lack_episode'] = new_lack
-                        
-                        logger.info(f"  ➜ [MP修正] 自动修正缺失集数: {old_lack} -> {new_lack} (因总集数 {old_total}->{total_episodes})")
+                        payload["lack_episode"] = new_lack
+                        logger.info(
+                            f"  ➜ [MP修正] 缺失集数 {old_lack}->{new_lack} "
+                            f"(总集数 {old_total}->{target_total})"
+                        )
 
-                    # C. 提交更新 (PUT /api/v1/subscribe/)
-                    update_url = f"{moviepilot_url}/api/v1/subscribe/"
-                    update_res = requests.put(update_url, headers=headers, json=sub_data, timeout=10)
-                    
-                    if update_res.status_code in [200, 204]:
-                        logger.info(f"  ➜ [MP同步] 已将 MP 订阅 (ID:{sub_id}) 的总集数更新为 {total_episodes}")
+                    response = requests.put(
+                        f"{base_url}/api/v1/subscribe/",
+                        headers=headers,
+                        json=payload,
+                        timeout=10,
+                    )
+                    if response.status_code not in (200, 204):
+                        logger.warning(
+                            f"  ➜ 更新 MoviePilot 总集数失败: "
+                            f"{response.status_code} - {response.text}"
+                        )
+                        success = False
                     else:
-                        logger.warning(f"  ➜ 更新 MP 总集数失败: {update_res.status_code} - {update_res.text}")
+                        logger.info(
+                            f"  ➜ [MP同步] 订阅 ID:{sub_id} 总集数 "
+                            f"{old_total}->{target_total}"
+                        )
 
-        return True
+        if status_changed:
+            response = requests.put(
+                f"{base_url}/api/v1/subscribe/status/{sub_id}",
+                headers=headers,
+                params={"state": target_state},
+                timeout=10,
+            )
+            if response.status_code not in (200, 204):
+                logger.warning(
+                    f"  ➜ 更新 MoviePilot 状态失败: "
+                    f"{response.status_code} - {response.text}"
+                )
+                success = False
+            else:
+                logger.info(
+                    f"  ➜ [MP同步] 订阅 ID:{sub_id} 状态 "
+                    f"{current_state}->{target_state}"
+                )
 
-    except Exception as e:
-        logger.error(f"  ➜ 调用 MoviePilot 更新接口出错: {e}")
+        return success
+    except MoviePilotSubscriptionLookupError as exc:
+        logger.warning(
+            f"  ➜ 查询 MoviePilot 订阅失败，本轮不写入: {exc}"
+        )
+        return False
+    except Exception as exc:
+        logger.error(f"  ➜ 调用 MoviePilot 更新接口出错: {exc}")
         return False
     
 def delete_transfer_history(tmdb_id: str, season: int, title: str, config: Dict[str, Any]) -> list:

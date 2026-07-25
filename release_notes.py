@@ -2,6 +2,23 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.8",
+        "published_at": "2026-07-26T07:09:10+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.8",
+        "changelog": """## MoviePilot 状态同步幂等修复
+
+- 新增完整订阅详情读取，返回 ID、状态、总集数和缺失集数。
+- 状态未变化时不调用状态 PUT；总集数未变化时不调用详情 PUT。
+- 状态和集数都未变化时执行零 PUT，避免高频任务重复写入。
+- 保留旧季不自动补订、最新季按现有开关自动补订的规则。
+- 自动补订成功后重新读取详情并执行必要同步。
+- 不修改智能追剧状态判断、数据库结构、Emby、STRM 和人物功能。
+- 增加 MoviePilot 幂等同步与自动补订回归测试。
+
+""",
+
+    },
+    {
         "version": "v7.2.7",
         "published_at": "2026-07-24T00:11:46+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.7",

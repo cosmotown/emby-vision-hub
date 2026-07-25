@@ -752,111 +752,193 @@ class WatchlistProcessor:
             return False
 
     # ★★★ 辅助方法：同步状态给 MoviePilot ★★★
-    def _sync_status_to_moviepilot(self, tmdb_id: str, series_name: str, series_details: Dict[str, Any], final_status: str, old_status: str = None):
-        """
-        根据最终计算出的 watching_status，调用 MP 接口更新订阅状态及总集数。
-        逻辑优化：
-        1. 只要 MP 有订阅，就同步状态（覆盖所有季）。
-        2. 如果 MP 无订阅，仅自动补订【最新季】（防止已完结的老季诈尸）。
-        """
+    def _sync_status_to_moviepilot(
+        self,
+        tmdb_id: str,
+        series_name: str,
+        series_details: Dict[str, Any],
+        final_status: str,
+        old_status: str = None,
+    ):
         try:
-            watchlist_cfg = settings_db.get_setting('watchlist_config') or {}
-            auto_pause_days = int(watchlist_cfg.get('auto_pause', 0))
+            cfg = settings_db.get_setting("watchlist_config") or {}
+            auto_pause_days = int(cfg.get("auto_pause", 0))
             enable_auto_pause = auto_pause_days > 0
-            auto_pending_cfg = watchlist_cfg.get('auto_pending', {})
-            enable_sync_sub = watchlist_cfg.get('sync_mp_subscription', False)
-            
-            # 获取配置的虚标集数 (默认99)
-            fake_total_episodes = int(auto_pending_cfg.get('default_total_episodes', 99))
+            auto_pending_cfg = cfg.get("auto_pending", {})
+            enable_sync_sub = cfg.get("sync_mp_subscription", False)
+            fake_total = int(
+                auto_pending_cfg.get("default_total_episodes", 99)
+            )
 
-            # 1. 确定 MP 目标状态
-            target_mp_status = 'R' 
+            target_state = "R"
             if final_status == STATUS_PENDING:
-                target_mp_status = 'P'
+                target_state = "P"
             elif final_status == STATUS_PAUSED:
-                target_mp_status = 'S' if enable_auto_pause else 'R'
+                target_state = "S" if enable_auto_pause else "R"
             elif final_status == STATUS_WATCHING:
-                target_mp_status = 'R'
+                target_state = "R"
             else:
-                return 
+                return
 
-            # ★★★ 计算最新季号 ★★★
-            all_seasons = series_details.get('seasons', [])
-            valid_seasons = [s for s in all_seasons if s.get('season_number', 0) > 0]
-            latest_season_num = max((s['season_number'] for s in valid_seasons), default=0)
+            seasons = series_details.get("seasons", [])
+            valid = [
+                s for s in seasons
+                if s.get("season_number", 0) > 0
+            ]
+            latest_season = max(
+                (s["season_number"] for s in valid),
+                default=0,
+            )
 
-            # 2. 遍历所有季进行同步
-            for season in all_seasons:
-                s_num = season.get('season_number')
-                if not s_num or s_num <= 0:
+            for season in seasons:
+                season_number = season.get("season_number")
+                if not season_number or season_number <= 0:
                     continue
 
-                # --- A. 检查订阅是否存在 ---
-                exists = moviepilot.check_subscription_exists(tmdb_id, 'Series', self.config, season=s_num)
-                
-                # --- B. 自动补订逻辑 ---
-                if not exists:
-                    # 只有【最新季】才允许自动补订
-                    # 逻辑：S1-S3 没了就没了，不补；S4(最新) 没了必须补回来，因为要追更。
-                    if s_num == latest_season_num:
-                        if not enable_sync_sub:
-                            logger.debug("  ➜ 自动补订开关关闭，跳过自动补订。")
-                            continue
-                        logger.info(f"  🔍 [MP同步] 发现《{series_name}》最新季 S{s_num} 在 MoviePilot 中无活跃订阅，正在自动补订...")
-                        sub_success = moviepilot.subscribe_series_to_moviepilot(
-                            series_info={'title': series_name, 'tmdb_id': tmdb_id},
-                            season_number=s_num,
-                            config=self.config
+                try:
+                    details = moviepilot.get_subscription_details(
+                        tmdb_id,
+                        "Series",
+                        self.config,
+                        season=season_number,
+                    )
+                except moviepilot.MoviePilotSubscriptionLookupError as exc:
+                    logger.warning(
+                        f"  ⚠️ [MP同步] 《{series_name}》S{season_number} "
+                        f"查询失败，本轮跳过且不自动补订: {exc}"
+                    )
+                    continue
+
+                auto_subscribed = False
+                if details is None:
+                    # 旧季不存在时保持原规则：不自动补订。
+                    if season_number != latest_season:
+                        continue
+                    # 最新季继续受原有开关控制。
+                    if not enable_sync_sub:
+                        logger.debug(
+                            "  ➜ 自动补订开关关闭，跳过最新季自动补订。"
                         )
-                        if not sub_success:
-                            logger.warning(f"  ❌ [MP同步] 补订 S{s_num} 失败，跳过。")
-                            continue
-                        logger.info(f"  ✅ [MP同步] 《{series_name}》S{s_num} 补订成功。")
-                    else:
-                        # 旧季不存在，直接跳过，不打扰
                         continue
 
-                # --- C. 计算目标总集数 ---
-                real_episode_count = season.get('episode_count', 0)
-                current_target_total = None
-                
-                if target_mp_status == 'P':
-                    current_target_total = fake_total_episodes
-                elif target_mp_status == 'R':
-                    if real_episode_count > 0:
-                        current_target_total = real_episode_count
+                    logger.info(
+                        f"  🔍 [MP同步] 《{series_name}》最新季 "
+                        f"S{season_number} 无订阅，正在自动补订..."
+                    )
+                    if not moviepilot.subscribe_series_to_moviepilot(
+                        series_info={
+                            "title": series_name,
+                            "tmdb_id": tmdb_id,
+                        },
+                        season_number=season_number,
+                        config=self.config,
+                    ):
+                        logger.warning(
+                            f"  ❌ [MP同步] 补订 S{season_number} 失败。"
+                        )
+                        continue
 
-                # --- D. 执行状态同步 ---
-                sync_success = moviepilot.update_subscription_status(
-                    int(tmdb_id), 
-                    s_num, 
-                    target_mp_status, 
-                    self.config, 
-                    total_episodes=current_target_total
+                    auto_subscribed = True
+                    logger.info(
+                        f"  ✅ [MP同步] 《{series_name}》"
+                        f"S{season_number} 补订成功。"
+                    )
+
+                    # 补订成功后重新读取详情，保留必要同步。
+                    details = None
+                    for attempt in range(3):
+                        try:
+                            details = moviepilot.get_subscription_details(
+                                tmdb_id,
+                                "Series",
+                                self.config,
+                                season=season_number,
+                            )
+                        except moviepilot.MoviePilotSubscriptionLookupError as exc:
+                            logger.warning(
+                                f"  ⚠️ [MP同步] 补订后读取详情失败 "
+                                f"({attempt + 1}/3): {exc}"
+                            )
+                        if details is not None:
+                            break
+                        if attempt < 2:
+                            time.sleep(1)
+
+                    if details is None:
+                        logger.warning(
+                            f"  ⚠️ [MP同步] 《{series_name}》"
+                            f"S{season_number} 已补订但详情暂不可读，"
+                            "本轮不执行 PUT。"
+                        )
+                        continue
+
+                current_state = str(
+                    details.get("state") or ""
+                ).strip().upper()
+                if not current_state:
+                    logger.warning(
+                        f"  ⚠️ [MP同步] 《{series_name}》"
+                        f"S{season_number} 当前状态不可核验。"
+                    )
+                    continue
+
+                real_total = season.get("episode_count", 0)
+                target_total = None
+                if target_state == "P":
+                    target_total = fake_total
+                elif target_state == "R" and real_total > 0:
+                    target_total = real_total
+
+                try:
+                    current_total = (
+                        int(details.get("total_episode"))
+                        if details.get("total_episode") is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    current_total = None
+
+                state_changed = current_state != target_state
+                total_changed = (
+                    target_total is not None
+                    and current_total is not None
+                    and current_total != target_total
                 )
 
-                if sync_success:
-                    # 仅记录有意义的变更日志
-                    should_log = False
-                    log_msg = ""
+                if not state_changed and not total_changed:
+                    logger.debug(
+                        f"  ➜ [MP同步] 《{series_name}》"
+                        f"S{season_number} 无真实变化，跳过所有 PUT。"
+                    )
+                    continue
 
-                    if target_mp_status != 'R':
-                        should_log = True
-                        status_desc = "待定(P)" if target_mp_status == 'P' else "暂停(S)"
-                        ep_msg = f", 集数->{current_target_total}" if current_target_total else ""
-                        log_msg = f"  ➜ [MP同步] 《{series_name}》S{s_num} -> {status_desc}{ep_msg} (原因: {translate_internal_status(final_status)})"
-                    
-                    elif target_mp_status == 'R' and (old_status == STATUS_PENDING or (not exists and s_num == latest_season_num)):
-                        should_log = True
-                        reason = "重新补订" if not exists else "解除待定"
-                        ep_msg = f", 集数修正->{current_target_total}" if current_target_total else ""
-                        log_msg = f"  ➜ [MP同步] 《{series_name}》S{s_num} -> 恢复订阅(R){ep_msg} (原因: {reason})"
+                if not moviepilot.update_subscription_status(
+                    int(tmdb_id),
+                    season_number,
+                    target_state,
+                    self.config,
+                    total_episodes=target_total,
+                    subscription_details=details,
+                ):
+                    continue
 
-                    if should_log:
-                        logger.info(log_msg)
-
-        except Exception as e:
-            logger.warning(f"同步状态给 MoviePilot 时出错: {e}")
+                changes = []
+                if auto_subscribed:
+                    changes.append("重新补订")
+                if state_changed:
+                    changes.append(
+                        f"状态 {current_state}->{target_state}"
+                    )
+                if total_changed:
+                    changes.append(
+                        f"总集数 {current_total}->{target_total}"
+                    )
+                logger.info(
+                    f"  ➜ [MP同步] 《{series_name}》"
+                    f"S{season_number}: " + "，".join(changes)
+                )
+        except Exception as exc:
+            logger.warning(f"同步状态给 MoviePilot 时出错: {exc}")
 
     def _check_season_consistency(self, tmdb_id: str, season_number: int, expected_episode_count: int) -> bool:
         """

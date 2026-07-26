@@ -214,7 +214,9 @@ def get_task_registry(context: str = 'all'):
         'update-daily-theme': (task_update_daily_theme, "更新每日主题", 'media', False),
         'manual_subscribe_batch': (task_manual_subscribe_batch, "手动订阅处理", 'media', False),
         'scan_old_seasons_backfill': (task_scan_old_seasons_backfill, "扫描缺季的剧", 'watchlist', False),
-        'merge-duplicate-actors': (task_merge_duplicate_actors, "合并分身演员", 'media', False),
+        # The legacy merge task deletes Person items without the v7.2.7
+        # protected-library snapshot and final fail-closed reference check.
+        # Keep it unreachable until it is migrated to that safety closure.
         'scan-ghost-actors': (task_scan_ghost_actor_candidates, "扫描幽灵人物", 'media', False),
         'scan-organize-115': (task_scan_and_organize_115, "扫描115待整理目录", 'media', False),
     }

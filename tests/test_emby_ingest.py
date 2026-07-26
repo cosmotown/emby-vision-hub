@@ -760,17 +760,17 @@ class EmbyHttpValidationTests(unittest.TestCase):
         self.assertNotIn("api_key", get.call_args.kwargs["params"])
         self.assertEqual("token", get.call_args.kwargs["headers"]["X-Emby-Token"])
 
-    @mock.patch("handler.emby.emby_client.post")
-    def test_refresh_item_reports_http_failure(self, post):
+    @mock.patch("handler.emby.emby_client.post_once")
+    def test_refresh_item_reports_http_failure(self, post_once):
         response = mock.Mock()
         response.raise_for_status.side_effect = RuntimeError("HTTP 500")
-        post.return_value = response
+        post_once.return_value = response
 
         self.assertFalse(emby.refresh_item_by_id("item-1", "http://emby", "token"))
 
-    @mock.patch("handler.emby.emby_client.post")
-    def test_refresh_item_supports_non_recursive_library_cleanup(self, post):
-        post.return_value.raise_for_status.return_value = None
+    @mock.patch("handler.emby.emby_client.post_once")
+    def test_refresh_item_supports_non_recursive_library_cleanup(self, post_once):
+        post_once.return_value.raise_for_status.return_value = None
 
         self.assertTrue(emby.refresh_item_by_id(
             "library-1",
@@ -779,11 +779,11 @@ class EmbyHttpValidationTests(unittest.TestCase):
             recursive=False,
         ))
 
-        self.assertEqual("false", post.call_args.kwargs["params"]["Recursive"])
+        self.assertEqual("false", post_once.call_args.kwargs["params"]["Recursive"])
 
-    @mock.patch("handler.emby.emby_client.post")
-    def test_exact_path_notifications_are_chunked(self, post):
-        post.return_value.raise_for_status.return_value = None
+    @mock.patch("handler.emby.emby_client.post_once")
+    def test_exact_path_notifications_are_chunked(self, post_once):
+        post_once.return_value.raise_for_status.return_value = None
         paths = [f"/media/tv/show/S01E{index:03d}.strm" for index in range(205)]
 
         self.assertTrue(emby.notify_media_paths_updated(
@@ -792,9 +792,9 @@ class EmbyHttpValidationTests(unittest.TestCase):
             "token",
             chunk_size=100,
         ))
-        self.assertEqual(3, post.call_count)
-        self.assertEqual(100, len(post.call_args_list[0].kwargs["json"]["Updates"]))
-        self.assertEqual(5, len(post.call_args_list[2].kwargs["json"]["Updates"]))
+        self.assertEqual(3, post_once.call_count)
+        self.assertEqual(100, len(post_once.call_args_list[0].kwargs["json"]["Updates"]))
+        self.assertEqual(5, len(post_once.call_args_list[2].kwargs["json"]["Updates"]))
 
     @mock.patch("handler.emby.emby_client.get")
     def test_ingest_queries_keep_api_key_out_of_url_params(self, get):
@@ -890,6 +890,7 @@ class EmbyHttpValidationTests(unittest.TestCase):
 
         self.assertEqual("episode-1", item["Id"])
         self.assertNotIn("api_key", get.call_args.kwargs["params"])
+        self.assertNotIn("MediaSources", get.call_args.kwargs["params"]["Fields"])
         self.assertEqual("true", get.call_args.kwargs["params"]["Recursive"])
         self.assertEqual("token", get.call_args.kwargs["headers"]["X-Emby-Token"])
 
@@ -915,6 +916,24 @@ class EmbyHttpValidationTests(unittest.TestCase):
 
         self.assertEqual("episode-1", item["Id"])
         self.assertNotIn("MediaSources", get.call_args.kwargs["params"]["Fields"])
+
+    @mock.patch("handler.emby.emby_client.post_once")
+    def test_metadata_backfill_refresh_is_minimal_and_non_replayed(self, post_once):
+        response = mock.Mock(status_code=204)
+        response.raise_for_status.return_value = None
+        post_once.return_value = response
+
+        self.assertTrue(
+            emby.refresh_metadata_backfill_item("episode-1", "http://emby", "token")
+        )
+
+        params = post_once.call_args.kwargs["params"]
+        self.assertEqual("false", params["Recursive"])
+        self.assertEqual("false", params["ReplaceAllMetadata"])
+        self.assertEqual("false", params["ReplaceAllImages"])
+        self.assertEqual("ValidationOnly", params["ImageRefreshMode"])
+        self.assertEqual("FullRefresh", params["MetadataRefreshMode"])
+        self.assertEqual({"X-Emby-Token": "token"}, post_once.call_args.kwargs["headers"])
 
 
 if __name__ == "__main__":

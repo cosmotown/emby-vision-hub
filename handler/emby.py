@@ -53,7 +53,11 @@ class EmbyAPIClient:
             total=5,
             backoff_factor=1,
             status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"]
+            # Only replay methods which are both read-only and idempotent in
+            # this client. Emby POST endpoints enqueue work and several DELETE
+            # endpoints are custom plugin actions, so a lost response must not
+            # cause a second mutation.
+            allowed_methods=["HEAD", "GET", "OPTIONS", "TRACE"]
         )
         
         adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
@@ -999,7 +1003,7 @@ def refresh_item_by_id(
     }
     
     try:
-        response = emby_client.post(
+        response = emby_client.post_once(
             refresh_url,
             params=refresh_params,
             headers={"X-Emby-Token": api_key},
@@ -1039,7 +1043,7 @@ def notify_media_paths_updated(
             ]
         }
         try:
-            response = emby_client.post(
+            response = emby_client.post_once(
                 api_url,
                 json=payload,
                 headers={"X-Emby-Token": api_key},
@@ -1055,7 +1059,7 @@ def _query_media_item_by_path(
     file_path: str,
     base_url: str,
     api_key: str,
-    include_media_sources: bool = True,
+    include_media_sources: bool = False,
 ) -> tuple[Optional[bool], Optional[Dict[str, Any]]]:
     """Return exact path match state and item data without exposing the API key."""
     normalized_target = os.path.normcase(os.path.normpath(str(file_path or '')))
@@ -1181,6 +1185,68 @@ def get_catalog_item_by_id(
         return None
     return None
 
+
+_METADATA_BACKFILL_FIELDS = (
+    "Id,Name,Type,Path,ParentId,SeriesId,ProviderIds,LockData,LockedFields,"
+    "OriginalTitle,Overview,PremiereDate,ProductionYear,CommunityRating,"
+    "OfficialRating,Genres,Studios,Taglines,IndexNumber,ParentIndexNumber,"
+    "ChildCount,RecursiveItemCount"
+)
+
+
+def get_metadata_backfill_item(
+    item_id: str,
+    base_url: str,
+    api_key: str,
+    user_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Read only the catalog fields needed by selective metadata backfill."""
+    return get_emby_item_details(
+        str(item_id or "").strip(),
+        base_url,
+        api_key,
+        user_id,
+        fields=_METADATA_BACKFILL_FIELDS,
+        silent_404=True,
+    )
+
+
+def refresh_metadata_backfill_item(
+    item_id: str,
+    base_url: str,
+    api_key: str,
+) -> bool:
+    """Submit one Shenyi-provider refresh without recursion or unlocking.
+
+    Emby 4.9.5 does not invoke remote metadata providers for ``Default`` mode.
+    ``FullRefresh`` here is deliberately limited to one item, preserves all
+    metadata/image values and locks, and never enters EVH's full-update chain.
+    """
+    normalized_id = str(item_id or "").strip()
+    if not normalized_id or not base_url or not api_key:
+        return False
+    try:
+        response = emby_client.post_once(
+            f"{base_url.rstrip('/')}/Items/{normalized_id}/Refresh",
+            params={
+                "Recursive": "false",
+                "MetadataRefreshMode": "FullRefresh",
+                "ImageRefreshMode": "ValidationOnly",
+                "ReplaceAllMetadata": "false",
+                "ReplaceAllImages": "false",
+            },
+            headers={"X-Emby-Token": api_key},
+        )
+        response.raise_for_status()
+        return response.status_code in (200, 204)
+    except Exception as exc:
+        logger.warning(
+            "神医元数据补齐的最小刷新失败 (ItemID: %s, %s)",
+            normalized_id,
+            type(exc).__name__,
+        )
+        return False
+
 # --- 最近锚点强制刷新版 ---
 def refresh_library_by_path(file_path: str, base_url: str, api_key: str) -> bool:
     """
@@ -1215,7 +1281,7 @@ def refresh_library_by_path(file_path: str, base_url: str, api_key: str) -> bool
         api_url = f"{base_url.rstrip('/')}/Library/Media/Updated"
         payload = {"Updates": [{"Path": file_path, "UpdateType": "Modified"}]}
         try:
-            response = emby_client.post(
+            response = emby_client.post_once(
                 api_url,
                 json=payload,
                 headers={"X-Emby-Token": api_key},
@@ -2179,7 +2245,7 @@ def delete_item_sy(item_id: str, emby_server_url: str, emby_api_key: str, user_i
     }
     
     try:
-        response = emby_client.post(api_url, headers=headers, params=params)
+        response = emby_client.post_once(api_url, headers=headers, params=params)
         response.raise_for_status()
         logger.info(f"  ✅ [神医接口] 成功删除 Emby 媒体项 ID: {item_id}。")
         return True
@@ -2222,7 +2288,7 @@ def delete_item(item_id: str, emby_server_url: str, emby_api_key: str, user_id: 
     }
     
     try:
-        response = emby_client.post(api_url, headers=headers, params=params)
+        response = emby_client.post_once(api_url, headers=headers, params=params)
         response.raise_for_status()
         logger.info(f"  ✅ 成功删除 Emby 媒体项 ID: {item_id}。")
         return True
@@ -2665,7 +2731,7 @@ def delete_person_custom_api(base_url: str, api_key: str, person_id: str) -> boo
     
     try:
         # 这个接口是 POST 请求
-        response = emby_client.post(api_url, headers=headers, params=params)
+        response = emby_client.post_once(api_url, headers=headers, params=params)
         response.raise_for_status()
         logger.info(f"  ✅ 成功删除演员 ID: {person_id}。")
         return True
@@ -2674,10 +2740,18 @@ def delete_person_custom_api(base_url: str, api_key: str, person_id: str) -> boo
         if e.response.status_code == 404:
             logger.error(f"删除演员 {person_id} 失败：需神医Pro版本才支持此功能。")
         else:
-            logger.error(f"使用临时令牌删除演员 {person_id} 时发生HTTP错误: {e.response.status_code} - {e.response.text}")
+            logger.error(
+                "使用临时令牌删除演员 %s 时发生 HTTP 错误: %s",
+                person_id,
+                e.response.status_code,
+            )
         return False
     except Exception as e:
-        logger.error(f"使用临时令牌删除演员 {person_id} 时发生未知错误: {e}")
+        logger.error(
+            "使用临时令牌删除演员 %s 时发生未知错误: %s",
+            person_id,
+            type(e).__name__,
+        )
         return False
 
 # --- 获取所有 Emby 用户列表 ---

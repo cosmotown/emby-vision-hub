@@ -8,6 +8,128 @@ from .connection import get_db_connection
 
 logger = logging.getLogger(__name__)
 
+_SELECTIVE_FILL_COLUMNS = {
+    'title': 'text',
+    'original_title': 'text',
+    'original_language': 'text',
+    'overview': 'text',
+    'release_date': 'date',
+    'release_year': 'number',
+    'rating': 'number',
+    'official_rating_json': 'json',
+    'genres_json': 'json',
+    'production_companies_json': 'json',
+    'networks_json': 'json',
+    'countries_json': 'json',
+    'total_episodes': 'number',
+}
+
+
+def _selective_value_missing(value: Any, value_kind: str) -> bool:
+    if value is None:
+        return True
+    if value_kind == 'text':
+        return not str(value).strip()
+    if value_kind == 'number':
+        return (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or value <= 0
+        )
+    if value_kind == 'date':
+        text = str(value or '').strip()
+        return (
+            len(text) < 10
+            or text[:10] in {'0000-00-00', '0001-01-01', '1900-01-01'}
+        )
+    if value_kind == 'json':
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                return not value.strip()
+        return value in ({}, [], None)
+    return False
+
+
+def selectively_fill_media_metadata(
+    tmdb_id: str,
+    item_type: str,
+    candidates: Dict[str, Any],
+) -> List[str]:
+    """Insert a skeleton row and fill only currently-empty allowlisted columns."""
+    normalized_tmdb_id = str(tmdb_id or '').strip()
+    normalized_type = str(item_type or '').strip()
+    if (
+        not normalized_tmdb_id.isdigit()
+        or int(normalized_tmdb_id) <= 0
+        or normalized_type not in {'Movie', 'Series', 'Season', 'Episode'}
+    ):
+        raise ValueError('invalid media identity')
+
+    safe_candidates = {
+        key: value
+        for key, value in (candidates or {}).items()
+        if key in _SELECTIVE_FILL_COLUMNS
+        and not _selective_value_missing(value, _SELECTIVE_FILL_COLUMNS[key])
+    }
+    if not safe_candidates:
+        return []
+
+    updated = []
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO media_metadata (tmdb_id, item_type)
+                    VALUES (%s, %s)
+                    ON CONFLICT (tmdb_id, item_type) DO NOTHING
+                    """,
+                    (normalized_tmdb_id, normalized_type),
+                )
+                for column, value in safe_candidates.items():
+                    value_kind = _SELECTIVE_FILL_COLUMNS[column]
+                    if value_kind == 'json':
+                        predicate = (
+                            f"({column} IS NULL OR {column} = 'null'::jsonb OR "
+                            f"{column} = '[]'::jsonb OR {column} = '{{}}'::jsonb)"
+                        )
+                        assignment = f"{column} = %s::jsonb"
+                        parameter = json.dumps(value, ensure_ascii=False)
+                    elif value_kind == 'text':
+                        predicate = f"({column} IS NULL OR BTRIM({column}) = '')"
+                        assignment = f"{column} = %s"
+                        parameter = value
+                    elif value_kind == 'number':
+                        predicate = f"({column} IS NULL OR {column} <= 0)"
+                        assignment = f"{column} = %s"
+                        parameter = value
+                    else:
+                        predicate = f"{column} IS NULL"
+                        assignment = f"{column} = %s"
+                        parameter = value
+
+                    cursor.execute(
+                        f"""
+                        UPDATE media_metadata
+                        SET {assignment}, last_updated_at = NOW()
+                        WHERE tmdb_id = %s AND item_type = %s
+                          AND {predicate}
+                        """,
+                        (parameter, normalized_tmdb_id, normalized_type),
+                    )
+                    if cursor.rowcount:
+                        updated.append(column)
+        return updated
+    except Exception:
+        logger.exception(
+            "选择性补齐媒体数据库失败 (TMDb=%s, Type=%s)",
+            normalized_tmdb_id,
+            normalized_type,
+        )
+        raise
+
 # 获取媒体库中 TMDb ID 对应的 Emby ID 映射
 def check_tmdb_ids_in_library(tmdb_ids: List[str], item_type: str) -> Dict[str, str]:
     """

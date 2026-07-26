@@ -178,7 +178,12 @@ class EmbyIngestTests(unittest.TestCase):
         )
 
         self.assertTrue(result)
-        refresh_item.assert_not_called()
+        refresh_item.assert_called_once_with(
+            "library-root",
+            "http://emby",
+            "token",
+            recursive=False,
+        )
 
     @mock.patch("services.emby_ingest.emby.refresh_item_by_id", return_value=True)
     @mock.patch("services.emby_ingest.emby.find_nearest_library_anchor_details")

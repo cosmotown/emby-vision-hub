@@ -16,6 +16,7 @@ import handler.emby as emby
 import utils
 from database import strm_ingest_db
 from services.emby_ingest import (
+    check_indexed_paths,
     collect_strm_inventory,
     delete_and_verify_paths,
     reconcile_paths,
@@ -49,6 +50,9 @@ ADAPTIVE_BULK_QUIET_SECONDS = 60
 ADAPTIVE_BULK_MAX_HOLD_SECONDS = 600
 ADAPTIVE_BULK_VERIFY_DELAY_SECONDS = 30
 ADAPTIVE_BATCH_POLL_SECONDS = 2
+TERMINAL_RECHECK_INITIAL_DELAY_SECONDS = 300
+TERMINAL_RECHECK_INTERVAL_SECONDS = 3600
+TERMINAL_RECHECK_BATCH_SIZE = 200
 
 _ADAPTIVE_REFRESH_LOCK = threading.Lock()
 _ADAPTIVE_REFRESH_STATES = {}
@@ -588,6 +592,9 @@ class MonitorService:
         self._reconcile_stop = threading.Event()
         self._reconcile_thread = None
         self._retry_thread = None
+        self._next_terminal_recheck_at = (
+            time.monotonic() + TERMINAL_RECHECK_INITIAL_DELAY_SECONDS
+        )
         lookback_days = max(0, int(self.config.get(
             constants.CONFIG_OPTION_MONITOR_SCAN_LOOKBACK_DAYS,
             constants.DEFAULT_MONITOR_SCAN_LOOKBACK_DAYS,
@@ -707,8 +714,94 @@ class MonitorService:
             if self._reconcile_stop.wait(self.full_scan_interval_hours * 3600):
                 return
 
+
+    def _retry_existing_ingest_paths(self, existing_paths: List[str]) -> None:
+        """Check first; only notify Emby for paths that are still unresolved."""
+        if not existing_paths:
+            return
+        base_url = self.config.get(constants.CONFIG_OPTION_EMBY_SERVER_URL)
+        api_key = self.config.get(constants.CONFIG_OPTION_EMBY_API_KEY)
+        indexed, missing, query_failed = check_indexed_paths(
+            existing_paths,
+            base_url,
+            api_key,
+        )
+
+        preconfirmed = sorted(indexed)
+        if preconfirmed:
+            strm_ingest_db.mark_completed(preconfirmed)
+            self.processor.enqueue_confirmed_ingest_postprocessing(preconfirmed)
+            logger.info(
+                f"  ✅ STRM 重试前核对：{len(preconfirmed)} 个路径已在 Emby 中，"
+                "直接完成，不再发送刷新请求。"
+            )
+
+        refresh_paths = sorted(set(missing) | set(query_failed))
+        if not refresh_paths:
+            return
+        result = refresh_and_verify_paths(
+            refresh_paths,
+            base_url,
+            api_key,
+        )
+        confirmed_paths = result.get('confirmed_paths') or []
+        unresolved_paths = sorted(
+            set(result.get('pending') or [])
+            | set(result.get('query_failed') or [])
+        )
+        if confirmed_paths:
+            strm_ingest_db.mark_completed(confirmed_paths)
+            self.processor.enqueue_confirmed_ingest_postprocessing(confirmed_paths)
+        retry_result = strm_ingest_db.mark_failed_attempts(
+            unresolved_paths,
+            'Emby 在有限重试后仍未确认入库',
+        )
+        if retry_result.get('failed'):
+            logger.warning(
+                f"  🚨 {retry_result['failed']} 个 STRM 达到重试上限，"
+                "已停止自动刷新，请在 STRM 入库诊断中人工处理。"
+            )
+
+    def _recheck_terminal_ingest_paths(
+        self,
+        limit: int = TERMINAL_RECHECK_BATCH_SIZE,
+    ) -> int:
+        """Read-only recheck terminal failures and complete paths now in Emby."""
+        paths = strm_ingest_db.list_failed_ingest_paths(limit=limit)
+        existing_paths = [path for path in paths if os.path.isfile(path)]
+        if not existing_paths:
+            return 0
+        indexed, _, query_failed = check_indexed_paths(
+            existing_paths,
+            self.config.get(constants.CONFIG_OPTION_EMBY_SERVER_URL),
+            self.config.get(constants.CONFIG_OPTION_EMBY_API_KEY),
+        )
+        confirmed_paths = sorted(indexed)
+        if confirmed_paths:
+            strm_ingest_db.mark_completed(confirmed_paths)
+            self.processor.enqueue_confirmed_ingest_postprocessing(confirmed_paths)
+        logger.info(
+            f"  🩺 STRM 终态自愈核对：检查 {len(existing_paths)}，"
+            f"已自动完成 {len(confirmed_paths)}，查询异常 {len(query_failed)}；"
+            "未收录路径保持人工处理状态，不重新发送刷新。"
+        )
+        return len(confirmed_paths)
+
     def _run_retry_loop(self):
         while not self._reconcile_stop.is_set():
+            if time.monotonic() >= self._next_terminal_recheck_at:
+                try:
+                    self._recheck_terminal_ingest_paths()
+                except Exception as exc:
+                    logger.error(
+                        f"  ❌ STRM 终态自愈核对失败，将在下一周期重试: {exc}",
+                        exc_info=True,
+                    )
+                finally:
+                    self._next_terminal_recheck_at = (
+                        time.monotonic() + TERMINAL_RECHECK_INTERVAL_SECONDS
+                    )
+
             events = []
             try:
                 events = strm_ingest_db.claim_due_paths(limit=20)
@@ -732,27 +825,7 @@ class MonitorService:
                     )
 
                 if existing_paths:
-                    result = refresh_and_verify_paths(
-                        existing_paths,
-                        self.config.get(constants.CONFIG_OPTION_EMBY_SERVER_URL),
-                        self.config.get(constants.CONFIG_OPTION_EMBY_API_KEY),
-                    )
-                    confirmed_paths = result.get('confirmed_paths') or []
-                    unresolved_paths = sorted(
-                        set(result.get('pending') or [])
-                        | set(result.get('query_failed') or [])
-                    )
-                    strm_ingest_db.mark_completed(confirmed_paths)
-                    self.processor.enqueue_confirmed_ingest_postprocessing(confirmed_paths)
-                    retry_result = strm_ingest_db.mark_failed_attempts(
-                        unresolved_paths,
-                        'Emby 在有限重试后仍未确认入库',
-                    )
-                    if retry_result.get('failed'):
-                        logger.warning(
-                            f"  🚨 {retry_result['failed']} 个 STRM 达到重试上限，"
-                            "已停止自动刷新，请在 STRM 入库诊断中人工处理。"
-                        )
+                    self._retry_existing_ingest_paths(existing_paths)
 
                 if delete_events:
                     delete_paths = [event['file_path'] for event in delete_events]

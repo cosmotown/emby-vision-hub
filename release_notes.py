@@ -2,6 +2,22 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.10",
+        "published_at": "2026-07-26T17:30:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.10",
+        "changelog": """## STRM 首次发现与失败记录自愈
+
+- 全新目录化作品尚未在 Emby 建立 Series/Season 锚点时，只对唯一匹配的物理媒体库执行一次 `Recursive=false` 浅层刷新，使 Emby 能发现新作品。
+- 物理媒体库浅层刷新具有进程内并发去重和 10 分钟冷却；不会递归扫描媒体库内容，也不会刷新不相关媒体库。
+- 平铺在电影库根目录的 STRM 继续保持单文件精确通知，不触发媒体库浅层刷新。
+- 有限重试改为先查询 Emby；已经收录的路径直接标记完成，只有仍缺失或查询异常的路径才重新发送通知。
+- 每小时只读核对最多 200 条历史 `failed` 入库记录；Emby 已收录的自动恢复为完成，未收录的保持人工处理且不会无限复活。
+- 不修改数据库结构、刮削逻辑、人物功能、MoviePilot 同步或删除安全边界。
+
+""",
+    },
+
+    {
         "version": "v7.2.9",
         "published_at": "2026-07-26T13:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.9",

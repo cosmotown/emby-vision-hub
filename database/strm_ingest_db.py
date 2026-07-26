@@ -374,6 +374,24 @@ def mark_failed_attempts(file_paths: Iterable[str], error: str) -> Dict[str, int
     return result
 
 
+
+def list_failed_ingest_paths(limit: int = 200) -> List[str]:
+    """Return terminal ingest failures for read-only Emby self-healing checks."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT file_path
+                FROM strm_ingest_retry_queue
+                WHERE operation = 'ingest'
+                  AND status = 'failed'
+                ORDER BY updated_at ASC, id ASC
+                LIMIT %s
+                """,
+                (max(1, min(int(limit), 1000)),),
+            )
+            return [row['file_path'] for row in cursor.fetchall()]
+
 def list_recent(limit: int = 100) -> List[Dict]:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:

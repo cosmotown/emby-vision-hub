@@ -13,10 +13,14 @@ logger = logging.getLogger(__name__)
 INGEST_REFRESH_LOCK = threading.Lock()
 DEFAULT_VERIFY_DELAYS = (8, 20, 45)
 ANCHOR_REFRESH_COOLDOWN_SECONDS = 300
+LIBRARY_SHALLOW_REFRESH_COOLDOWN_SECONDS = 600
 
 _ANCHOR_REFRESH_STATE_LOCK = threading.Lock()
 _ANCHOR_REFRESH_INFLIGHT: Set[Tuple[str, str]] = set()
 _ANCHOR_REFRESHED_AT: Dict[Tuple[str, str], float] = {}
+_LIBRARY_SHALLOW_REFRESH_STATE_LOCK = threading.Lock()
+_LIBRARY_SHALLOW_REFRESH_INFLIGHT: Set[Tuple[str, str]] = set()
+_LIBRARY_SHALLOW_REFRESHED_AT: Dict[Tuple[str, str], float] = {}
 
 
 def _claim_anchor_refresh(base_url: str, anchor_id: str) -> Optional[Tuple[str, str]]:
@@ -52,11 +56,51 @@ def _finish_anchor_refresh(key: Tuple[str, str], succeeded: bool) -> None:
             _ANCHOR_REFRESHED_AT.pop(cached_key, None)
 
 
+
+def _claim_library_shallow_refresh(base_url: str, library_id: str) -> Optional[Tuple[str, str]]:
+    """Reserve one non-recursive physical-library refresh with cooldown."""
+    key = (str(base_url or '').rstrip('/'), str(library_id or '').strip())
+    if not key[1]:
+        return None
+
+    now = time.monotonic()
+    with _LIBRARY_SHALLOW_REFRESH_STATE_LOCK:
+        last_refresh = _LIBRARY_SHALLOW_REFRESHED_AT.get(key)
+        if key in _LIBRARY_SHALLOW_REFRESH_INFLIGHT:
+            return None
+        if (
+            last_refresh is not None
+            and now - last_refresh < LIBRARY_SHALLOW_REFRESH_COOLDOWN_SECONDS
+        ):
+            return None
+        _LIBRARY_SHALLOW_REFRESH_INFLIGHT.add(key)
+    return key
+
+
+def _finish_library_shallow_refresh(key: Tuple[str, str], succeeded: bool) -> None:
+    with _LIBRARY_SHALLOW_REFRESH_STATE_LOCK:
+        _LIBRARY_SHALLOW_REFRESH_INFLIGHT.discard(key)
+        if succeeded:
+            _LIBRARY_SHALLOW_REFRESHED_AT[key] = time.monotonic()
+
+        expiry = time.monotonic() - (LIBRARY_SHALLOW_REFRESH_COOLDOWN_SECONDS * 2)
+        stale_keys = [
+            cached_key
+            for cached_key, refreshed_at in _LIBRARY_SHALLOW_REFRESHED_AT.items()
+            if refreshed_at < expiry
+            and cached_key not in _LIBRARY_SHALLOW_REFRESH_INFLIGHT
+        ]
+        for cached_key in stale_keys:
+            _LIBRARY_SHALLOW_REFRESHED_AT.pop(cached_key, None)
+
 def _reset_ingest_refresh_state() -> None:
     """Clear process-local refresh deduplication state for tests and clean restarts."""
     with _ANCHOR_REFRESH_STATE_LOCK:
         _ANCHOR_REFRESH_INFLIGHT.clear()
         _ANCHOR_REFRESHED_AT.clear()
+    with _LIBRARY_SHALLOW_REFRESH_STATE_LOCK:
+        _LIBRARY_SHALLOW_REFRESH_INFLIGHT.clear()
+        _LIBRARY_SHALLOW_REFRESHED_AT.clear()
 
 
 def normalize_paths(file_paths: Iterable[str], require_existing: bool = True) -> List[str]:
@@ -486,6 +530,47 @@ def delete_and_verify_paths(
     return result
 
 
+
+def _match_unique_physical_library(
+    path: str,
+    libraries: Sequence[Dict[str, object]],
+) -> Optional[Tuple[str, str, str]]:
+    """Return the longest unique physical library match for one path."""
+    normalized_path = os.path.normcase(os.path.normpath(str(path or '').strip()))
+    if not normalized_path:
+        return None
+
+    candidates: List[Tuple[int, str, str, str]] = []
+    for library in libraries:
+        info = library.get('info') or {}
+        library_id = str(info.get('Id') or '').strip()
+        library_name = str(info.get('Name') or library_id).strip()
+        if not library_id:
+            continue
+        for root_path in library.get('paths') or []:
+            root = os.path.normpath(str(root_path or '').strip())
+            if not root:
+                continue
+            normalized_root = os.path.normcase(root)
+            try:
+                inside_root = os.path.commonpath(
+                    [normalized_path, normalized_root]
+                ) == normalized_root
+            except ValueError:
+                inside_root = False
+            if inside_root:
+                candidates.append((len(normalized_root), library_id, library_name, root))
+
+    if not candidates:
+        return None
+    longest = max(candidate[0] for candidate in candidates)
+    best = [candidate for candidate in candidates if candidate[0] == longest]
+    unique_ids = {candidate[1] for candidate in best}
+    if len(unique_ids) != 1:
+        return None
+    _, library_id, library_name, root = best[0]
+    return library_id, library_name, root
+
 def _refresh_parent_targets(
     file_paths: Iterable[str],
     base_url: str,
@@ -510,7 +595,9 @@ def _refresh_parent_targets(
             "不执行任何递归刷新。"
         )
         return True
+
     anchors: Dict[str, str] = {}
+    shallow_libraries: Dict[str, str] = {}
     for parent_dir in parent_dirs:
         anchor = emby.find_nearest_library_anchor_details(
             parent_dir,
@@ -534,11 +621,28 @@ def _refresh_parent_targets(
             and normalized_anchor_path not in library_root_paths
         ):
             anchors[str(anchor_id)] = anchor_name or str(anchor_id)
-        else:
-            logger.info(
-                f"  ➜ '{parent_dir}' 尚无安全的剧集/季锚点，仅发送精确路径通知，"
-                "不会递归刷新整个媒体库。"
-            )
+            continue
+
+        matched_library = _match_unique_physical_library(parent_dir, libraries)
+        if matched_library:
+            library_id, library_name, root_path = matched_library
+            normalized_parent = os.path.normcase(os.path.normpath(parent_dir))
+            normalized_root = os.path.normcase(os.path.normpath(root_path))
+            # Flat files directly below a library root remain exact-file only.
+            # Directory-based works may use one safe non-recursive root refresh
+            # so Emby can create the initial Series/Movie item and future anchors.
+            if normalized_parent != normalized_root:
+                shallow_libraries[library_id] = library_name or library_id
+                logger.info(
+                    f"  ➜ '{parent_dir}' 尚无安全的剧集/季锚点，"
+                    f"将对唯一匹配媒体库 '{library_name or library_id}' 执行一次浅层发现。"
+                )
+                continue
+
+        logger.info(
+            f"  ➜ '{parent_dir}' 尚无安全的剧集/季锚点，仅发送精确路径通知，"
+            "不会递归刷新整个媒体库。"
+        )
 
     success = True
     for anchor_id, anchor_name in anchors.items():
@@ -562,8 +666,32 @@ def _refresh_parent_targets(
             _finish_anchor_refresh(refresh_key, refreshed)
         if not refreshed:
             success = False
-    return success
 
+    for library_id, library_name in shallow_libraries.items():
+        refresh_key = _claim_library_shallow_refresh(base_url, library_id)
+        if refresh_key is None:
+            logger.info(
+                f"  ➜ 物理媒体库近期已浅层刷新或正在刷新，跳过重复请求: "
+                f"'{library_name}' ({library_id})"
+            )
+            continue
+        logger.info(
+            f"  ➜ 新作品尚无 Emby 锚点，浅层刷新物理媒体库: "
+            f"'{library_name}' ({library_id})；Recursive=false。"
+        )
+        refreshed = False
+        try:
+            refreshed = emby.refresh_item_by_id(
+                library_id,
+                base_url,
+                api_key,
+                recursive=False,
+            )
+        finally:
+            _finish_library_shallow_refresh(refresh_key, refreshed)
+        if not refreshed:
+            success = False
+    return success
 
 def refresh_and_verify_paths(
     file_paths: Iterable[str],

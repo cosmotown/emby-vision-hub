@@ -39,6 +39,211 @@ DELETE_DEBOUNCE_TIMER = None
 
 DEBOUNCE_DELAY = 3 # 防抖延迟秒数
 
+# --- STRM 自适应批处理 -------------------------------------------------------
+# 小批量保持原有 3 秒防抖后的快速处理；同一作品在短时间持续到达时，自动切换
+# 为大批量静默聚合，等待写入安静或达到最长等待后再统一通知 Emby。
+ADAPTIVE_BURST_WINDOW_SECONDS = 75
+ADAPTIVE_BULK_THRESHOLD = 4
+ADAPTIVE_BULK_PATH_THRESHOLD = 25
+ADAPTIVE_BULK_QUIET_SECONDS = 60
+ADAPTIVE_BULK_MAX_HOLD_SECONDS = 600
+ADAPTIVE_BULK_VERIFY_DELAY_SECONDS = 30
+ADAPTIVE_BATCH_POLL_SECONDS = 2
+
+_ADAPTIVE_REFRESH_LOCK = threading.Lock()
+_ADAPTIVE_REFRESH_STATES = {}
+_ADAPTIVE_REFRESH_WORKER = None
+_SEASON_DIRECTORY_RE = re.compile(
+    r"^(?:season[\s._-]*\d+|specials?|第\s*\d+\s*季)$",
+    re.IGNORECASE,
+)
+
+
+def _adaptive_work_key(file_path: str, exclude_paths: List[str] = None) -> str:
+    """Return a stable per-title key without ever widening to a library root."""
+    path = os.path.normpath(str(file_path or '').strip())
+    parent = os.path.dirname(path)
+    if _SEASON_DIRECTORY_RE.match(os.path.basename(parent)):
+        work_dir = os.path.dirname(parent)
+    else:
+        work_dir = parent
+
+    normalized_excludes = {
+        os.path.normcase(os.path.normpath(str(value)))
+        for value in (exclude_paths or [])
+        if str(value or '').strip()
+    }
+    if os.path.normcase(os.path.normpath(work_dir)) in normalized_excludes:
+        # Flat files directly below an excluded/library root must remain isolated.
+        return path
+    return work_dir or path
+
+
+def _reset_adaptive_refresh_state():
+    """Clear process-local adaptive batching state (used by tests/restarts)."""
+    global _ADAPTIVE_REFRESH_WORKER
+    with _ADAPTIVE_REFRESH_LOCK:
+        _ADAPTIVE_REFRESH_STATES.clear()
+        _ADAPTIVE_REFRESH_WORKER = None
+
+
+def _register_adaptive_refresh_paths(
+    processor,
+    file_paths: List[str],
+    exclude_paths: List[str] = None,
+    now: float = None,
+):
+    """Register one debounced arrival and return paths that should run fast now."""
+    current = time.monotonic() if now is None else float(now)
+    grouped = {}
+    for raw_path in file_paths or []:
+        path = os.path.normpath(str(raw_path or '').strip())
+        if not path:
+            continue
+        key = _adaptive_work_key(path, exclude_paths)
+        grouped.setdefault(key, set()).add(path)
+
+    immediate_paths = []
+    activated_keys = []
+    with _ADAPTIVE_REFRESH_LOCK:
+        for key, paths in grouped.items():
+            state = _ADAPTIVE_REFRESH_STATES.setdefault(key, {
+                'processor': processor,
+                'arrivals': [],
+                'pending': set(),
+                'bulk': False,
+                'first_pending_at': None,
+                'last_seen': current,
+            })
+            state['processor'] = processor
+            arrivals = [
+                stamp for stamp in state.get('arrivals', [])
+                if current - stamp <= ADAPTIVE_BURST_WINDOW_SECONDS
+            ]
+            arrivals.append(current)
+            state['arrivals'] = arrivals
+            state['last_seen'] = current
+
+            should_bulk = (
+                state.get('bulk', False)
+                or len(arrivals) >= ADAPTIVE_BULK_THRESHOLD
+                or len(paths) >= ADAPTIVE_BULK_PATH_THRESHOLD
+            )
+            if should_bulk:
+                if not state.get('bulk', False):
+                    state['bulk'] = True
+                    activated_keys.append(key)
+                state['pending'].update(paths)
+                if state.get('first_pending_at') is None:
+                    state['first_pending_at'] = current
+            else:
+                immediate_paths.extend(paths)
+
+    return sorted(set(immediate_paths)), sorted(activated_keys)
+
+
+def _pop_due_adaptive_refresh_batches(now: float = None):
+    """Return quiet/max-hold bulk batches and prune expired fast-mode history."""
+    current = time.monotonic() if now is None else float(now)
+    due_batches = []
+    with _ADAPTIVE_REFRESH_LOCK:
+        for key, state in list(_ADAPTIVE_REFRESH_STATES.items()):
+            last_seen_value = state.get('last_seen')
+            last_seen = current if last_seen_value is None else float(last_seen_value)
+            pending = set(state.get('pending') or set())
+            if not state.get('bulk', False):
+                if current - last_seen > ADAPTIVE_BURST_WINDOW_SECONDS:
+                    _ADAPTIVE_REFRESH_STATES.pop(key, None)
+                continue
+
+            quiet_due = current - last_seen >= ADAPTIVE_BULK_QUIET_SECONDS
+            first_pending_at = state.get('first_pending_at')
+            max_due = (
+                first_pending_at is not None
+                and current - float(first_pending_at) >= ADAPTIVE_BULK_MAX_HOLD_SECONDS
+            )
+
+            if pending and (quiet_due or max_due):
+                due_batches.append({
+                    'key': key,
+                    'processor': state.get('processor'),
+                    'paths': sorted(pending),
+                    'reason': 'quiet' if quiet_due else 'max_hold',
+                })
+                state['pending'].clear()
+                state['first_pending_at'] = None
+
+            if quiet_due and not state.get('pending'):
+                _ADAPTIVE_REFRESH_STATES.pop(key, None)
+
+    return due_batches
+
+
+def _adaptive_refresh_worker_loop():
+    global _ADAPTIVE_REFRESH_WORKER
+    while True:
+        time.sleep(ADAPTIVE_BATCH_POLL_SECONDS)
+        due_batches = _pop_due_adaptive_refresh_batches()
+        for batch in due_batches:
+            reason = '连续无新文件' if batch['reason'] == 'quiet' else '达到最长聚合时间'
+            logger.info(
+                f"  📦 [自适应入库] {reason}，统一处理作品 "
+                f"'{os.path.basename(batch['key'])}' 的 {len(batch['paths'])} 个文件。"
+            )
+            threading.Thread(
+                target=_handle_batch_refresh_only_task,
+                args=(batch['processor'], batch['paths']),
+                kwargs={'bulk_mode': True},
+                daemon=True,
+            ).start()
+
+        with _ADAPTIVE_REFRESH_LOCK:
+            if not _ADAPTIVE_REFRESH_STATES:
+                _ADAPTIVE_REFRESH_WORKER = None
+                return
+
+
+def _ensure_adaptive_refresh_worker():
+    global _ADAPTIVE_REFRESH_WORKER
+    with _ADAPTIVE_REFRESH_LOCK:
+        if _ADAPTIVE_REFRESH_WORKER and _ADAPTIVE_REFRESH_WORKER.is_alive():
+            return
+        _ADAPTIVE_REFRESH_WORKER = threading.Thread(
+            target=_adaptive_refresh_worker_loop,
+            name='adaptive-strm-ingest',
+            daemon=True,
+        )
+        _ADAPTIVE_REFRESH_WORKER.start()
+
+
+def _enqueue_adaptive_refresh_only(
+    processor,
+    file_paths: List[str],
+    exclude_paths: List[str] = None,
+):
+    immediate_paths, activated_keys = _register_adaptive_refresh_paths(
+        processor,
+        file_paths,
+        exclude_paths=exclude_paths,
+    )
+    for key in activated_keys:
+        logger.info(
+            f"  📦 [自适应入库] 检测到作品 '{os.path.basename(key)}' 持续写入，"
+            f"切换为大批量静默聚合；安静 {ADAPTIVE_BULK_QUIET_SECONDS} 秒或 "
+            f"最多 {ADAPTIVE_BULK_MAX_HOLD_SECONDS // 60} 分钟后统一处理。"
+        )
+
+    if immediate_paths:
+        threading.Thread(
+            target=_handle_batch_refresh_only_task,
+            args=(processor, immediate_paths),
+            kwargs={'bulk_mode': False},
+            daemon=True,
+        ).start()
+
+    _ensure_adaptive_refresh_worker()
+
+
 class MediaFileHandler(FileSystemEventHandler):
     """
     文件系统事件处理器
@@ -214,10 +419,14 @@ def process_batch_queue():
 
         threading.Thread(target=_handle_batch_file_task, args=(processor, files_to_scrape)).start()
 
-    # 2. 仅刷新流程
+    # 2. 仅刷新流程：小批量立即处理，持续大批量按作品静默聚合。
     if files_to_refresh_only:
-        logger.info(f"  🚀 [实时监控] 发现 {len(files_to_refresh_only)} 个文件命中排除路径，将跳过刮削直接刷新 Emby。")
-        threading.Thread(target=_handle_batch_refresh_only_task, args=(processor, files_to_refresh_only)).start()
+        logger.info(f"  🚀 [实时监控] 发现 {len(files_to_refresh_only)} 个文件命中排除路径，将跳过刮削并进入自适应 Emby 入库。")
+        _enqueue_adaptive_refresh_only(
+            processor,
+            files_to_refresh_only,
+            exclude_paths=exclude_paths,
+        )
 
 def process_delete_batch_queue():
     """
@@ -268,26 +477,44 @@ def _handle_batch_file_task(processor, file_paths: List[str]):
     if not valid_files: return
     processor.process_file_actively_batch(valid_files)
 
-def _handle_batch_refresh_only_task(processor, file_paths: List[str]):
-    """批量处理仅刷新任务 (新增/修改)"""
+def _handle_batch_refresh_only_task(
+    processor,
+    file_paths: List[str],
+    bulk_mode: bool = False,
+):
+    """批量处理仅刷新任务；大批量只做一次延迟确认，后续交给有限重试。"""
     valid_files, skipped_files = wait_for_paths_stable(file_paths)
     if skipped_files:
         logger.warning(f"  ⚠️ [实时监控] {len(skipped_files)} 个文件未在时限内稳定，交给自动查漏重试。")
-    if not valid_files: return
+    if not valid_files:
+        return
 
     config = config_manager.APP_CONFIG
+    refresh_kwargs = {}
+    if bulk_mode:
+        refresh_kwargs['verify_delays'] = (ADAPTIVE_BULK_VERIFY_DELAY_SECONDS,)
+        logger.info(
+            f"  📦 [自适应入库] 大批量模式一次通知 {len(valid_files)} 个文件，"
+            f"{ADAPTIVE_BULK_VERIFY_DELAY_SECONDS} 秒后统一确认；未完成项交给有限重试。"
+        )
+
     result = refresh_and_verify_paths(
         valid_files,
         config.get(constants.CONFIG_OPTION_EMBY_SERVER_URL),
         config.get(constants.CONFIG_OPTION_EMBY_API_KEY),
         initial_delay_seconds=config.get(constants.CONFIG_OPTION_MONITOR_EXCLUDE_REFRESH_DELAY, 0),
+        **refresh_kwargs,
     )
     pending = result.get('pending') or []
     if pending:
         queue_result = strm_ingest_db.enqueue_paths(
             pending,
-            source='realtime',
-            last_error='Emby 在首次精确通知后仍未确认入库',
+            source='realtime_bulk' if bulk_mode else 'realtime',
+            last_error=(
+                'Emby 在大批量聚合通知后仍未确认入库'
+                if bulk_mode
+                else 'Emby 在首次精确通知后仍未确认入库'
+            ),
         )
         logger.warning(
             f"  ⚠️ [实时监控] {len(pending)}/{result.get('requested', 0)} 个文件尚未被 Emby 收录，"

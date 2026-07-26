@@ -2,6 +2,22 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.9",
+        "published_at": "2026-07-26T13:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.9",
+        "changelog": """## STRM 自适应批量入库优化
+
+- 小批量 STRM 继续沿用 3 秒防抖后的快速精确通知与确认。
+- 同一作品在 75 秒窗口内持续到达 4 批，或单批达到 25 个文件时，自动切换为大批量模式。
+- 大批量按作品静默聚合，连续 60 秒无新文件或达到 10 分钟上限后统一处理。
+- 大批量只进行一次作品级精确通知和一次延迟确认，未完成路径交给原有 10/30/60 分钟有限重试。
+- 平铺电影按单文件隔离，不会把不同作品错误合并；剧集按 Series 目录聚合。
+- 保持不递归刷新媒体库根目录、不改 Emby/STRM 精确路径安全边界。
+- 不修改数据库结构、刮削逻辑、人物功能、追剧判断或 MoviePilot 状态同步。
+
+""",
+    },
+    {
         "version": "v7.2.8",
         "published_at": "2026-07-26T07:09:10+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.8",

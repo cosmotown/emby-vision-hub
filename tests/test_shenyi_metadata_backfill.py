@@ -168,10 +168,20 @@ class ShenyiBackfillTests(unittest.TestCase):
             row = self.db_rows.setdefault((tmdb_id, item_type), {})
             changed = []
             for key, value in values.items():
-                if is_missing(
-                    row.get(key),
-                    numeric_zero=key in {"rating", "total_episodes", "release_year"},
-                ):
+                semantic = (
+                    "title"
+                    if key in {"title", "original_title"}
+                    else (
+                        "date"
+                        if key == "release_date"
+                        else (
+                            "number"
+                            if key in {"rating", "total_episodes", "release_year"}
+                            else ("json" if key.endswith("_json") else "text")
+                        )
+                    )
+                )
+                if is_missing(row.get(key), semantic=semantic):
                     row[key] = value
                     changed.append(key)
             self.db_calls.append((tmdb_id, item_type, dict(values)))
@@ -194,11 +204,13 @@ class ShenyiBackfillTests(unittest.TestCase):
         )
 
     def test_missing_value_rules_cover_blanks_json_zero_and_placeholders(self):
-        for value in (None, "", "  ", [], {}, "[]", "{}", "0001-01-01"):
+        for value in (None, "", "  ", [], {}, "[]", "{}"):
             self.assertTrue(is_missing(value))
+        self.assertTrue(is_missing("0001-01-01", semantic="date"))
         self.assertTrue(is_missing(0, numeric_zero=True))
         self.assertFalse(is_missing(0))
         self.assertTrue(is_missing("TBA", title=True))
+        self.assertTrue(is_missing("占位", semantic="title"))
         self.assertFalse(is_missing("真实标题", title=True))
 
     def test_emby_locked_overview_is_never_changed(self):
@@ -250,15 +262,99 @@ class ShenyiBackfillTests(unittest.TestCase):
         self.assertEqual(24, written["number_of_episodes"])
         self.assertTrue(result["refreshed"])
 
+    def test_placeholder_title_and_date_are_really_updated(self):
+        self.write_json("cache", "tmdb-movies2/7/all.json", complete_movie())
+        self.db_rows[("7", "Movie")] = {
+            "title": "占位",
+            "release_date": "1900-01-01",
+        }
+
+        result = self.service().execute("movie")
+
+        self.assertIn("title", result["database_fields"])
+        self.assertIn("release_date", result["database_fields"])
+        self.assertEqual("缓存电影", self.db_rows[("7", "Movie")]["title"])
+        self.assertEqual("2025-02-02", self.db_rows[("7", "Movie")]["release_date"])
+
+    def test_preview_file_and_database_results_share_missing_semantics(self):
+        cache = complete_movie()
+        override = complete_movie(title="占位", release_date="1900-01-01")
+        self.write_json("cache", "tmdb-movies2/7/all.json", cache)
+        self.write_json("override", "tmdb-movies2/7/all.json", override)
+        self.items["movie"].update(
+            {
+                "Name": "占位",
+                "OriginalTitle": "Cached Movie",
+                "Overview": "缓存简介",
+                "PremiereDate": "1900-01-01",
+                "CommunityRating": 7.5,
+                "Genres": ["剧情"],
+                "Studios": [{"Name": "已存在"}],
+            }
+        )
+        self.db_rows[("7", "Movie")] = {
+            "title": "占位",
+            "original_title": "Cached Movie",
+            "overview": "缓存简介",
+            "release_date": "1900-01-01",
+            "rating": 7.5,
+            "genres_json": [{"id": 18, "name": "剧情"}],
+            "original_language": "zh",
+        }
+        service = self.service()
+
+        preview = service.preview("movie")
+        result = service.execute("movie")
+
+        self.assertTrue(preview["would_write_file"])
+        self.assertEqual(
+            ["release_date", "release_year", "title"],
+            preview["would_write_database"],
+        )
+        self.assertEqual(
+            ["release_date", "release_year", "title"],
+            sorted(result["database_fields"]),
+        )
+        self.assertEqual(
+            ["release_date", "title"],
+            sorted(result["file_fields"]),
+        )
+
     def test_cache_only_fills_missing_fields_and_creates_complete_override(self):
         self.write_json("cache", "tmdb-movies2/7/all.json", complete_movie())
 
         result = self.service().execute("movie")
 
-        self.assertEqual("updated", result["status"])
+        self.assertEqual("refresh_submitted", result["status"])
+        self.assertTrue(result["source_updated"])
+        self.assertTrue(result["refresh_submitted"])
         self.assertTrue((self.root / "override/tmdb-movies2/7/all.json").exists())
         self.assertIn("__created__", result["file_fields"])
         self.assertEqual(["movie"], self.refresh_calls)
+
+    def test_cache_identity_must_match_its_documented_location(self):
+        self.write_json(
+            "cache",
+            "tmdb-movies2/7/all.json",
+            complete_movie(id=8),
+        )
+
+        with self.assertRaisesRegex(ValueError, "身份字段与路径不一致"):
+            self.service().preview("movie")
+
+        self.write_json(
+            "cache",
+            "tmdb-tv/42/season-0.json",
+            {
+                "id": 420,
+                "name": "错误季号",
+                "overview": "不会被采用",
+                "air_date": "2025-01-01",
+                "season_number": 1,
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "身份字段与路径不一致"):
+            self.service().preview("season0")
 
     def test_official_rating_isolated_from_custom_rating(self):
         self.write_json("cache", "tmdb-tv/42/series.json", complete_series())
@@ -337,6 +433,100 @@ class ShenyiBackfillTests(unittest.TestCase):
 
         self.assertEqual("pending", result["verification"]["status"])
         self.assertIn("overview", result["verification"]["remaining_fields"])
+        self.assertEqual(["movie"], self.refresh_calls)
+
+    def test_http_refresh_failure_allows_one_explicit_retry_only(self):
+        self.write_json("cache", "tmdb-movies2/7/all.json", complete_movie())
+        outcomes = [False, True]
+        service = self.service()
+        service.refresh = (
+            lambda item_id, *_: self.refresh_calls.append(item_id)
+            or outcomes.pop(0)
+        )
+
+        first = service.execute("movie")
+        passive = service.execute("movie")
+        retried = service.execute("movie", explicit_retry=True)
+        repeated = service.execute("movie", explicit_retry=True)
+
+        self.assertEqual("refresh_failed", first["status"])
+        self.assertEqual("refresh_failed", passive["status"])
+        self.assertFalse(passive["source_updated"])
+        self.assertEqual("refresh_submitted", retried["status"])
+        self.assertEqual("refresh_submitted", repeated["status"])
+        self.assertEqual(["movie", "movie"], self.refresh_calls)
+
+    def test_failed_explicit_retry_cannot_form_a_manual_refresh_loop(self):
+        self.write_json("cache", "tmdb-movies2/7/all.json", complete_movie())
+        service = self.service()
+        service.refresh = (
+            lambda item_id, *_: self.refresh_calls.append(item_id) or False
+        )
+
+        first = service.execute("movie")
+        retried = service.execute("movie", explicit_retry=True)
+        blocked = service.execute("movie", explicit_retry=True)
+
+        self.assertEqual("refresh_failed", first["status"])
+        self.assertEqual("refresh_failed", retried["status"])
+        self.assertEqual("refresh_failed", blocked["status"])
+        self.assertEqual(["movie", "movie"], self.refresh_calls)
+
+    def test_timeout_requires_read_only_confirmation_or_cooled_explicit_retry(self):
+        self.write_json("cache", "tmdb-movies2/7/all.json", complete_movie())
+        now = [10.0]
+        service = self.service()
+        service.clock = lambda: now[0]
+        service.ambiguous_cooldown = 60
+        outcomes = [TimeoutError("unknown delivery"), True]
+
+        def refresh(item_id, *_):
+            self.refresh_calls.append(item_id)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        service.refresh = refresh
+        first = service.execute("movie")
+        blocked = service.execute("movie", explicit_retry=True)
+        now[0] = 71.0
+        retried = service.execute("movie", explicit_retry=True)
+
+        self.assertEqual("refresh_ambiguous", first["status"])
+        self.assertGreater(blocked["retry_after_seconds"], 0)
+        self.assertEqual("refresh_ambiguous", blocked["status"])
+        self.assertEqual("refresh_submitted", retried["status"])
+        self.assertEqual(["movie", "movie"], self.refresh_calls)
+
+    def test_timeout_is_resolved_by_read_only_confirmation_without_post(self):
+        cache = complete_movie()
+        self.write_json("cache", "tmdb-movies2/7/all.json", cache)
+        self.items["movie"].update(
+            {
+                "Name": cache["title"],
+                "OriginalTitle": cache["original_title"],
+                "Overview": "",
+                "PremiereDate": cache["release_date"],
+                "CommunityRating": cache["vote_average"],
+                "OfficialRating": "PG",
+                "Genres": ["剧情"],
+                "Studios": [{"Name": "哨兵制片厂"}],
+            }
+        )
+        service = self.service()
+
+        def timeout(item_id, *_):
+            self.refresh_calls.append(item_id)
+            raise TimeoutError("unknown delivery")
+
+        service.refresh = timeout
+        first = service.execute("movie")
+        self.items["movie"]["Overview"] = cache["overview"]
+        confirmed = service.execute("movie")
+
+        self.assertEqual("refresh_ambiguous", first["status"])
+        self.assertEqual("provider_confirmed", confirmed["status"])
         self.assertEqual(["movie"], self.refresh_calls)
 
     def test_atomic_replace_failure_preserves_original_override(self):
@@ -433,10 +623,11 @@ class ShenyiBackfillTests(unittest.TestCase):
         preview = service.preview("movie")
         second = service.execute("movie")
 
-        self.assertEqual("updated", first["status"])
+        self.assertEqual("refresh_submitted", first["status"])
         self.assertEqual("pending_provider", preview["status"])
         self.assertFalse(preview["would_refresh"])
-        self.assertEqual("unchanged", second["status"])
+        self.assertEqual("refresh_submitted", second["status"])
+        self.assertFalse(second["source_updated"])
         self.assertEqual(["movie"], self.refresh_calls)
 
     def test_completed_auxiliary_fields_are_not_reported_again(self):
@@ -488,7 +679,7 @@ class ShenyiBackfillTests(unittest.TestCase):
         thread.join(2)
 
         self.assertEqual("duplicate_in_progress", duplicate["status"])
-        self.assertEqual("updated", first_result[0]["status"])
+        self.assertEqual("refresh_submitted", first_result[0]["status"])
         self.assertEqual(["movie"], self.refresh_calls)
 
     def test_episodes_of_same_series_share_one_root_lock(self):
@@ -536,8 +727,72 @@ class ShenyiBackfillTests(unittest.TestCase):
         thread.join(2)
 
         self.assertEqual("duplicate_in_progress", duplicate["status"])
-        self.assertEqual("updated", first_result[0]["status"])
+        self.assertEqual("refresh_submitted", first_result[0]["status"])
         self.assertEqual(["episode"], self.refresh_calls)
+
+    def test_series_tmdb_id_falls_back_to_evh_database(self):
+        self.items["series"]["ProviderIds"] = {}
+        self.write_json("cache", "tmdb-tv/42/series.json", complete_series())
+        service = self.service()
+        service.get_tmdb_by_emby = (
+            lambda item_id: "42" if item_id == "series" else None
+        )
+
+        preview = service.preview("series")
+
+        self.assertEqual("42", preview["tmdb_id"])
+        self.assertEqual(
+            "override/tmdb-tv/42/series.json",
+            preview["relative_override_path"],
+        )
+
+    def test_season_and_episode_ids_fall_back_to_located_cache(self):
+        self.items["season0"]["ProviderIds"] = {}
+        self.items["episode"]["ProviderIds"] = {}
+        self.items["series"]["ProviderIds"] = {}
+        self.write_json(
+            "cache",
+            "tmdb-tv/42/season-0.json",
+            {
+                "id": 420,
+                "name": "特别篇",
+                "overview": "季简介",
+                "air_date": "2025-01-01",
+                "season_number": 0,
+            },
+        )
+        self.write_json(
+            "cache",
+            "tmdb-tv/42/season-0-episode-1.json",
+            {
+                "id": 421,
+                "name": "特别集",
+                "overview": "集简介",
+                "air_date": "2025-01-02",
+                "season_number": 0,
+                "episode_number": 1,
+            },
+        )
+        service = self.service()
+        service.get_tmdb_by_emby = (
+            lambda item_id: "42" if item_id == "series" else None
+        )
+
+        season = service.preview("season0")
+        episode = service.preview("episode")
+
+        self.assertEqual("420", season["tmdb_id"])
+        self.assertEqual("421", episode["tmdb_id"])
+        self.assertEqual("series", episode["root_series_id"])
+
+    def test_unused_item_and_file_locks_are_removed(self):
+        self.write_json("cache", "tmdb-movies2/7/all.json", complete_movie())
+        service = self.service()
+
+        service.execute("movie")
+
+        self.assertEqual({}, ShenyiMetadataBackfillService._item_locks)
+        self.assertEqual({}, ShenyiStore._locks)
 
 
 @unittest.skipUnless(database_media_db is not None, "requires application dependencies")
@@ -571,7 +826,7 @@ class SelectiveDatabaseFillTests(unittest.TestCase):
                     "overview": " ",
                     "rating": 0,
                     "total_episodes": "0",
-                    "official_rating_json": {"results": [{"rating": "TV-14"}]},
+                    "official_rating_json": {"US": "TV-14"},
                     "custom_rating": "不得进入官方字段",
                 },
             )
@@ -581,6 +836,37 @@ class SelectiveDatabaseFillTests(unittest.TestCase):
         self.assertIn("official_rating_json", sql_text)
         self.assertNotIn("custom_rating", sql_text)
         self.assertNotIn("total_episodes =", sql_text)
+
+    def test_sql_predicates_match_placeholder_title_and_date_semantics(self):
+        connection = mock.MagicMock()
+        connection_context = mock.MagicMock()
+        connection_context.__enter__.return_value = connection
+        cursor = mock.MagicMock()
+        cursor_context = mock.MagicMock()
+        cursor_context.__enter__.return_value = cursor
+        connection.cursor.return_value = cursor_context
+
+        def execute(sql, _params):
+            cursor.rowcount = 1
+
+        cursor.execute.side_effect = execute
+        with mock.patch.object(
+            database_media_db, "get_db_connection", return_value=connection_context
+        ):
+            updated = database_media_db.selectively_fill_media_metadata(
+                "7",
+                "Movie",
+                {"title": "真实标题", "release_date": "2025-02-02"},
+            )
+
+        self.assertEqual(["title", "release_date"], updated)
+        sql_text = "\n".join(
+            " ".join(str(call.args[0]).split())
+            for call in cursor.execute.call_args_list
+        )
+        self.assertIn("LOWER(BTRIM(title)) IN", sql_text)
+        self.assertIn("'占位'", sql_text)
+        self.assertIn("release_date IN (DATE '0001-01-01', DATE '1900-01-01')", sql_text)
 
     def test_invalid_identity_is_rejected_before_database_access(self):
         with self.assertRaises(ValueError):

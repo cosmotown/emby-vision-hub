@@ -1,0 +1,15 @@
+{
+  "air_date": "2025-01-01",
+  "credits": {"cast": [], "crew": []},
+  "episode_number": 1,
+  "external_ids": {},
+  "id": 809101,
+  "name": "Episode 1",
+  "overview": "Sanitized episode overview.",
+  "production_code": "FIXTURE-101",
+  "season_number": 1,
+  "still_path": "/sanitized-episode-still.jpg",
+  "videos": {"results": []},
+  "vote_average": 8.0,
+  "vote_count": 8
+}

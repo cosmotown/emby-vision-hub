@@ -1215,7 +1215,9 @@ def refresh_metadata_backfill_item(
     item_id: str,
     base_url: str,
     api_key: str,
-) -> bool:
+    *,
+    detailed: bool = False,
+) -> Any:
     """Submit one Shenyi-provider refresh without recursion or unlocking.
 
     Emby 4.9.5 does not invoke remote metadata providers for ``Default`` mode.
@@ -1224,7 +1226,7 @@ def refresh_metadata_backfill_item(
     """
     normalized_id = str(item_id or "").strip()
     if not normalized_id or not base_url or not api_key:
-        return False
+        return {"outcome": "http_failed", "submitted": False} if detailed else False
     try:
         response = emby_client.post_once(
             f"{base_url.rstrip('/')}/Items/{normalized_id}/Refresh",
@@ -1238,14 +1240,28 @@ def refresh_metadata_backfill_item(
             headers={"X-Emby-Token": api_key},
         )
         response.raise_for_status()
-        return response.status_code in (200, 204)
+        submitted = response.status_code in (200, 204)
+        if detailed:
+            return {
+                "outcome": "submitted" if submitted else "http_failed",
+                "submitted": submitted,
+                "status_code": response.status_code,
+            }
+        return submitted
+    except requests.Timeout as exc:
+        logger.warning(
+            "神医元数据补齐刷新结果不确定 (ItemID: %s, %s)",
+            normalized_id,
+            type(exc).__name__,
+        )
+        return {"outcome": "ambiguous", "submitted": None} if detailed else False
     except Exception as exc:
         logger.warning(
             "神医元数据补齐的最小刷新失败 (ItemID: %s, %s)",
             normalized_id,
             type(exc).__name__,
         )
-        return False
+        return {"outcome": "http_failed", "submitted": False} if detailed else False
 
 # --- 最近锚点强制刷新版 ---
 def refresh_library_by_path(file_path: str, base_url: str, api_key: str) -> bool:

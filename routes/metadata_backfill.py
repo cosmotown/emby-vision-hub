@@ -2,6 +2,7 @@ import copy
 import logging
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Dict, List
 
@@ -21,10 +22,15 @@ metadata_backfill_bp = Blueprint(
 
 
 class MetadataBackfillTaskStore:
-    def __init__(self):
+    def __init__(self, max_workers: int = 2):
         self._lock = threading.Lock()
         self._tasks: Dict[str, dict] = {}
-        self._active_items = set()
+        self._active_keys = set()
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, int(max_workers)),
+            thread_name_prefix="metadata-backfill",
+        )
+        self._futures = set()
 
     def _trim(self):
         if len(self._tasks) <= 100:
@@ -37,38 +43,60 @@ class MetadataBackfillTaskStore:
         for key in completed[: len(self._tasks) - 100]:
             self._tasks.pop(key, None)
 
-    def start(self, service: ShenyiMetadataBackfillService, item_ids: List[str]) -> dict:
+    def start(
+        self,
+        service: ShenyiMetadataBackfillService,
+        item_ids: List[str],
+        *,
+        explicit_retry: bool = False,
+    ) -> dict:
+        active_keys = {
+            service.execution_key(item_id)
+            for item_id in item_ids
+        }
         with self._lock:
-            duplicates = sorted(set(item_ids) & self._active_items)
+            duplicates = sorted(active_keys & self._active_keys)
             if duplicates:
-                raise ValueError("部分项目已有补齐任务运行")
+                raise ValueError("同一根媒体项目已有补齐任务运行")
             task_id = uuid.uuid4().hex
-            self._active_items.update(item_ids)
+            self._active_keys.update(active_keys)
             self._tasks[task_id] = {
                 "task_id": task_id,
                 "status": "pending",
                 "total": len(item_ids),
                 "completed": 0,
                 "results": [],
+                "explicit_retry": bool(explicit_retry),
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             self._trim()
 
-        threading.Thread(
-            target=self._run,
-            args=(task_id, service, item_ids),
-            name=f"metadata-backfill-{task_id[:8]}",
-            daemon=True,
-        ).start()
+        future = self._executor.submit(
+            self._run,
+            task_id,
+            service,
+            item_ids,
+            active_keys,
+            bool(explicit_retry),
+        )
+        with self._lock:
+            self._futures.add(future)
+        future.add_done_callback(self._discard_future)
         return self.get(task_id)
 
-    def _run(self, task_id, service, item_ids):
+    def _discard_future(self, future):
+        with self._lock:
+            self._futures.discard(future)
+
+    def _run(self, task_id, service, item_ids, active_keys, explicit_retry):
         with self._lock:
             self._tasks[task_id]["status"] = "running"
         try:
             for item_id in item_ids:
                 try:
-                    result = service.execute(item_id)
+                    result = service.execute(
+                        item_id, explicit_retry=explicit_retry
+                    )
                 except Exception as exc:
                     logger.warning(
                         "神医元数据补齐项目失败 (ItemID=%s, %s)",
@@ -96,12 +124,15 @@ class MetadataBackfillTaskStore:
                 self._tasks[task_id]["error"] = type(exc).__name__
         finally:
             with self._lock:
-                self._active_items.difference_update(item_ids)
+                self._active_keys.difference_update(active_keys)
 
     def get(self, task_id):
         with self._lock:
             task = self._tasks.get(str(task_id or "").strip())
             return copy.deepcopy(task) if task else None
+
+    def shutdown(self, wait=True):
+        self._executor.shutdown(wait=wait)
 
 
 metadata_backfill_tasks = MetadataBackfillTaskStore()
@@ -173,7 +204,12 @@ def preview_metadata_backfill():
 @processor_ready_required
 def start_metadata_backfill():
     try:
-        task = metadata_backfill_tasks.start(_service(), _item_ids())
+        payload = request.get_json(silent=True) or {}
+        task = metadata_backfill_tasks.start(
+            _service(),
+            _item_ids(),
+            explicit_retry=payload.get("explicit_retry") is True,
+        )
         return jsonify(task), 202
     except ValueError as exc:
         status = 409 if "已有" in str(exc) else 400

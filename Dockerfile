@@ -50,6 +50,7 @@ COPY web_app.py \
      utils.py \
      logger_setup.py \
      constants.py \
+     metadata_contracts.py \
      ai_translator.py \
      watchlist_processor.py \
      actor_utils.py \

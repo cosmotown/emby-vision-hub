@@ -935,6 +935,38 @@ class EmbyHttpValidationTests(unittest.TestCase):
         self.assertEqual("FullRefresh", params["MetadataRefreshMode"])
         self.assertEqual({"X-Emby-Token": "token"}, post_once.call_args.kwargs["headers"])
 
+    @mock.patch("handler.emby.emby_client.post_once")
+    def test_metadata_backfill_refresh_reports_http_failure_for_explicit_retry(
+        self, post_once
+    ):
+        response = mock.Mock(status_code=500)
+        response.raise_for_status.side_effect = emby.requests.HTTPError("500")
+        post_once.return_value = response
+
+        outcome = emby.refresh_metadata_backfill_item(
+            "episode-1", "http://emby", "token", detailed=True
+        )
+
+        self.assertEqual(
+            {"outcome": "http_failed", "submitted": False}, outcome
+        )
+        self.assertEqual(1, post_once.call_count)
+
+    @mock.patch("handler.emby.emby_client.post_once")
+    def test_metadata_backfill_refresh_timeout_is_ambiguous_and_not_replayed(
+        self, post_once
+    ):
+        post_once.side_effect = emby.requests.Timeout("unknown delivery")
+
+        outcome = emby.refresh_metadata_backfill_item(
+            "episode-1", "http://emby", "token", detailed=True
+        )
+
+        self.assertEqual(
+            {"outcome": "ambiguous", "submitted": None}, outcome
+        )
+        self.assertEqual(1, post_once.call_count)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,45 @@
+{
+  "adult": false,
+  "alternative_titles": {"titles": []},
+  "backdrop_path": "/sanitized-movie-backdrop.jpg",
+  "belongs_to_collection": null,
+  "budget": 1000000,
+  "credits": {"cast": [], "crew": []},
+  "external_ids": {"imdb_id": "tt0000707"},
+  "genres": [{"id": 18, "name": "Drama"}],
+  "homepage": "https://example.invalid/movie",
+  "id": 707,
+  "imdb_id": "tt0000707",
+  "keywords": {"keywords": []},
+  "original_language": "ko",
+  "original_title": "Sanitized Movie",
+  "overview": "Sanitized movie overview from a real-shape Shenyi cache.",
+  "popularity": 1.25,
+  "poster_path": "/sanitized-movie-poster.jpg",
+  "production_companies": [{"id": 7001, "logo_path": null, "name": "Fixture Studio", "origin_country": "KR"}],
+  "production_countries": [{"iso_3166_1": "KR", "name": "South Korea"}],
+  "release_date": "2025-02-02",
+  "release_dates": {
+    "results": [{
+      "iso_3166_1": "US",
+      "release_dates": [{
+        "certification": "PG-13",
+        "descriptors": [],
+        "iso_639_1": null,
+        "note": "",
+        "release_date": "2025-02-02T00:00:00.000Z",
+        "type": 3
+      }]
+    }]
+  },
+  "revenue": 2000000,
+  "runtime": 100,
+  "spoken_languages": [{"english_name": "Korean", "iso_639_1": "ko", "name": "한국어"}],
+  "status": "Released",
+  "tagline": "Sanitized fixture",
+  "title": "Sanitized Movie",
+  "video": false,
+  "videos": {"results": []},
+  "vote_average": 7.7,
+  "vote_count": 77
+}

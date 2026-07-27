@@ -1,4 +1,5 @@
 import time
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -58,7 +59,11 @@ class MetadataBackfillRouteTests(unittest.TestCase):
 
     def test_task_get_only_reads_existing_state(self):
         service = mock.Mock()
-        service.execute.return_value = {"item_id": "one", "status": "updated"}
+        service.execution_key.return_value = "one"
+        service.execute.return_value = {
+            "item_id": "one",
+            "status": "refresh_submitted",
+        }
         with mock.patch.object(metadata_backfill, "_service", return_value=service):
             created = self.client.post(
                 "/api/metadata-backfill/tasks", json={"item_id": "one"}
@@ -75,7 +80,95 @@ class MetadataBackfillRouteTests(unittest.TestCase):
 
         self.assertEqual(200, state.status_code)
         self.assertEqual("completed", state.get_json()["status"])
-        self.assertEqual(1, service.execute.call_count)
+        service.execute.assert_called_once_with("one", explicit_retry=False)
+
+    def test_explicit_retry_is_forwarded_to_one_bounded_task(self):
+        service = mock.Mock()
+        service.execution_key.return_value = "one"
+        service.execute.return_value = {
+            "item_id": "one",
+            "status": "refresh_failed",
+        }
+        store = metadata_backfill.MetadataBackfillTaskStore(max_workers=1)
+        try:
+            with (
+                mock.patch.object(metadata_backfill, "_service", return_value=service),
+                mock.patch.object(metadata_backfill, "metadata_backfill_tasks", store),
+            ):
+                created = self.client.post(
+                    "/api/metadata-backfill/tasks",
+                    json={"item_id": "one", "explicit_retry": True},
+                )
+            self.assertEqual(202, created.status_code)
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                task = store.get(created.get_json()["task_id"])
+                if task["status"] == "completed":
+                    break
+                time.sleep(0.01)
+            service.execute.assert_called_once_with("one", explicit_retry=True)
+        finally:
+            store.shutdown()
+
+    def test_different_episodes_are_deduplicated_by_root_series(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class Service:
+            @staticmethod
+            def execution_key(_item_id):
+                return "root-series"
+
+            @staticmethod
+            def execute(item_id, *, explicit_retry=False):
+                entered.set()
+                release.wait(2)
+                return {"item_id": item_id, "status": "refresh_submitted"}
+
+        store = metadata_backfill.MetadataBackfillTaskStore(max_workers=1)
+        try:
+            store.start(Service(), ["episode-1"])
+            self.assertTrue(entered.wait(1))
+            with self.assertRaisesRegex(ValueError, "根媒体项目"):
+                store.start(Service(), ["episode-2"])
+        finally:
+            release.set()
+            store.shutdown()
+
+    def test_task_pool_has_a_fixed_concurrency_limit(self):
+        active = 0
+        maximum = 0
+        lock = threading.Lock()
+        release = threading.Event()
+        two_entered = threading.Event()
+
+        class Service:
+            @staticmethod
+            def execution_key(item_id):
+                return item_id
+
+            @staticmethod
+            def execute(item_id, *, explicit_retry=False):
+                nonlocal active, maximum
+                with lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                    if active == 2:
+                        two_entered.set()
+                release.wait(2)
+                with lock:
+                    active -= 1
+                return {"item_id": item_id, "status": "refresh_submitted"}
+
+        store = metadata_backfill.MetadataBackfillTaskStore(max_workers=2)
+        try:
+            for index in range(4):
+                store.start(Service(), [f"item-{index}"])
+            self.assertTrue(two_entered.wait(1))
+            self.assertEqual(2, maximum)
+        finally:
+            release.set()
+            store.shutdown()
 
 
 if __name__ == "__main__":

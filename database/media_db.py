@@ -5,12 +5,17 @@ from typing import List, Dict, Optional, Any
 import json
 import psycopg2
 from .connection import get_db_connection
+from metadata_contracts import (
+    is_missing,
+    postgres_missing_predicate,
+    validate_database_structured,
+)
 
 logger = logging.getLogger(__name__)
 
 _SELECTIVE_FILL_COLUMNS = {
-    'title': 'text',
-    'original_title': 'text',
+    'title': 'title',
+    'original_title': 'title',
     'original_language': 'text',
     'overview': 'text',
     'release_date': 'date',
@@ -26,30 +31,7 @@ _SELECTIVE_FILL_COLUMNS = {
 
 
 def _selective_value_missing(value: Any, value_kind: str) -> bool:
-    if value is None:
-        return True
-    if value_kind == 'text':
-        return not str(value).strip()
-    if value_kind == 'number':
-        return (
-            not isinstance(value, (int, float))
-            or isinstance(value, bool)
-            or value <= 0
-        )
-    if value_kind == 'date':
-        text = str(value or '').strip()
-        return (
-            len(text) < 10
-            or text[:10] in {'0000-00-00', '0001-01-01', '1900-01-01'}
-        )
-    if value_kind == 'json':
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except (TypeError, ValueError):
-                return not value.strip()
-        return value in ({}, [], None)
-    return False
+    return is_missing(value, semantic=value_kind)
 
 
 def selectively_fill_media_metadata(
@@ -67,12 +49,16 @@ def selectively_fill_media_metadata(
     ):
         raise ValueError('invalid media identity')
 
-    safe_candidates = {
-        key: value
-        for key, value in (candidates or {}).items()
-        if key in _SELECTIVE_FILL_COLUMNS
-        and not _selective_value_missing(value, _SELECTIVE_FILL_COLUMNS[key])
-    }
+    safe_candidates = {}
+    for key, value in (candidates or {}).items():
+        if key not in _SELECTIVE_FILL_COLUMNS:
+            continue
+        value_kind = _SELECTIVE_FILL_COLUMNS[key]
+        if _selective_value_missing(value, value_kind):
+            continue
+        if value_kind == 'json':
+            value = validate_database_structured(key, normalized_type, value)
+        safe_candidates[key] = value
     if not safe_candidates:
         return []
 
@@ -91,24 +77,12 @@ def selectively_fill_media_metadata(
                 for column, value in safe_candidates.items():
                     value_kind = _SELECTIVE_FILL_COLUMNS[column]
                     if value_kind == 'json':
-                        predicate = (
-                            f"({column} IS NULL OR {column} = 'null'::jsonb OR "
-                            f"{column} = '[]'::jsonb OR {column} = '{{}}'::jsonb)"
-                        )
                         assignment = f"{column} = %s::jsonb"
                         parameter = json.dumps(value, ensure_ascii=False)
-                    elif value_kind == 'text':
-                        predicate = f"({column} IS NULL OR BTRIM({column}) = '')"
-                        assignment = f"{column} = %s"
-                        parameter = value
-                    elif value_kind == 'number':
-                        predicate = f"({column} IS NULL OR {column} <= 0)"
-                        assignment = f"{column} = %s"
-                        parameter = value
                     else:
-                        predicate = f"{column} IS NULL"
                         assignment = f"{column} = %s"
                         parameter = value
+                    predicate = postgres_missing_predicate(column, value_kind)
 
                     cursor.execute(
                         f"""

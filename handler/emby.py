@@ -53,7 +53,11 @@ class EmbyAPIClient:
             total=5,
             backoff_factor=1,
             status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"]
+            # Only replay methods which are both read-only and idempotent in
+            # this client. Emby POST endpoints enqueue work and several DELETE
+            # endpoints are custom plugin actions, so a lost response must not
+            # cause a second mutation.
+            allowed_methods=["HEAD", "GET", "OPTIONS", "TRACE"]
         )
         
         adapter = HTTPAdapter(max_retries=retries, pool_connections=20, pool_maxsize=20)
@@ -71,6 +75,9 @@ class EmbyAPIClient:
         # 自动注入超时，如果未指定
         if 'timeout' not in kwargs:
             kwargs['timeout'] = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        if str(method).upper() not in {"GET", "HEAD", "OPTIONS", "TRACE"}:
+            # Do not let requests replay a mutation through a 307/308 redirect.
+            kwargs.setdefault('allow_redirects', False)
 
         with self.semaphore:
             try:
@@ -90,11 +97,14 @@ class EmbyAPIClient:
         return self.request("POST", url, **kwargs)
 
     def post_once(self, url, **kwargs):
-        """Submit a non-idempotent POST without the shared automatic retry policy."""
+        """Submit one non-idempotent POST without retries or redirect replay."""
         if 'timeout' not in kwargs:
             kwargs['timeout'] = config_manager.APP_CONFIG.get(
                 constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60
             )
+        # Requests follows POST redirects by default.  A 307/308 can replay the
+        # body, so mutation endpoints must surface redirects to the caller.
+        kwargs.setdefault('allow_redirects', False)
         with self.semaphore:
             return requests.post(url, **kwargs)
 
@@ -999,7 +1009,7 @@ def refresh_item_by_id(
     }
     
     try:
-        response = emby_client.post(
+        response = emby_client.post_once(
             refresh_url,
             params=refresh_params,
             headers={"X-Emby-Token": api_key},
@@ -1039,7 +1049,7 @@ def notify_media_paths_updated(
             ]
         }
         try:
-            response = emby_client.post(
+            response = emby_client.post_once(
                 api_url,
                 json=payload,
                 headers={"X-Emby-Token": api_key},
@@ -1055,7 +1065,7 @@ def _query_media_item_by_path(
     file_path: str,
     base_url: str,
     api_key: str,
-    include_media_sources: bool = True,
+    include_media_sources: bool = False,
 ) -> tuple[Optional[bool], Optional[Dict[str, Any]]]:
     """Return exact path match state and item data without exposing the API key."""
     normalized_target = os.path.normcase(os.path.normpath(str(file_path or '')))
@@ -1215,7 +1225,7 @@ def refresh_library_by_path(file_path: str, base_url: str, api_key: str) -> bool
         api_url = f"{base_url.rstrip('/')}/Library/Media/Updated"
         payload = {"Updates": [{"Path": file_path, "UpdateType": "Modified"}]}
         try:
-            response = emby_client.post(
+            response = emby_client.post_once(
                 api_url,
                 json=payload,
                 headers={"X-Emby-Token": api_key},
@@ -2179,7 +2189,7 @@ def delete_item_sy(item_id: str, emby_server_url: str, emby_api_key: str, user_i
     }
     
     try:
-        response = emby_client.post(api_url, headers=headers, params=params)
+        response = emby_client.post_once(api_url, headers=headers, params=params)
         response.raise_for_status()
         logger.info(f"  ✅ [神医接口] 成功删除 Emby 媒体项 ID: {item_id}。")
         return True
@@ -2222,7 +2232,7 @@ def delete_item(item_id: str, emby_server_url: str, emby_api_key: str, user_id: 
     }
     
     try:
-        response = emby_client.post(api_url, headers=headers, params=params)
+        response = emby_client.post_once(api_url, headers=headers, params=params)
         response.raise_for_status()
         logger.info(f"  ✅ 成功删除 Emby 媒体项 ID: {item_id}。")
         return True
@@ -2665,7 +2675,7 @@ def delete_person_custom_api(base_url: str, api_key: str, person_id: str) -> boo
     
     try:
         # 这个接口是 POST 请求
-        response = emby_client.post(api_url, headers=headers, params=params)
+        response = emby_client.post_once(api_url, headers=headers, params=params)
         response.raise_for_status()
         logger.info(f"  ✅ 成功删除演员 ID: {person_id}。")
         return True
@@ -2674,10 +2684,18 @@ def delete_person_custom_api(base_url: str, api_key: str, person_id: str) -> boo
         if e.response.status_code == 404:
             logger.error(f"删除演员 {person_id} 失败：需神医Pro版本才支持此功能。")
         else:
-            logger.error(f"使用临时令牌删除演员 {person_id} 时发生HTTP错误: {e.response.status_code} - {e.response.text}")
+            logger.error(
+                "使用临时令牌删除演员 %s 时发生 HTTP 错误: %s",
+                person_id,
+                e.response.status_code,
+            )
         return False
     except Exception as e:
-        logger.error(f"使用临时令牌删除演员 {person_id} 时发生未知错误: {e}")
+        logger.error(
+            "使用临时令牌删除演员 %s 时发生未知错误: %s",
+            person_id,
+            type(e).__name__,
+        )
         return False
 
 # --- 获取所有 Emby 用户列表 ---

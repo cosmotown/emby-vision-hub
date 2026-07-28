@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -153,6 +154,8 @@ class ShenyiBackfillTests(unittest.TestCase):
         self.db_rows = {}
         self.db_calls = []
         self.refresh_calls = []
+        with ShenyiMetadataBackfillService._refresh_guard:
+            ShenyiMetadataBackfillService._refresh_records.clear()
 
     def tearDown(self):
         self.temp.cleanup()
@@ -163,7 +166,7 @@ class ShenyiBackfillTests(unittest.TestCase):
         path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
         return path
 
-    def service(self):
+    def service(self, *, refresh_store=None, refresh=None, clock=None):
         def fill_db(tmdb_id, item_type, values):
             row = self.db_rows.setdefault((tmdb_id, item_type), {})
             changed = []
@@ -187,6 +190,22 @@ class ShenyiBackfillTests(unittest.TestCase):
             self.db_calls.append((tmdb_id, item_type, dict(values)))
             return changed
 
+        def get_refresh_store():
+            return json.loads(json.dumps(refresh_store))
+
+        def save_refresh_store(value):
+            refresh_store.clear()
+            refresh_store.update(json.loads(json.dumps(value)))
+
+        kwargs = {}
+        if refresh_store is not None:
+            kwargs.update(
+                get_refresh_store=get_refresh_store,
+                save_refresh_store=save_refresh_store,
+            )
+        if clock is not None:
+            kwargs["clock"] = clock
+
         return ShenyiMetadataBackfillService(
             str(self.root),
             "http://emby",
@@ -198,9 +217,12 @@ class ShenyiBackfillTests(unittest.TestCase):
             ),
             fill_db=fill_db,
             get_tmdb_by_emby=lambda _item_id: None,
-            refresh=lambda item_id, *_: self.refresh_calls.append(item_id) or True,
+            refresh=refresh or (
+                lambda item_id, *_: self.refresh_calls.append(item_id) or True
+            ),
             provider_settle_delay=0,
             verification_delays=(0,),
+            **kwargs,
         )
 
     def test_missing_value_rules_cover_blanks_json_zero_and_placeholders(self):
@@ -528,6 +550,142 @@ class ShenyiBackfillTests(unittest.TestCase):
         self.assertEqual("refresh_ambiguous", first["status"])
         self.assertEqual("provider_confirmed", confirmed["status"])
         self.assertEqual(["movie"], self.refresh_calls)
+
+    def test_preexisting_sources_receive_one_initial_refresh_and_persist_guard(self):
+        cache = complete_movie()
+        self.write_json("cache", "tmdb-movies2/7/all.json", cache)
+        self.write_json("override", "tmdb-movies2/7/all.json", cache)
+        self.db_rows[("7", "Movie")] = {
+            "title": cache["title"],
+            "original_title": cache["original_title"],
+            "overview": cache["overview"],
+            "release_date": cache["release_date"],
+            "release_year": 2025,
+            "rating": cache["vote_average"],
+            "genres_json": cache["genres"],
+            "production_companies_json": cache["production_companies"],
+            "countries_json": [],
+            "original_language": cache["original_language"],
+            "official_rating_json": {},
+        }
+        durable = {}
+        service = self.service(refresh_store=durable)
+
+        preview = service.preview("movie")
+        first = service.execute("movie")
+        with ShenyiMetadataBackfillService._refresh_guard:
+            ShenyiMetadataBackfillService._refresh_records.clear()
+        second = self.service(refresh_store=durable).execute("movie")
+
+        self.assertTrue(preview["would_refresh"])
+        self.assertEqual("refresh_submitted", first["status"])
+        self.assertEqual("refresh_submitted", second["status"])
+        self.assertEqual(["movie"], self.refresh_calls)
+        self.assertEqual(1, len(durable))
+
+    def test_explicit_retry_limit_survives_service_restart(self):
+        self.write_json("cache", "tmdb-movies2/7/all.json", complete_movie())
+        durable = {}
+
+        def fail(item_id, *_):
+            self.refresh_calls.append(item_id)
+            return False
+
+        first = self.service(refresh_store=durable, refresh=fail).execute("movie")
+        with ShenyiMetadataBackfillService._refresh_guard:
+            ShenyiMetadataBackfillService._refresh_records.clear()
+
+        def succeed(item_id, *_):
+            self.refresh_calls.append(item_id)
+            return True
+
+        restarted = self.service(refresh_store=durable, refresh=succeed)
+        passive = restarted.execute("movie")
+        retried = restarted.execute("movie", explicit_retry=True)
+        with ShenyiMetadataBackfillService._refresh_guard:
+            ShenyiMetadataBackfillService._refresh_records.clear()
+        repeated = self.service(
+            refresh_store=durable, refresh=succeed
+        ).execute("movie", explicit_retry=True)
+
+        self.assertEqual("refresh_failed", first["status"])
+        self.assertEqual("refresh_failed", passive["status"])
+        self.assertEqual("refresh_submitted", retried["status"])
+        self.assertEqual("refresh_submitted", repeated["status"])
+        self.assertEqual(["movie", "movie"], self.refresh_calls)
+
+    def test_ambiguous_retry_cooldown_and_single_retry_survive_restart(self):
+        self.write_json("cache", "tmdb-movies2/7/all.json", complete_movie())
+        durable = {}
+        now = [10.0]
+
+        def ambiguous(item_id, *_):
+            self.refresh_calls.append(item_id)
+            raise TimeoutError("unknown delivery")
+
+        first = self.service(
+            refresh_store=durable, refresh=ambiguous, clock=lambda: now[0]
+        ).execute("movie")
+        with ShenyiMetadataBackfillService._refresh_guard:
+            ShenyiMetadataBackfillService._refresh_records.clear()
+        now[0] = 20.0
+        restarted = self.service(
+            refresh_store=durable, refresh=ambiguous, clock=lambda: now[0]
+        )
+        blocked = restarted.execute("movie", explicit_retry=True)
+        now[0] = 71.0
+        retried = restarted.execute("movie", explicit_retry=True)
+        now[0] = 200.0
+        repeated = restarted.execute("movie", explicit_retry=True)
+
+        self.assertEqual("refresh_ambiguous", first["status"])
+        self.assertGreater(blocked["retry_after_seconds"], 0)
+        self.assertEqual("refresh_ambiguous", retried["status"])
+        self.assertEqual("refresh_ambiguous", repeated["status"])
+        self.assertEqual(["movie", "movie"], self.refresh_calls)
+
+    def test_permission_setup_failure_closes_temporary_descriptor(self):
+        self.write_json("cache", "tmdb-movies2/7/all.json", complete_movie())
+        with (
+            mock.patch(
+                "services.shenyi_metadata_backfill._apply_source_file_identity",
+                side_effect=PermissionError("identity mismatch"),
+            ),
+            mock.patch(
+                "services.shenyi_metadata_backfill.os.close",
+                wraps=os.close,
+            ) as close_fd,
+        ):
+            with self.assertRaises(PermissionError):
+                self.service().execute("movie")
+
+        self.assertTrue(close_fd.called)
+        temporary_files = list(
+            (self.root / "override/tmdb-movies2/7").glob(".*.tmp")
+        )
+        self.assertEqual([], temporary_files)
+
+    def test_atomic_replace_preserves_existing_override_mode(self):
+        original = complete_movie(overview="")
+        path = self.write_json("override", "tmdb-movies2/7/all.json", original)
+        path.chmod(0o640)
+        self.write_json("cache", "tmdb-movies2/7/all.json", complete_movie())
+        self.db_rows[("7", "Movie")] = {"overview": "数据库简介"}
+
+        self.service().execute("movie")
+
+        self.assertEqual(0o640, stat.S_IMODE(path.stat().st_mode))
+
+    def test_new_override_inherits_cache_mode(self):
+        cache = self.write_json(
+            "cache", "tmdb-movies2/7/all.json", complete_movie()
+        )
+        cache.chmod(0o644)
+
+        self.service().execute("movie")
+
+        override = self.root / "override/tmdb-movies2/7/all.json"
+        self.assertEqual(0o644, stat.S_IMODE(override.stat().st_mode))
 
     def test_atomic_replace_failure_preserves_original_override(self):
         original = complete_movie(overview="")

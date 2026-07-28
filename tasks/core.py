@@ -11,8 +11,7 @@ import task_manager
 
 # 导入各个模块的任务函数
 from .actors import (task_sync_person_map, task_enrich_aliases, task_actor_translation, 
-                     task_process_actor_subscriptions, task_merge_duplicate_actors,
-                     task_scan_ghost_actor_candidates)
+                     task_process_actor_subscriptions, task_scan_ghost_actor_candidates)
 from .media import task_role_translation, task_populate_metadata_cache, task_sync_ratings_to_emby, task_execute_auto_tagging_rules, task_scan_monitor_folders, task_restore_local_cache_from_db, task_scan_incomplete_assets 
 from .watchlist import task_process_watchlist, task_refresh_completed_series, task_scan_old_seasons_backfill, task_add_all_series_to_watchlist
 from .custom_collections import task_process_all_custom_collections, process_single_custom_collection

@@ -558,6 +558,7 @@ class PersonCleanupSafetyTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
         }
         for function_name in (
+            'task_merge_duplicate_actors',
             '_disabled_legacy_task_purge_ghost_actors',
             '_disabled_legacy_task_purge_unregistered_actors',
         ):
@@ -566,6 +567,8 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         registry_source = (repo_root / 'tasks' / 'core.py').read_text()
         self.assertNotIn("'purge-ghost-actors':", registry_source)
         self.assertNotIn("'purge-unregistered-actors':", registry_source)
+        self.assertNotIn("'merge-duplicate-actors':", registry_source)
+        self.assertNotIn('task_merge_duplicate_actors,', registry_source)
 
     def test_manual_verification_never_calls_person_delete_api(self):
         repo_root = Path(__file__).resolve().parents[1]

@@ -3,12 +3,53 @@
 import requests
 import json
 import logging
+import threading
 from typing import Dict, Any, Optional
 
 import handler.tmdb as tmdb
 import constants
 
 logger = logging.getLogger(__name__)
+
+_SUBSCRIPTION_LOCKS_GUARD = threading.Lock()
+_SUBSCRIPTION_LOCKS = {}
+
+
+def _subscription_lock_key(
+    config: Dict[str, Any],
+    tmdb_id: Any,
+    season: Optional[int],
+) -> str:
+    base_url = str(
+        config.get(constants.CONFIG_OPTION_MOVIEPILOT_URL, "") or ""
+    ).rstrip("/")
+    if season is None:
+        season_key = "all"
+    else:
+        try:
+            season_key = str(int(season))
+        except (TypeError, ValueError):
+            season_key = str(season).strip()
+    return f"{base_url}|tmdb:{str(tmdb_id).strip()}|season:{season_key}"
+
+
+def _acquire_subscription_lock(key: str):
+    with _SUBSCRIPTION_LOCKS_GUARD:
+        entry = _SUBSCRIPTION_LOCKS.get(key)
+        if entry is None:
+            entry = {"lock": threading.Lock(), "users": 0}
+            _SUBSCRIPTION_LOCKS[key] = entry
+        entry["users"] += 1
+    entry["lock"].acquire()
+    return entry
+
+
+def _release_subscription_lock(key: str, entry) -> None:
+    entry["lock"].release()
+    with _SUBSCRIPTION_LOCKS_GUARD:
+        entry["users"] -= 1
+        if entry["users"] == 0 and _SUBSCRIPTION_LOCKS.get(key) is entry:
+            _SUBSCRIPTION_LOCKS.pop(key, None)
 
 # ======================================================================
 # 核心基础函数 (Token管理与API请求)
@@ -31,7 +72,12 @@ def _get_access_token(config: Dict[str, Any]) -> Optional[str]:
         login_data = {"username": mp_username, "password": mp_password}
         
         # 设置超时
-        login_response = requests.post(login_url, data=login_data, timeout=10)
+        login_response = requests.post(
+            login_url,
+            data=login_data,
+            timeout=10,
+            allow_redirects=False,
+        )
         login_response.raise_for_status()
         
         return login_response.json().get("access_token")
@@ -44,6 +90,10 @@ def subscribe_with_custom_payload(payload: dict, config: Dict[str, Any]) -> bool
     【核心订阅函数】直接接收一个完整的订阅 payload 并提交。
     所有其他订阅函数最终都应调用此函数。
     """
+    tmdb_id = payload.get("tmdbid")
+    season = payload.get("season")
+    lock_key = _subscription_lock_key(config, tmdb_id, season)
+    lock_entry = _acquire_subscription_lock(lock_key)
     try:
         moviepilot_url = config.get(constants.CONFIG_OPTION_MOVIEPILOT_URL, '').rstrip('/')
         access_token = _get_access_token(config)
@@ -56,22 +106,28 @@ def subscribe_with_custom_payload(payload: dict, config: Dict[str, Any]) -> bool
 
         logger.trace(f"  ➜ 最终发送给 MoviePilot 的 Payload: {json.dumps(payload, ensure_ascii=False)}")
         
-        sub_response = requests.post(subscribe_url, headers=subscribe_headers, json=payload, timeout=60)
+        sub_response = requests.post(
+            subscribe_url,
+            headers=subscribe_headers,
+            json=payload,
+            timeout=60,
+            allow_redirects=False,
+        )
         
         if sub_response.status_code in [200, 201, 204]:
             logger.info(f"  ✅ MoviePilot 已接受订阅任务。")
             return True
         else:
-            # 尝试解析错误信息
-            try:
-                err_msg = sub_response.json().get('detail') or sub_response.text
-            except:
-                err_msg = sub_response.text
-            logger.error(f"  ➜ 失败！MoviePilot 返回错误: {sub_response.status_code} - {err_msg}")
+            logger.error(
+                "  ➜ MoviePilot 订阅失败，HTTP %s。",
+                sub_response.status_code,
+            )
             return False
     except Exception as e:
         logger.error(f"  ➜ 使用自定义Payload订阅到MoviePilot时发生错误: {e}", exc_info=True)
         return False
+    finally:
+        _release_subscription_lock(lock_key, lock_entry)
 
 def cancel_subscription(tmdb_id: str, item_type: str, config: Dict[str, Any], season: Optional[int] = None) -> bool:
     """
@@ -98,8 +154,16 @@ def cancel_subscription(tmdb_id: str, item_type: str, config: Dict[str, Any], se
             season_log = f" Season {target_season}" if target_season is not None else ""
             logger.info(f"  ➜ 正在向 MoviePilot 发送取消订阅请求: {media_id_for_api}{season_log}")
 
+            lock_key = _subscription_lock_key(config, tmdb_id, target_season)
+            lock_entry = _acquire_subscription_lock(lock_key)
             try:
-                response = requests.delete(cancel_url, headers=headers, params=params, timeout=30)
+                response = requests.delete(
+                    cancel_url,
+                    headers=headers,
+                    params=params,
+                    timeout=30,
+                    allow_redirects=False,
+                )
                 if response.status_code in [200, 204]:
                     logger.info(f"  ✅ MoviePilot 已成功取消订阅: {media_id_for_api}{season_log}")
                     return True
@@ -107,11 +171,16 @@ def cancel_subscription(tmdb_id: str, item_type: str, config: Dict[str, Any], se
                     logger.info(f"  ✅ MoviePilot 中未找到订阅 {media_id_for_api}{season_log}，无需取消。")
                     return True
                 else:
-                    logger.error(f"  ➜ MoviePilot 取消订阅失败！API 返回: {response.status_code} - {response.text}")
+                    logger.error(
+                        "  ➜ MoviePilot 取消订阅失败，HTTP %s。",
+                        response.status_code,
+                    )
                     return False
             except Exception as req_e:
                 logger.error(f"  ➜ 请求 MoviePilot API 发生异常: {req_e}")
                 return False
+            finally:
+                _release_subscription_lock(lock_key, lock_entry)
 
         # --- 逻辑分支 ---
 
@@ -205,7 +274,7 @@ def get_subscription_details(
             return None
         if lookup.status_code != 200:
             raise MoviePilotSubscriptionLookupError(
-                f"订阅查询失败: {lookup.status_code} - {lookup.text}"
+                f"订阅查询失败: HTTP {lookup.status_code}"
             )
 
         lookup_data = lookup.json()
@@ -223,7 +292,7 @@ def get_subscription_details(
         )
         if detail.status_code != 200:
             raise MoviePilotSubscriptionLookupError(
-                f"订阅详情查询失败: {detail.status_code} - {detail.text}"
+                f"订阅详情查询失败: HTTP {detail.status_code}"
             )
 
         detail_data = detail.json()
@@ -342,15 +411,18 @@ def update_subscription_status(
     total_episodes: Optional[int] = None,
     subscription_details: Optional[Dict[str, Any]] = None,
 ) -> bool:
+    lock_key = _subscription_lock_key(config, tmdb_id, season)
+    lock_entry = _acquire_subscription_lock(lock_key)
     try:
-        details = subscription_details
-        if details is None:
-            details = get_subscription_details(
-                str(tmdb_id),
-                "Series" if season is not None else "Movie",
-                config,
-                season=season,
-            )
+        # Always re-read under the per-subscription lock.  A payload fetched by
+        # the caller before lock acquisition can become stale while another task
+        # updates the same subscription, defeating GET/compare/PUT idempotency.
+        details = get_subscription_details(
+            str(tmdb_id),
+            "Series" if season is not None else "Movie",
+            config,
+            season=season,
+        )
         if not isinstance(details, dict) or not details.get("id"):
             return False
 
@@ -437,11 +509,12 @@ def update_subscription_status(
                         headers=headers,
                         json=payload,
                         timeout=10,
+                        allow_redirects=False,
                     )
                     if response.status_code not in (200, 204):
                         logger.warning(
-                            f"  ➜ 更新 MoviePilot 总集数失败: "
-                            f"{response.status_code} - {response.text}"
+                            "  ➜ 更新 MoviePilot 总集数失败，HTTP %s。",
+                            response.status_code,
                         )
                         success = False
                     else:
@@ -456,11 +529,12 @@ def update_subscription_status(
                 headers=headers,
                 params={"state": target_state},
                 timeout=10,
+                allow_redirects=False,
             )
             if response.status_code not in (200, 204):
                 logger.warning(
-                    f"  ➜ 更新 MoviePilot 状态失败: "
-                    f"{response.status_code} - {response.text}"
+                    "  ➜ 更新 MoviePilot 状态失败，HTTP %s。",
+                    response.status_code,
                 )
                 success = False
             else:
@@ -478,6 +552,8 @@ def update_subscription_status(
     except Exception as exc:
         logger.error(f"  ➜ 调用 MoviePilot 更新接口出错: {exc}")
         return False
+    finally:
+        _release_subscription_lock(lock_key, lock_entry)
     
 def delete_transfer_history(tmdb_id: str, season: int, title: str, config: Dict[str, Any]) -> list:
     """
@@ -565,7 +641,14 @@ def delete_transfer_history(tmdb_id: str, season: int, title: str, config: Dict[
                 if rec_hash:
                     collected_hashes.append(rec_hash)
 
-                del_res = requests.delete(delete_url, headers=headers, params=del_params, json=rec, timeout=15)
+                del_res = requests.delete(
+                    delete_url,
+                    headers=headers,
+                    params=del_params,
+                    json=rec,
+                    timeout=15,
+                    allow_redirects=False,
+                )
                 if del_res.status_code == 200:
                     deleted_count += 1
             except: pass
@@ -607,7 +690,12 @@ def delete_download_tasks(keyword: str, config: Dict[str, Any], hashes: list = N
             del_url = f"{moviepilot_url}/api/v1/download/{task_hash}"
             try:
                 # 只有这里才是真正执行删除的地方
-                del_res = requests.delete(del_url, headers=headers, timeout=10)
+                del_res = requests.delete(
+                    del_url,
+                    headers=headers,
+                    timeout=10,
+                    allow_redirects=False,
+                )
                 if del_res.status_code == 200:
                     logger.info(f" 🗑️ [下载器清理] 已精确删除任务 Hash: {task_hash[:8]}...")
                     deleted_count += 1

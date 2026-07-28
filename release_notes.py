@@ -9,11 +9,11 @@ CUSTOM_RELEASES = [
 
 - 以神医助手 Pro 的 `/STRM/HC/cache` 与 `/STRM/HC/override` 为唯一文件数据层，为电影、剧集、季和分集增加字段级缺失预览及批量补齐 API。
 - 严格按 Emby 锁定字段、现有 override、EVH 数据库、神医原始 TMDb 缓存的优先级只填空值；不会用空字符串、空 JSON、零评分或占位日期覆盖已有数据。
-- override 只从完整神医缓存基底创建；已有文件采用进程锁、mtime/大小/SHA-256 复核、同目录临时文件、`fsync` 与原子替换，拒绝路径穿越和符号链接逃逸。
+- override 只从完整神医缓存基底创建；已有文件采用进程锁、mtime/大小/SHA-256 复核并继承来源文件权限/可读身份，再以同目录临时文件、`fsync` 与原子替换写入，拒绝路径穿越和符号链接逃逸。
 - PostgreSQL 使用专用选择性写入，只更新当前仍为空的允许字段；官方分级与自定义分级保持隔离，无破坏性数据库迁移。
-- Emby 只提交单 item、`Recursive=false`、不替换元数据、不替换图片且不解锁的神医 Provider 刷新；非幂等 POST 不再由共享 HTTP 会话自动重放。
-- STRM 收录查询不再请求 `MediaSources`，避免意外触发神医 ffprobe/dffmpeg；旧的分身演员合并删除入口已停用，人物安全闭环保持失败关闭。
-- 不读取或修改 MediaInfo JSON，不处理人物、演员、图片、MoviePilot、115、向量或完整媒体库刷新。
+- Emby 只提交单 item、`Recursive=false`、不替换元数据、不替换图片且不解锁的神医 Provider 刷新；刷新意图持久化，POST 禁止自动重试和重定向重放，5xx/连接异常按不确定结果冷却处理。
+- STRM 收录查询不再请求 `MediaSources`，避免意外触发神医 ffprobe/dffmpeg；实时事件任务改为有界执行器；旧的分身演员合并删除从注册、导入和函数入口三层停用。
+- MoviePilot 同订阅写操作增加串行锁、变更前回读和失败日志脱敏；安全回填本身仍不读取或修改 MediaInfo JSON，也不处理人物、演员、图片、MoviePilot、115、向量或完整媒体库刷新。
 
 """,
     },

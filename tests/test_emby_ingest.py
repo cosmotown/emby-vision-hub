@@ -372,8 +372,11 @@ class EmbyIngestTests(unittest.TestCase):
 
     def test_realtime_queue_keeps_all_paths_for_emby(self):
         source = (Path(__file__).resolve().parents[1] / "monitor_service.py").read_text(encoding="utf-8")
-        self.assertIn("args=(processor, files_to_scrape)", source)
-        self.assertNotIn("args=(processor, representative_files)", source)
+        self.assertIn(
+            "_submit_monitor_task(_handle_batch_file_task, processor, files_to_scrape)",
+            source,
+        )
+        self.assertNotIn("representative_files", source)
 
     @mock.patch("services.emby_ingest.emby.get_media_item_by_path")
     def test_confirmed_items_are_deduplicated_by_emby_id(self, get_item):
@@ -738,6 +741,24 @@ class EmbyIngestTests(unittest.TestCase):
 
 
 class EmbyHttpValidationTests(unittest.TestCase):
+    @mock.patch("handler.emby.emby_client.session.request")
+    def test_shared_mutation_client_disables_redirect_following(self, request):
+        request.return_value = mock.Mock(status_code=204)
+
+        emby.emby_client.post("http://emby/mutation", json={"x": 1})
+
+        self.assertFalse(request.call_args.kwargs["allow_redirects"])
+        self.assertEqual(1, request.call_count)
+
+    @mock.patch("handler.emby.requests.post")
+    def test_post_once_disables_redirect_following(self, post):
+        post.return_value = mock.Mock(status_code=307)
+
+        emby.emby_client.post_once("http://emby/mutation", json={"x": 1})
+
+        self.assertFalse(post.call_args.kwargs["allow_redirects"])
+        self.assertEqual(1, post.call_count)
+
     @mock.patch("handler.emby.emby_client.get")
     def test_catalog_item_id_lookup_is_exact_and_lightweight(self, get):
         response = mock.Mock()
@@ -936,12 +957,25 @@ class EmbyHttpValidationTests(unittest.TestCase):
         self.assertEqual({"X-Emby-Token": "token"}, post_once.call_args.kwargs["headers"])
 
     @mock.patch("handler.emby.emby_client.post_once")
-    def test_metadata_backfill_refresh_reports_http_failure_for_explicit_retry(
+    def test_metadata_backfill_refresh_gateway_error_is_ambiguous(
         self, post_once
     ):
-        response = mock.Mock(status_code=500)
-        response.raise_for_status.side_effect = emby.requests.HTTPError("500")
-        post_once.return_value = response
+        post_once.return_value = mock.Mock(status_code=502)
+
+        outcome = emby.refresh_metadata_backfill_item(
+            "episode-1", "http://emby", "token", detailed=True
+        )
+
+        self.assertEqual(
+            {"outcome": "ambiguous", "submitted": None}, outcome
+        )
+        self.assertEqual(1, post_once.call_count)
+
+    @mock.patch("handler.emby.emby_client.post_once")
+    def test_metadata_backfill_refresh_redirect_is_rejected_without_following(
+        self, post_once
+    ):
+        post_once.return_value = mock.Mock(status_code=307)
 
         outcome = emby.refresh_metadata_backfill_item(
             "episode-1", "http://emby", "token", detailed=True
@@ -949,6 +983,36 @@ class EmbyHttpValidationTests(unittest.TestCase):
 
         self.assertEqual(
             {"outcome": "http_failed", "submitted": False}, outcome
+        )
+        self.assertEqual(1, post_once.call_count)
+
+    @mock.patch("handler.emby.emby_client.post_once")
+    def test_metadata_backfill_refresh_client_error_is_definite_failure(
+        self, post_once
+    ):
+        post_once.return_value = mock.Mock(status_code=400)
+
+        outcome = emby.refresh_metadata_backfill_item(
+            "episode-1", "http://emby", "token", detailed=True
+        )
+
+        self.assertEqual(
+            {"outcome": "http_failed", "submitted": False}, outcome
+        )
+        self.assertEqual(1, post_once.call_count)
+
+    @mock.patch("handler.emby.emby_client.post_once")
+    def test_metadata_backfill_refresh_connection_error_is_ambiguous(
+        self, post_once
+    ):
+        post_once.side_effect = emby.requests.ConnectionError("connection reset")
+
+        outcome = emby.refresh_metadata_backfill_item(
+            "episode-1", "http://emby", "token", detailed=True
+        )
+
+        self.assertEqual(
+            {"outcome": "ambiguous", "submitted": None}, outcome
         )
         self.assertEqual(1, post_once.call_count)
 

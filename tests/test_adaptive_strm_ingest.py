@@ -134,6 +134,31 @@ class AdaptiveStrmIngestTests(unittest.TestCase):
         )
         processor.enqueue_confirmed_ingest_postprocessing.assert_called_once_with([path])
 
+    def test_monitor_background_work_uses_fixed_worker_pool(self):
+        self.assertEqual(4, monitor_service._MONITOR_TASK_EXECUTOR._max_workers)
+
+        path = self._path(1)
+        processor = object()
+        with mock.patch.object(
+            monitor_service,
+            '_register_adaptive_refresh_paths',
+            return_value=([path], []),
+        ), mock.patch.object(
+            monitor_service,
+            '_submit_monitor_task',
+        ) as submit, mock.patch.object(
+            monitor_service,
+            '_ensure_adaptive_refresh_worker',
+        ):
+            monitor_service._enqueue_adaptive_refresh_only(processor, [path])
+
+        submit.assert_called_once_with(
+            monitor_service._handle_batch_refresh_only_task,
+            processor,
+            [path],
+            bulk_mode=False,
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

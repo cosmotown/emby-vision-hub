@@ -675,6 +675,12 @@ def task_actor_translation(processor):
         task_manager.update_status_from_thread(-1, f"任务失败: {e}")
 
 def task_merge_duplicate_actors(processor):
+    raise RuntimeError(
+        "分身演员合并任务已禁用：其删除链尚未接入人物安全闭环"
+    )
+
+
+def _disabled_legacy_task_merge_duplicate_actors(processor):
     """
     【高危 V2.1 - 修正版】
     - 扫描 Emby 中所有演员，找出拥有相同 TMDb ID 的“分身”演员。

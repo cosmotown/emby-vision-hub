@@ -75,6 +75,9 @@ class EmbyAPIClient:
         # 自动注入超时，如果未指定
         if 'timeout' not in kwargs:
             kwargs['timeout'] = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60)
+        if str(method).upper() not in {"GET", "HEAD", "OPTIONS", "TRACE"}:
+            # Do not let requests replay a mutation through a 307/308 redirect.
+            kwargs.setdefault('allow_redirects', False)
 
         with self.semaphore:
             try:
@@ -94,11 +97,14 @@ class EmbyAPIClient:
         return self.request("POST", url, **kwargs)
 
     def post_once(self, url, **kwargs):
-        """Submit a non-idempotent POST without the shared automatic retry policy."""
+        """Submit one non-idempotent POST without retries or redirect replay."""
         if 'timeout' not in kwargs:
             kwargs['timeout'] = config_manager.APP_CONFIG.get(
                 constants.CONFIG_OPTION_EMBY_API_TIMEOUT, 60
             )
+        # Requests follows POST redirects by default.  A 307/308 can replay the
+        # body, so mutation endpoints must surface redirects to the caller.
+        kwargs.setdefault('allow_redirects', False)
         with self.semaphore:
             return requests.post(url, **kwargs)
 
@@ -1239,16 +1245,35 @@ def refresh_metadata_backfill_item(
             },
             headers={"X-Emby-Token": api_key},
         )
-        response.raise_for_status()
-        submitted = response.status_code in (200, 204)
-        if detailed:
-            return {
-                "outcome": "submitted" if submitted else "http_failed",
-                "submitted": submitted,
-                "status_code": response.status_code,
-            }
-        return submitted
-    except requests.Timeout as exc:
+        status_code = int(response.status_code)
+        if 200 <= status_code < 300:
+            if detailed:
+                return {
+                    "outcome": "submitted",
+                    "submitted": True,
+                    "status_code": status_code,
+                }
+            return True
+        if 500 <= status_code < 600:
+            # A gateway/application error may be emitted after Emby accepted or
+            # queued the refresh.  Treat it as unknown delivery, never as proof
+            # that an immediate second POST is safe.
+            logger.warning(
+                "神医元数据补齐刷新结果不确定 (ItemID: %s, HTTP %s)",
+                normalized_id,
+                status_code,
+            )
+            return {"outcome": "ambiguous", "submitted": None} if detailed else False
+        # Redirects are not followed and 3xx/4xx are definite rejection results.
+        logger.warning(
+            "神医元数据补齐的最小刷新被拒绝 (ItemID: %s, HTTP %s)",
+            normalized_id,
+            status_code,
+        )
+        return {"outcome": "http_failed", "submitted": False} if detailed else False
+    except requests.RequestException as exc:
+        # Timeouts, proxy/TLS failures, connection resets and truncated responses
+        # can all happen after the server received the mutation.
         logger.warning(
             "神医元数据补齐刷新结果不确定 (ItemID: %s, %s)",
             normalized_id,

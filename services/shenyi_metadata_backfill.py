@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -31,6 +32,7 @@ from metadata_contracts import (
 
 ALLOWED_TYPES = {"Movie", "Series", "Season", "Episode"}
 IDENTITY_KEYS = {"id", "season_number", "episode_number"}
+REFRESH_STORE_SETTING_KEY = "metadata_backfill_refresh_records_v1"
 
 
 def _positive_id(value: Any) -> str:
@@ -80,6 +82,52 @@ def _json_object(path: Path) -> Optional[Dict[str, Any]]:
     if not isinstance(value, dict):
         raise ValueError("神医 JSON 根节点必须为对象")
     return value
+
+
+def _apply_source_file_identity(fd: int, source_path: Path) -> None:
+    """Preserve source mode and ownership where possible before atomic replace.
+
+    ``mkstemp`` intentionally creates a private file (normally 0600).  Replacing a
+    Shenyi cache/override with that inode can make the JSON unreadable to a
+    provider running under a different UID.  Preserve the source mode, try to
+    preserve its owner/group, and fail closed when the resulting inode would no
+    longer be readable through any identity class that could read the source.
+    """
+    source_stat = source_path.stat(follow_symlinks=False)
+    source_mode = stat.S_IMODE(source_stat.st_mode)
+
+    temporary_stat = os.fstat(fd)
+    if temporary_stat.st_gid != source_stat.st_gid:
+        try:
+            os.fchown(fd, -1, source_stat.st_gid)
+        except PermissionError:
+            pass
+    temporary_stat = os.fstat(fd)
+    if temporary_stat.st_uid != source_stat.st_uid:
+        try:
+            os.fchown(fd, source_stat.st_uid, -1)
+        except PermissionError:
+            pass
+
+    # Apply the mode after chown because some platforms clear special bits when
+    # ownership changes.  Only permission bits are copied, never file type bits.
+    os.fchmod(fd, source_mode)
+    temporary_stat = os.fstat(fd)
+    remains_readable = (
+        (
+            temporary_stat.st_uid == source_stat.st_uid
+            and bool(source_mode & stat.S_IRUSR)
+        )
+        or (
+            temporary_stat.st_gid == source_stat.st_gid
+            and bool(source_mode & stat.S_IRGRP)
+        )
+        or bool(source_mode & stat.S_IROTH)
+    )
+    if not remains_readable:
+        raise PermissionError(
+            "无法在原子替换时保留神医 JSON 的可读身份，已安全放弃写入"
+        )
 
 
 COMPLETE_CACHE_KEYS = {
@@ -340,13 +388,19 @@ class ShenyiStore:
                 payload = json.dumps(
                     current, ensure_ascii=False, indent=2, sort_keys=True
                 ).encode("utf-8")
+                permission_source = (
+                    override_path if current_fingerprint else location.cache_path
+                )
                 fd, temporary = tempfile.mkstemp(
                     prefix=f".{override_path.name}.",
                     suffix=".tmp",
                     dir=str(override_path.parent),
                 )
                 try:
-                    with os.fdopen(fd, "wb") as handle:
+                    _apply_source_file_identity(fd, permission_source)
+                    handle = os.fdopen(fd, "wb")
+                    fd = -1
+                    with handle:
                         handle.write(payload)
                         handle.flush()
                         os.fsync(handle.fileno())
@@ -363,6 +417,11 @@ class ShenyiStore:
                         os.close(directory_fd)
                     return (["__created__"] if created else []) + changed
                 except Exception:
+                    if fd >= 0:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
                     try:
                         os.unlink(temporary)
                     except FileNotFoundError:
@@ -479,12 +538,18 @@ class ShenyiMetadataBackfillService:
         fill_db: Optional[Callable[..., List[str]]] = None,
         get_tmdb_by_emby: Optional[Callable[[str], Optional[str]]] = None,
         refresh: Optional[Callable[..., bool]] = None,
+        get_refresh_store: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
+        save_refresh_store: Optional[Callable[[Dict[str, Any]], None]] = None,
         provider_settle_delay: float = 0.5,
         verification_delays: Tuple[float, ...] = (0.1, 0.4, 1.0),
         ambiguous_cooldown: float = 60.0,
         sleep: Callable[[float], None] = time.sleep,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = time.time,
     ):
+        uses_runtime_defaults = any(
+            dependency is None
+            for dependency in (get_item, get_db, fill_db, get_tmdb_by_emby, refresh)
+        )
         if get_item is None or refresh is None:
             import handler.emby as emby
 
@@ -502,6 +567,18 @@ class ShenyiMetadataBackfillService:
             get_tmdb_by_emby = (
                 get_tmdb_by_emby or media_db.get_tmdb_id_from_emby_id
             )
+        if (get_refresh_store is None) != (save_refresh_store is None):
+            raise ValueError("刷新状态存储必须同时提供读取和写入函数")
+        if get_refresh_store is None and uses_runtime_defaults:
+            from database import settings_db
+
+            get_refresh_store = lambda: settings_db.get_setting(
+                REFRESH_STORE_SETTING_KEY
+            )
+            save_refresh_store = lambda value: settings_db.save_setting(
+                REFRESH_STORE_SETTING_KEY, value
+            )
+
         self.store = ShenyiStore(local_data_path)
         self.base_url = base_url
         self.api_key = api_key
@@ -511,6 +588,8 @@ class ShenyiMetadataBackfillService:
         self.fill_db = fill_db
         self.get_tmdb_by_emby = get_tmdb_by_emby
         self.refresh = refresh
+        self.get_refresh_store = get_refresh_store
+        self.save_refresh_store = save_refresh_store
         self.provider_settle_delay = max(float(provider_settle_delay), 0.0)
         self.verification_delays = verification_delays
         self.ambiguous_cooldown = max(float(ambiguous_cooldown), 0.0)
@@ -541,11 +620,36 @@ class ShenyiMetadataBackfillService:
                 cls._item_locks.pop(item_id, None)
 
     def _refresh_key(self, item_id: str) -> str:
-        return f"{self.store.root}:{item_id}"
+        identity = (
+            f"{self.base_url.rstrip('/')}|{self.store.root}|{item_id}"
+        ).encode("utf-8")
+        return hashlib.sha256(identity).hexdigest()
+
+    @staticmethod
+    def _ordered_refresh_records(value: Any) -> "OrderedDict[str, Dict[str, Any]]":
+        if value is None:
+            return OrderedDict()
+        if not isinstance(value, dict):
+            raise RuntimeError("持久化刷新状态格式无效，已拒绝提交刷新")
+        valid = [
+            (str(key), dict(record))
+            for key, record in value.items()
+            if isinstance(record, dict)
+        ]
+        valid.sort(key=lambda entry: float(entry[1].get("updated_at") or 0))
+        return OrderedDict(valid)
 
     def _get_refresh_record(self, item_id: str) -> Optional[Dict[str, Any]]:
         key = self._refresh_key(item_id)
         with self._refresh_guard:
+            if self.get_refresh_store is not None:
+                records = self._ordered_refresh_records(self.get_refresh_store())
+                record = records.get(key)
+                if record is not None:
+                    self._refresh_records[key] = dict(record)
+                    self._refresh_records.move_to_end(key)
+                    return dict(record)
+                return None
             record = self._refresh_records.get(key)
             if record is not None:
                 self._refresh_records.move_to_end(key)
@@ -555,10 +659,23 @@ class ShenyiMetadataBackfillService:
     def _set_refresh_record(self, item_id: str, **values: Any) -> Dict[str, Any]:
         key = self._refresh_key(item_id)
         with self._refresh_guard:
-            record = dict(self._refresh_records.get(key) or {})
+            if self.get_refresh_store is not None:
+                records = self._ordered_refresh_records(self.get_refresh_store())
+                record = dict(records.get(key) or {})
+            else:
+                records = self._refresh_records
+                record = dict(records.get(key) or {})
             record.update(values)
             record["updated_at"] = self.clock()
-            self._refresh_records[key] = record
+            records[key] = record
+            records.move_to_end(key)
+            while len(records) > self._refresh_record_limit:
+                records.popitem(last=False)
+            if self.save_refresh_store is not None:
+                # Persist before returning.  A failure here prevents a POST from
+                # being issued without a durable replay guard.
+                self.save_refresh_store(dict(records))
+            self._refresh_records[key] = dict(record)
             self._refresh_records.move_to_end(key)
             while len(self._refresh_records) > self._refresh_record_limit:
                 self._refresh_records.popitem(last=False)
@@ -825,9 +942,12 @@ class ShenyiMetadataBackfillService:
         }
 
     def preview(self, item_id: str) -> Dict[str, Any]:
-        plan = self._analyze(str(item_id or "").strip())
+        normalized_id = str(item_id or "").strip()
+        plan = self._analyze(normalized_id)
         result = self._public_result(plan)
         would_update = bool(plan["file_fill"] or plan["db_fill"])
+        record = self._get_refresh_record(normalized_id) or {}
+        first_provider_submission = bool(plan["changes"] and not record)
         result["status"] = (
             "would_update"
             if would_update
@@ -835,7 +955,7 @@ class ShenyiMetadataBackfillService:
         )
         result["would_write_file"] = bool(plan["file_fill"])
         result["would_write_database"] = sorted(plan["db_fill"])
-        result["would_refresh"] = would_update
+        result["would_refresh"] = bool(would_update or first_provider_submission)
         return result
 
     def _verify_refresh(
@@ -913,7 +1033,7 @@ class ShenyiMetadataBackfillService:
     def _submit_refresh(self, item_id: str) -> str:
         try:
             outcome = self.refresh(item_id, self.base_url, self.api_key)
-        except (requests.Timeout, TimeoutError):
+        except (requests.RequestException, TimeoutError):
             return "ambiguous"
         except Exception:
             return "http_failed"
@@ -939,22 +1059,21 @@ class ShenyiMetadataBackfillService:
         if item_lock is None:
             return {"item_id": normalized_id, "status": "duplicate_in_progress"}
         try:
-            # Re-read every source after lock acquisition. A retry first checks
-            # provider state and never repeats a mutation automatically.
+            # Re-read every source after lock acquisition.  Every mutation intent
+            # is durably recorded before the single POST so a restart cannot turn
+            # an unknown delivery into an automatic replay.
             plan = self._analyze(normalized_id)
             public = self._public_result(plan)
+            record = self._get_refresh_record(normalized_id) or {}
+            remembered_fields = list(record.get("fields") or [])
+
             if not plan["changes"]:
-                record = self._get_refresh_record(normalized_id) or {}
-                remembered_fields = list(record.get("fields") or [])
-                if (
-                    record.get("state")
-                    in {
-                        "source_updated",
-                        "refresh_submitted",
-                        "refresh_ambiguous",
-                    }
-                    and remembered_fields
-                ):
+                if remembered_fields and record.get("state") in {
+                    "source_updated",
+                    "refresh_pending",
+                    "refresh_submitted",
+                    "refresh_ambiguous",
+                }:
                     verification = self._verify_refresh(
                         normalized_id,
                         plan["item_type"],
@@ -966,6 +1085,7 @@ class ShenyiMetadataBackfillService:
                             normalized_id,
                             state="provider_confirmed",
                             root_key=lock_id,
+                            ambiguous_until=0,
                         )
                         return self._state_result(
                             public,
@@ -973,8 +1093,18 @@ class ShenyiMetadataBackfillService:
                             states=["provider_confirmed"],
                             verification=verification,
                         )
+                state = str(record.get("state") or "unchanged")
+                if state in {"source_updated", "refresh_pending"}:
+                    state = "refresh_ambiguous"
+                if state in {
+                    "refresh_submitted",
+                    "refresh_failed",
+                    "refresh_ambiguous",
+                }:
+                    return self._state_result(public, state, states=[state])
                 return self._state_result(public, "unchanged", states=[])
 
+            fields = [change["field"] for change in plan["changes"]]
             file_fields = []
             if plan["file_fill"]:
                 file_fields = self.store.merge_override(
@@ -989,11 +1119,12 @@ class ShenyiMetadataBackfillService:
             source_updated = bool(file_fields or database_fields)
             states = ["source_updated"] if source_updated else []
             if source_updated:
-                self._set_refresh_record(
+                record = self._set_refresh_record(
                     normalized_id,
                     state="source_updated",
                     root_key=lock_id,
-                    fields=[change["field"] for change in plan["changes"]],
+                    fields=fields,
+                    ambiguous_until=self.clock() + self.ambiguous_cooldown,
                 )
             else:
                 read_only_verification = self._verify_refresh(
@@ -1007,6 +1138,8 @@ class ShenyiMetadataBackfillService:
                         normalized_id,
                         state="provider_confirmed",
                         root_key=lock_id,
+                        fields=fields,
+                        ambiguous_until=0,
                     )
                     return self._state_result(
                         public,
@@ -1022,63 +1155,71 @@ class ShenyiMetadataBackfillService:
                         states=["refresh_submitted"],
                         verification=read_only_verification,
                     )
-                if not explicit_retry:
-                    remembered = record.get("state")
-                    state = (
-                        remembered
-                        if remembered
-                        in {
-                            "refresh_submitted",
-                            "refresh_failed",
+                # With no record, the sources pre-dated EVH's first run.  Record
+                # an intent below and allow exactly one initial provider refresh.
+                if record:
+                    remembered = str(record.get("state") or "")
+                    if not explicit_retry:
+                        state = (
+                            remembered
+                            if remembered in {"refresh_failed", "refresh_ambiguous"}
+                            else "refresh_ambiguous"
+                        )
+                        retry_after = None
+                        ambiguous_until = float(record.get("ambiguous_until") or 0)
+                        if state == "refresh_ambiguous" and self.clock() < ambiguous_until:
+                            retry_after = ambiguous_until - self.clock()
+                        return self._state_result(
+                            public,
+                            state,
+                            states=[state],
+                            verification=read_only_verification,
+                            retry_after_seconds=retry_after,
+                        )
+                    if record.get("explicit_retry_used") is True:
+                        state = (
+                            "refresh_failed"
+                            if remembered == "refresh_failed"
+                            else "refresh_ambiguous"
+                        )
+                        return self._state_result(
+                            public,
+                            state,
+                            states=[state],
+                            verification=read_only_verification,
+                        )
+                    ambiguous_until = float(record.get("ambiguous_until") or 0)
+                    if self.clock() < ambiguous_until:
+                        return self._state_result(
+                            public,
                             "refresh_ambiguous",
-                        }
-                        else "refresh_ambiguous"
-                    )
-                    return self._state_result(
-                        public,
-                        state,
-                        states=[state],
-                        verification=read_only_verification,
-                    )
-                if (
-                    record.get("state") == "refresh_failed"
-                    and record.get("explicit_retry_used") is True
-                ):
-                    return self._state_result(
-                        public,
-                        "refresh_failed",
-                        states=["refresh_failed"],
-                        verification=read_only_verification,
-                    )
-                ambiguous_until = float(record.get("ambiguous_until") or 0)
-                if (
-                    record.get("state") == "refresh_ambiguous"
-                    and self.clock() < ambiguous_until
-                ):
-                    return self._state_result(
-                        public,
-                        "refresh_ambiguous",
-                        states=["refresh_ambiguous"],
-                        verification=read_only_verification,
-                        retry_after_seconds=ambiguous_until - self.clock(),
-                    )
+                            states=["refresh_ambiguous"],
+                            verification=read_only_verification,
+                            retry_after_seconds=ambiguous_until - self.clock(),
+                        )
 
             if file_fields and self.provider_settle_delay > 0:
-                # Shenyi watches the override tree asynchronously. Give the
-                # provider one bounded visibility window before the single
-                # refresh POST; never compensate by replaying that mutation.
                 self.sleep(self.provider_settle_delay)
+
             retry_submission = bool(explicit_retry and not source_updated)
+            current_record = self._get_refresh_record(normalized_id) or record
+            self._set_refresh_record(
+                normalized_id,
+                state="refresh_pending",
+                root_key=lock_id,
+                fields=fields,
+                explicit_retry_used=bool(
+                    current_record.get("explicit_retry_used") or retry_submission
+                ),
+                ambiguous_until=self.clock() + self.ambiguous_cooldown,
+            )
             refresh_outcome = self._submit_refresh(normalized_id)
             if refresh_outcome == "http_failed":
-                record = self._get_refresh_record(normalized_id) or {}
                 self._set_refresh_record(
                     normalized_id,
                     state="refresh_failed",
                     root_key=lock_id,
-                    explicit_retry_used=bool(
-                        record.get("explicit_retry_used") or retry_submission
-                    ),
+                    ambiguous_until=0,
                 )
                 return self._state_result(
                     public,
@@ -1108,6 +1249,7 @@ class ShenyiMetadataBackfillService:
                 normalized_id,
                 state="refresh_submitted",
                 root_key=lock_id,
+                ambiguous_until=0,
             )
             verification = self._verify_refresh(
                 normalized_id, plan["item_type"], plan["changes"]
@@ -1118,6 +1260,7 @@ class ShenyiMetadataBackfillService:
                     normalized_id,
                     state="provider_confirmed",
                     root_key=lock_id,
+                    ambiguous_until=0,
                 )
                 state = "provider_confirmed"
             else:

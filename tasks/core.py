@@ -11,8 +11,7 @@ import task_manager
 
 # 导入各个模块的任务函数
 from .actors import (task_sync_person_map, task_enrich_aliases, task_actor_translation, 
-                     task_process_actor_subscriptions, task_merge_duplicate_actors,
-                     task_scan_ghost_actor_candidates)
+                     task_process_actor_subscriptions, task_scan_ghost_actor_candidates)
 from .media import task_role_translation, task_populate_metadata_cache, task_sync_ratings_to_emby, task_execute_auto_tagging_rules, task_scan_monitor_folders, task_restore_local_cache_from_db, task_scan_incomplete_assets 
 from .watchlist import task_process_watchlist, task_refresh_completed_series, task_scan_old_seasons_backfill, task_add_all_series_to_watchlist
 from .custom_collections import task_process_all_custom_collections, process_single_custom_collection
@@ -214,7 +213,9 @@ def get_task_registry(context: str = 'all'):
         'update-daily-theme': (task_update_daily_theme, "更新每日主题", 'media', False),
         'manual_subscribe_batch': (task_manual_subscribe_batch, "手动订阅处理", 'media', False),
         'scan_old_seasons_backfill': (task_scan_old_seasons_backfill, "扫描缺季的剧", 'watchlist', False),
-        'merge-duplicate-actors': (task_merge_duplicate_actors, "合并分身演员", 'media', False),
+        # The legacy merge task deletes Person items without the v7.2.7
+        # protected-library snapshot and final fail-closed reference check.
+        # Keep it unreachable until it is migrated to that safety closure.
         'scan-ghost-actors': (task_scan_ghost_actor_candidates, "扫描幽灵人物", 'media', False),
         'scan-organize-115': (task_scan_and_organize_115, "扫描115待整理目录", 'media', False),
     }

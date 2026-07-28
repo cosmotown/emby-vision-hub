@@ -134,6 +134,61 @@ class AdaptiveStrmIngestTests(unittest.TestCase):
         )
         processor.enqueue_confirmed_ingest_postprocessing.assert_called_once_with([path])
 
+    def test_monitor_background_work_uses_fixed_worker_pool(self):
+        self.assertEqual(4, monitor_service._MONITOR_TASK_EXECUTOR._max_workers)
+        self.assertEqual(64, monitor_service._MONITOR_TASK_SLOTS._initial_value)
+
+        path = self._path(1)
+        processor = object()
+        with mock.patch.object(
+            monitor_service,
+            '_register_adaptive_refresh_paths',
+            return_value=([path], []),
+        ), mock.patch.object(
+            monitor_service,
+            '_submit_monitor_task',
+        ) as submit, mock.patch.object(
+            monitor_service,
+            '_ensure_adaptive_refresh_worker',
+        ):
+            monitor_service._enqueue_adaptive_refresh_only(processor, [path])
+
+        submit.assert_called_once_with(
+            monitor_service._handle_batch_refresh_only_task,
+            processor,
+            [path],
+            bulk_mode=False,
+        )
+
+    def test_full_monitor_queue_applies_backpressure_before_submit(self):
+        slots = mock.Mock()
+        slots.acquire.side_effect = [False, True]
+        future = mock.Mock()
+        executor = mock.Mock()
+        executor.submit.return_value = future
+        target = mock.Mock()
+
+        with mock.patch.object(
+            monitor_service, "_MONITOR_TASK_SLOTS", slots
+        ), mock.patch.object(
+            monitor_service, "_MONITOR_TASK_EXECUTOR", executor
+        ), self.assertLogs(monitor_service.logger, level="WARNING"):
+            result = monitor_service._submit_monitor_task(
+                target, "value", flag=True
+            )
+
+        self.assertIs(future, result)
+        self.assertEqual(
+            [mock.call(blocking=False), mock.call()],
+            slots.acquire.call_args_list,
+        )
+        executor.submit.assert_called_once_with(
+            target, "value", flag=True
+        )
+        future.add_done_callback.assert_called_once_with(
+            monitor_service._log_monitor_task_result
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

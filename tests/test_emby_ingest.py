@@ -372,8 +372,11 @@ class EmbyIngestTests(unittest.TestCase):
 
     def test_realtime_queue_keeps_all_paths_for_emby(self):
         source = (Path(__file__).resolve().parents[1] / "monitor_service.py").read_text(encoding="utf-8")
-        self.assertIn("args=(processor, files_to_scrape)", source)
-        self.assertNotIn("args=(processor, representative_files)", source)
+        self.assertIn(
+            "_submit_monitor_task(_handle_batch_file_task, processor, files_to_scrape)",
+            source,
+        )
+        self.assertNotIn("representative_files", source)
 
     @mock.patch("services.emby_ingest.emby.get_media_item_by_path")
     def test_confirmed_items_are_deduplicated_by_emby_id(self, get_item):

@@ -5,6 +5,7 @@ import re
 import time
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Any
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -57,10 +58,39 @@ TERMINAL_RECHECK_BATCH_SIZE = 200
 _ADAPTIVE_REFRESH_LOCK = threading.Lock()
 _ADAPTIVE_REFRESH_STATES = {}
 _ADAPTIVE_REFRESH_WORKER = None
+_MONITOR_TASK_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix='evh-monitor-task',
+)
+_MONITOR_TASK_SLOTS = threading.BoundedSemaphore(64)
 _SEASON_DIRECTORY_RE = re.compile(
     r"^(?:season[\s._-]*\d+|specials?|第\s*\d+\s*季)$",
     re.IGNORECASE,
 )
+
+
+def _log_monitor_task_result(future):
+    """Surface background task failures without creating unbounded threads."""
+    try:
+        future.result()
+    except Exception:
+        logger.exception("实时监控后台任务执行失败")
+    finally:
+        _MONITOR_TASK_SLOTS.release()
+
+
+def _submit_monitor_task(target, *args, **kwargs):
+    """Run monitor work on a bounded worker pool with bounded backlog."""
+    if not _MONITOR_TASK_SLOTS.acquire(blocking=False):
+        logger.warning("实时监控后台队列已满，等待空闲槽位以避免任务丢失。")
+        _MONITOR_TASK_SLOTS.acquire()
+    try:
+        future = _MONITOR_TASK_EXECUTOR.submit(target, *args, **kwargs)
+    except Exception:
+        _MONITOR_TASK_SLOTS.release()
+        raise
+    future.add_done_callback(_log_monitor_task_result)
+    return future
 
 
 def _adaptive_work_key(file_path: str, exclude_paths: List[str] = None) -> str:
@@ -194,12 +224,12 @@ def _adaptive_refresh_worker_loop():
                 f"  📦 [自适应入库] {reason}，统一处理作品 "
                 f"'{os.path.basename(batch['key'])}' 的 {len(batch['paths'])} 个文件。"
             )
-            threading.Thread(
-                target=_handle_batch_refresh_only_task,
-                args=(batch['processor'], batch['paths']),
-                kwargs={'bulk_mode': True},
-                daemon=True,
-            ).start()
+            _submit_monitor_task(
+                _handle_batch_refresh_only_task,
+                batch['processor'],
+                batch['paths'],
+                bulk_mode=True,
+            )
 
         with _ADAPTIVE_REFRESH_LOCK:
             if not _ADAPTIVE_REFRESH_STATES:
@@ -238,12 +268,12 @@ def _enqueue_adaptive_refresh_only(
         )
 
     if immediate_paths:
-        threading.Thread(
-            target=_handle_batch_refresh_only_task,
-            args=(processor, immediate_paths),
-            kwargs={'bulk_mode': False},
-            daemon=True,
-        ).start()
+        _submit_monitor_task(
+            _handle_batch_refresh_only_task,
+            processor,
+            immediate_paths,
+            bulk_mode=False,
+        )
 
     _ensure_adaptive_refresh_worker()
 
@@ -421,7 +451,7 @@ def process_batch_queue():
             else:
                 logger.info(f"    ├─ [刮削] 目录 '{folder_name}' 单文件: {os.path.basename(rep_file)}")
 
-        threading.Thread(target=_handle_batch_file_task, args=(processor, files_to_scrape)).start()
+        _submit_monitor_task(_handle_batch_file_task, processor, files_to_scrape)
 
     # 2. 仅刷新流程：小批量立即处理，持续大批量按作品静默聚合。
     if files_to_refresh_only:
@@ -466,12 +496,19 @@ def process_delete_batch_queue():
     # 1. 正常逻辑：走处理器删除流程 (清理DB等)
     if files_to_delete_logic:
         logger.info(f"  🗑️ [实时监控] 聚合处理删除事件: {len(files_to_delete_logic)} 个常规文件")
-        threading.Thread(target=processor.process_file_deletion_batch, args=(files_to_delete_logic,)).start()
+        _submit_monitor_task(
+            processor.process_file_deletion_batch,
+            files_to_delete_logic,
+        )
 
     # 2. 排除路径逻辑：仅刷新 Emby (移除条目)
     if files_to_refresh_only:
         logger.info(f"  🗑️ [实时监控] 聚合处理删除事件: {len(files_to_refresh_only)} 个排除路径文件 (仅刷新)")
-        threading.Thread(target=_handle_batch_delete_refresh_only, args=(processor, files_to_refresh_only)).start()
+        _submit_monitor_task(
+            _handle_batch_delete_refresh_only,
+            processor,
+            files_to_refresh_only,
+        )
 
 def _handle_batch_file_task(processor, file_paths: List[str]):
     """批量处理新增文件任务 (刮削模式)"""

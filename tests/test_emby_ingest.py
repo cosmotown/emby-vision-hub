@@ -373,7 +373,9 @@ class EmbyIngestTests(unittest.TestCase):
     def test_realtime_queue_keeps_all_paths_for_emby(self):
         source = (Path(__file__).resolve().parents[1] / "monitor_service.py").read_text(encoding="utf-8")
         self.assertIn(
-            "_submit_monitor_task(_handle_batch_file_task, processor, files_to_scrape)",
+            "_handle_batch_file_task,\n"
+            "            processor,\n"
+            "            files_to_scrape,",
             source,
         )
         self.assertNotIn("representative_files", source)

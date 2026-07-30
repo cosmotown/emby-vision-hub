@@ -58,6 +58,9 @@ class UpdateTests(unittest.TestCase):
 
     def test_r_to_r_zero_put(self):
         with mock.patch.object(
+            moviepilot, "get_subscription_details",
+            return_value=self.details(),
+        ), mock.patch.object(
             moviepilot, "_get_access_token"
         ) as token, mock.patch.object(
             moviepilot.requests, "put"
@@ -71,6 +74,9 @@ class UpdateTests(unittest.TestCase):
 
     def test_p_to_r_one_status_put(self):
         with mock.patch.object(
+            moviepilot, "get_subscription_details",
+            return_value=self.details("P", 12),
+        ), mock.patch.object(
             moviepilot, "_get_access_token", return_value="t"
         ), mock.patch.object(
             moviepilot.requests, "put",
@@ -88,6 +94,9 @@ class UpdateTests(unittest.TestCase):
 
     def test_total_only_one_detail_put(self):
         with mock.patch.object(
+            moviepilot, "get_subscription_details",
+            return_value=self.details("R", 10, 2),
+        ), mock.patch.object(
             moviepilot, "_get_access_token", return_value="t"
         ), mock.patch.object(
             moviepilot.requests, "put",
@@ -106,6 +115,9 @@ class UpdateTests(unittest.TestCase):
 
     def test_state_and_total_each_one_put(self):
         with mock.patch.object(
+            moviepilot, "get_subscription_details",
+            return_value=self.details("P", 99, 90),
+        ), mock.patch.object(
             moviepilot, "_get_access_token", return_value="t"
         ), mock.patch.object(
             moviepilot.requests, "put",

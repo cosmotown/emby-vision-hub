@@ -372,8 +372,13 @@ class EmbyIngestTests(unittest.TestCase):
 
     def test_realtime_queue_keeps_all_paths_for_emby(self):
         source = (Path(__file__).resolve().parents[1] / "monitor_service.py").read_text(encoding="utf-8")
-        self.assertIn("args=(processor, files_to_scrape)", source)
-        self.assertNotIn("args=(processor, representative_files)", source)
+        self.assertIn(
+            "_handle_batch_file_task,\n"
+            "            processor,\n"
+            "            files_to_scrape,",
+            source,
+        )
+        self.assertNotIn("representative_files", source)
 
     @mock.patch("services.emby_ingest.emby.get_media_item_by_path")
     def test_confirmed_items_are_deduplicated_by_emby_id(self, get_item):
@@ -738,6 +743,24 @@ class EmbyIngestTests(unittest.TestCase):
 
 
 class EmbyHttpValidationTests(unittest.TestCase):
+    @mock.patch("handler.emby.emby_client.session.request")
+    def test_shared_mutation_client_disables_redirect_following(self, request):
+        request.return_value = mock.Mock(status_code=204)
+
+        emby.emby_client.post("http://emby/mutation", json={"x": 1})
+
+        self.assertFalse(request.call_args.kwargs["allow_redirects"])
+        self.assertEqual(1, request.call_count)
+
+    @mock.patch("handler.emby.requests.post")
+    def test_post_once_disables_redirect_following(self, post):
+        post.return_value = mock.Mock(status_code=307)
+
+        emby.emby_client.post_once("http://emby/mutation", json={"x": 1})
+
+        self.assertFalse(post.call_args.kwargs["allow_redirects"])
+        self.assertEqual(1, post.call_count)
+
     @mock.patch("handler.emby.emby_client.get")
     def test_catalog_item_id_lookup_is_exact_and_lightweight(self, get):
         response = mock.Mock()
@@ -760,17 +783,17 @@ class EmbyHttpValidationTests(unittest.TestCase):
         self.assertNotIn("api_key", get.call_args.kwargs["params"])
         self.assertEqual("token", get.call_args.kwargs["headers"]["X-Emby-Token"])
 
-    @mock.patch("handler.emby.emby_client.post")
-    def test_refresh_item_reports_http_failure(self, post):
+    @mock.patch("handler.emby.emby_client.post_once")
+    def test_refresh_item_reports_http_failure(self, post_once):
         response = mock.Mock()
         response.raise_for_status.side_effect = RuntimeError("HTTP 500")
-        post.return_value = response
+        post_once.return_value = response
 
         self.assertFalse(emby.refresh_item_by_id("item-1", "http://emby", "token"))
 
-    @mock.patch("handler.emby.emby_client.post")
-    def test_refresh_item_supports_non_recursive_library_cleanup(self, post):
-        post.return_value.raise_for_status.return_value = None
+    @mock.patch("handler.emby.emby_client.post_once")
+    def test_refresh_item_supports_non_recursive_library_cleanup(self, post_once):
+        post_once.return_value.raise_for_status.return_value = None
 
         self.assertTrue(emby.refresh_item_by_id(
             "library-1",
@@ -779,11 +802,11 @@ class EmbyHttpValidationTests(unittest.TestCase):
             recursive=False,
         ))
 
-        self.assertEqual("false", post.call_args.kwargs["params"]["Recursive"])
+        self.assertEqual("false", post_once.call_args.kwargs["params"]["Recursive"])
 
-    @mock.patch("handler.emby.emby_client.post")
-    def test_exact_path_notifications_are_chunked(self, post):
-        post.return_value.raise_for_status.return_value = None
+    @mock.patch("handler.emby.emby_client.post_once")
+    def test_exact_path_notifications_are_chunked(self, post_once):
+        post_once.return_value.raise_for_status.return_value = None
         paths = [f"/media/tv/show/S01E{index:03d}.strm" for index in range(205)]
 
         self.assertTrue(emby.notify_media_paths_updated(
@@ -792,9 +815,9 @@ class EmbyHttpValidationTests(unittest.TestCase):
             "token",
             chunk_size=100,
         ))
-        self.assertEqual(3, post.call_count)
-        self.assertEqual(100, len(post.call_args_list[0].kwargs["json"]["Updates"]))
-        self.assertEqual(5, len(post.call_args_list[2].kwargs["json"]["Updates"]))
+        self.assertEqual(3, post_once.call_count)
+        self.assertEqual(100, len(post_once.call_args_list[0].kwargs["json"]["Updates"]))
+        self.assertEqual(5, len(post_once.call_args_list[2].kwargs["json"]["Updates"]))
 
     @mock.patch("handler.emby.emby_client.get")
     def test_ingest_queries_keep_api_key_out_of_url_params(self, get):
@@ -890,6 +913,7 @@ class EmbyHttpValidationTests(unittest.TestCase):
 
         self.assertEqual("episode-1", item["Id"])
         self.assertNotIn("api_key", get.call_args.kwargs["params"])
+        self.assertNotIn("MediaSources", get.call_args.kwargs["params"]["Fields"])
         self.assertEqual("true", get.call_args.kwargs["params"]["Recursive"])
         self.assertEqual("token", get.call_args.kwargs["headers"]["X-Emby-Token"])
 

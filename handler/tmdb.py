@@ -63,7 +63,9 @@ def requests_retry_session(
         connect=retries,
         backoff_factor=backoff_factor,
         status_forcelist=status_forcelist,
-        allowed_methods=frozenset(['HEAD', 'GET', 'PUT', 'DELETE', 'OPTIONS', 'TRACE', 'POST']),
+        # This shared transport is read-oriented. Never replay a mutation if a
+        # future caller reuses it for a non-idempotent endpoint.
+        allowed_methods=frozenset(['HEAD', 'GET', 'OPTIONS', 'TRACE']),
     )
     
     # ★★★ 核心修改：增加 pool_connections 和 pool_maxsize 参数 ★★★

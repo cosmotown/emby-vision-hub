@@ -2,6 +2,30 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.11",
+        "published_at": "2026-07-30T21:19:01+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.11",
+        "changelog": """## 安全维护与传输加固
+
+- Emby 非幂等变更请求禁止自动重放和重定向，降低响应丢失或重定向导致重复提交的风险。
+- Emby 精确路径查询默认不再请求 `MediaSources`，保留准确匹配并减少不必要的响应负载。
+- MoviePilot 订阅变更按地址、TMDb ID 和季号串行化，并增加单次提交、重定向与敏感日志保护。
+- STRM 实时后台任务使用 4 个 worker、64 个槽位的有界执行器，并补齐 start、stop、restart 生命周期和任务回放保护。
+- 封面刷新及图片上传使用单次提交；禁止重定向，失败或结果不确定时不会再次上传备用格式。
+- 危险旧人物合并执行链已从源码移除，公开与私有兼容入口均保持失败关闭。
+- 增加 PR validation，持续执行后端编译、完整测试和前端生产构建。
+
+### 明确不包含
+
+- 不包含神医缺失元数据回填。
+- 不包含 MediaInfo 修复状态机。
+- 不包含虚拟库更新延迟专项。
+- 不包含全仓数据库空值覆盖重构。
+
+""",
+    },
+
+    {
         "version": "v7.2.10",
         "published_at": "2026-07-26T17:30:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.10",

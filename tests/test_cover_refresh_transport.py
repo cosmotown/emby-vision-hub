@@ -269,6 +269,83 @@ class CoverRefreshTransportTests(unittest.TestCase):
             post.call_args.kwargs["headers"]["X-Emby-Token"],
         )
 
+    @mock.patch("services.cover_generator.spawn_later")
+    @mock.patch("services.cover_generator.gevent_sleep")
+    @mock.patch("services.cover_generator.requests.post")
+    def test_library_upload_transport_failure_does_not_try_next_candidate(
+        self,
+        post,
+        _sleep,
+        _spawn_later,
+    ):
+        candidates = [
+            {
+                "content_type": "image/gif",
+                "data": b"GIF89a-first",
+                "label": "original",
+            },
+            {
+                "content_type": "image/jpeg",
+                "data": b"\xff\xd8fallback",
+                "label": "fallback",
+            },
+        ]
+        failures = [
+            ("redirect-307", mock.Mock(status_code=307)),
+            ("redirect-308", mock.Mock(status_code=308)),
+            ("server-error", mock.Mock(status_code=500)),
+            ("timeout", requests.exceptions.Timeout("unknown delivery")),
+        ]
+        for label, failure in failures:
+            with self.subTest(failure=label):
+                post.reset_mock()
+                if isinstance(failure, Exception):
+                    post.side_effect = failure
+                else:
+                    post.side_effect = None
+                    post.return_value = failure
+                with (
+                    mock.patch.object(
+                        cover_generator.config_manager,
+                        "APP_CONFIG",
+                        self.config,
+                    ),
+                    mock.patch.object(
+                        self.service,
+                        "_CoverGeneratorService__get_image_upload_type",
+                        return_value=("image/gif", ".gif"),
+                    ),
+                    mock.patch.object(
+                        self.service,
+                        "_CoverGeneratorService__build_emby_upload_candidates",
+                        return_value=candidates,
+                    ),
+                    mock.patch.object(
+                        self.service,
+                        "_CoverGeneratorService__is_animated_image",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        self.service,
+                        "_CoverGeneratorService__get_primary_image_tag",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        self.service,
+                        "_CoverGeneratorService__verify_primary_image_upload",
+                    ) as verify,
+                ):
+                    self.assertFalse(
+                        self.service._CoverGeneratorService__set_library_image(
+                            "server-1",
+                            {"Id": "library-1", "Name": "Movies"},
+                            candidates[0]["data"],
+                        )
+                    )
+
+                post.assert_called_once()
+                verify.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

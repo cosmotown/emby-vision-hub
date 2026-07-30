@@ -674,7 +674,10 @@ class CoverGeneratorService:
                         candidate["label"],
                     )
                 if not self.__upload_primary_image(upload_url, api_key, library, candidate):
-                    continue
+                    # A rejected or ambiguous POST must terminate this upload
+                    # attempt. Candidate fallback is only safe after a 2xx
+                    # response whose write-back verification failed.
+                    return False
                 gevent_sleep(0.8)
                 if self.__verify_primary_image_upload(library_id, before_tag, candidate):
                     self.__refresh_emby_image_cache(library_id)

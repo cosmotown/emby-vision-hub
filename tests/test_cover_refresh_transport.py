@@ -12,6 +12,7 @@ import services.cover_generator as cover_generator
 class CoverRefreshTransportTests(unittest.TestCase):
     def setUp(self):
         self.service = CoverGeneratorService.__new__(CoverGeneratorService)
+        self.service._covers_output = None
         self.config = {
             "emby_server_url": "http://emby.example",
             "emby_api_key": "secret-token",
@@ -195,6 +196,78 @@ class CoverRefreshTransportTests(unittest.TestCase):
         log_text = "\n".join(logs.output)
         self.assertNotIn("secret-token", log_text)
         self.assertNotIn("sensitive-response-body", log_text)
+
+    @mock.patch("services.cover_generator.spawn_later")
+    @mock.patch("services.cover_generator.gevent_sleep")
+    @mock.patch("services.cover_generator.requests.post")
+    def test_library_image_url_is_constructed_without_token(
+        self,
+        post,
+        _sleep,
+        _spawn_later,
+    ):
+        post.return_value = mock.Mock(status_code=204)
+        candidate = {
+            "content_type": "image/png",
+            "data": b"\x89PNG\r\n\x1a\nbinary-image",
+            "label": "original",
+        }
+        with (
+            mock.patch.object(
+                cover_generator.config_manager,
+                "APP_CONFIG",
+                self.config,
+            ),
+            mock.patch.object(
+                self.service,
+                "_CoverGeneratorService__get_image_upload_type",
+                return_value=("image/png", ".png"),
+            ),
+            mock.patch.object(
+                self.service,
+                "_CoverGeneratorService__build_emby_upload_candidates",
+                return_value=[candidate],
+            ),
+            mock.patch.object(
+                self.service,
+                "_CoverGeneratorService__is_animated_image",
+                return_value=False,
+            ),
+            mock.patch.object(
+                self.service,
+                "_CoverGeneratorService__get_primary_image_tag",
+                return_value=None,
+            ),
+            mock.patch.object(
+                self.service,
+                "_CoverGeneratorService__verify_primary_image_upload",
+                return_value=True,
+            ),
+            mock.patch.object(
+                self.service,
+                "_CoverGeneratorService__refresh_emby_image_cache",
+            ),
+        ):
+            self.assertTrue(
+                self.service._CoverGeneratorService__set_library_image(
+                    "server-1",
+                    {"Id": "library-1", "Name": "Movies"},
+                    candidate["data"],
+                )
+            )
+
+        post.assert_called_once()
+        request_url = post.call_args.args[0]
+        self.assertEqual(
+            "http://emby.example/Items/library-1/Images/Primary",
+            request_url,
+        )
+        self.assertNotIn("secret-token", request_url)
+        self.assertNotIn("api_key", request_url)
+        self.assertEqual(
+            "secret-token",
+            post.call_args.kwargs["headers"]["X-Emby-Token"],
+        )
 
 
 if __name__ == "__main__":

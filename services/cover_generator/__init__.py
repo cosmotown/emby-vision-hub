@@ -634,7 +634,7 @@ class CoverGeneratorService:
         library_id = library.get("Id") or library.get("ItemId")
         base_url = config_manager.APP_CONFIG.get('emby_server_url')
         api_key = config_manager.APP_CONFIG.get('emby_api_key')
-        upload_url = f"{base_url.rstrip('/')}/Items/{library_id}/Images/Primary?api_key={api_key}"
+        upload_url = f"{base_url.rstrip('/')}/Items/{library_id}/Images/Primary"
         raw_image_data = self.__normalize_image_data(image_data)
         if not raw_image_data:
             logger.error(f"  ➜ 媒体库 '{library['Name']}' 的封面数据格式无效，无法上传。")
@@ -683,10 +683,11 @@ class CoverGeneratorService:
 
             logger.error(f"  ➜ Emby 未能确认媒体库 '{library['Name']}' 的封面已生效。")
             return False
-        except requests.exceptions.RequestException as e:
-            logger.error(f"  ➜ 上传封面到媒体库 '{library['Name']}' 时发生网络错误: {e}")
-            if e.response is not None:
-                logger.error(f"  ➜ 响应状态: {e.response.status_code}, 响应内容: {e.response.text[:200]}")
+        except requests.exceptions.RequestException as exc:
+            logger.error(
+                f"  ➜ 上传封面到媒体库 '{library['Name']}' 的结果不确定 "
+                f"({type(exc).__name__})；不会自动重试。"
+            )
             return False
 
     def __normalize_image_data(self, image_data: Union[bytes, str]) -> Optional[bytes]:

@@ -781,14 +781,32 @@ class CoverGeneratorService:
                 len(candidate["data"]),
                 candidate["label"],
             )
-            response = requests.post(upload_url, data=encoded_image, headers=headers, timeout=60)
-            response.raise_for_status()
-            logger.debug(f"  ➜ 已提交封面到媒体库 '{library['Name']}'。")
-            return True
-        except requests.exceptions.RequestException as e:
-            logger.error(f"  ➜ 上传封面到媒体库 '{library['Name']}' 时发生网络错误: {e}")
-            if e.response is not None:
-                logger.error(f"  ➜ 响应状态: {e.response.status_code}, 响应内容: {e.response.text[:200]}")
+            response = requests.post(
+                upload_url,
+                data=encoded_image,
+                headers=headers,
+                timeout=60,
+                allow_redirects=False,
+            )
+            if 200 <= response.status_code < 300:
+                logger.debug(f"  ➜ 已提交封面到媒体库 '{library['Name']}'。")
+                return True
+            if response.status_code >= 500:
+                logger.warning(
+                    f"  ➜ 上传封面到媒体库 '{library['Name']}' 的结果不确定 "
+                    f"(HTTP {response.status_code})；不会自动重试。"
+                )
+            else:
+                logger.warning(
+                    f"  ➜ 上传封面到媒体库 '{library['Name']}' 被明确拒绝 "
+                    f"(HTTP {response.status_code})。"
+                )
+            return False
+        except requests.exceptions.RequestException as exc:
+            logger.warning(
+                f"  ➜ 上传封面到媒体库 '{library['Name']}' 的结果不确定 "
+                f"({type(exc).__name__})；不会自动重试。"
+            )
             return False
 
     def __get_primary_image_tag(self, item_id: str) -> Optional[str]:
@@ -874,21 +892,37 @@ class CoverGeneratorService:
             return
         refresh_url = f"{base_url.rstrip('/')}/Items/{item_id}/Refresh"
         params = {
-            "api_key": api_key,
             "Recursive": "false",
             "ImageRefreshMode": "Default",
             "MetadataRefreshMode": "Default",
             "ReplaceAllMetadata": "false",
             "ReplaceAllImages": "false",
         }
+        headers = {"X-Emby-Token": api_key}
         try:
-            response = requests.post(refresh_url, params=params, timeout=15)
-            if response.status_code in (200, 204):
+            response = emby.emby_client.post_once(
+                refresh_url,
+                params=params,
+                headers=headers,
+                timeout=15,
+            )
+            if 200 <= response.status_code < 300:
                 logger.debug(f"  ➜ 已请求 Emby 刷新封面缓存 (ItemID: {item_id})。")
+            elif response.status_code >= 500:
+                logger.warning(
+                    f"  ➜ Emby 封面缓存刷新结果不确定 "
+                    f"(ItemID: {item_id}, HTTP {response.status_code})；不会自动重试。"
+                )
             else:
-                logger.warning(f"  ➜ Emby 封面缓存刷新返回异常状态: {response.status_code}")
-        except Exception as e:
-            logger.warning(f"  ➜ Emby 封面缓存刷新失败 (ItemID: {item_id}): {e}")
+                logger.warning(
+                    f"  ➜ Emby 封面缓存刷新被明确拒绝 "
+                    f"(ItemID: {item_id}, HTTP {response.status_code})。"
+                )
+        except requests.exceptions.RequestException as exc:
+            logger.warning(
+                f"  ➜ Emby 封面缓存刷新结果不确定 "
+                f"(ItemID: {item_id}, {type(exc).__name__})；不会自动重试。"
+            )
 
     def __get_library_title_from_yaml(self, library_name: str) -> Tuple[str, str]:
         zh_title, en_title = library_name, ''

@@ -559,16 +559,47 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         }
         for function_name in (
             'task_merge_duplicate_actors',
+            '_disabled_legacy_task_merge_duplicate_actors',
             '_disabled_legacy_task_purge_ghost_actors',
             '_disabled_legacy_task_purge_unregistered_actors',
         ):
             self.assertIsInstance(functions[function_name].body[0], ast.Raise)
+
+        legacy_merge = functions['_disabled_legacy_task_merge_duplicate_actors']
+        self.assertEqual(1, len(legacy_merge.body))
+        self.assertNotIn('delete_person_custom_api', ast.unparse(legacy_merge))
+
+        disabled_namespace = {}
+        exec(
+            compile(
+                ast.Module(
+                    body=[
+                        functions['task_merge_duplicate_actors'],
+                        legacy_merge,
+                    ],
+                    type_ignores=[],
+                ),
+                'tasks/actors.py',
+                'exec',
+            ),
+            disabled_namespace,
+        )
+        for function_name in (
+            'task_merge_duplicate_actors',
+            '_disabled_legacy_task_merge_duplicate_actors',
+        ):
+            with self.assertRaisesRegex(RuntimeError, '禁用|移除'):
+                disabled_namespace[function_name](MagicMock())
 
         registry_source = (repo_root / 'tasks' / 'core.py').read_text()
         self.assertNotIn("'purge-ghost-actors':", registry_source)
         self.assertNotIn("'purge-unregistered-actors':", registry_source)
         self.assertNotIn("'merge-duplicate-actors':", registry_source)
         self.assertNotIn('task_merge_duplicate_actors,', registry_source)
+        self.assertNotIn(
+            '_disabled_legacy_task_merge_duplicate_actors',
+            registry_source,
+        )
 
     def test_manual_verification_never_calls_person_delete_api(self):
         repo_root = Path(__file__).resolve().parents[1]

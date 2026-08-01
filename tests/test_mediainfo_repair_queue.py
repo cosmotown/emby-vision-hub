@@ -27,16 +27,30 @@ class FakeRepository:
         self.next_id = 1
         self.generation = 0
         self.recover_calls = 0
+        self.events = []
 
-    def recover_interrupted_jobs(self, _minutes):
+    def recover_expired_jobs(self, _instance_id, _minutes):
         with self.lock:
             self.recover_calls += 1
             for row in self.rows_by_id.values():
-                if row["state"] == "pending":
-                    row.update(state="shutdown_before_start", reason_code="shutdown_before_start")
-                elif row["state"] in {"running", "submitting", "submitted"}:
+                if row["state"] in {"pending", "running"} and row.get("post_attempts", 0) == 0 and row.get("lease_expired", True):
+                    reason = "worker_lost_before_submit" if row["state"] == "running" else "shutdown_before_start"
+                    row.update(state="shutdown_before_start", reason_code=reason)
+                elif row["state"] in {"running", "submitting", "submitted"} and row.get("lease_expired", True):
                     row.update(state="ambiguous", reason_code="post_result_ambiguous")
         return {}
+
+    def cleanup_terminal_jobs(self):
+        return 0
+
+    def heartbeat_owned_jobs(self, instance_id, generation, _lease_seconds):
+        with self.lock:
+            count = 0
+            for row in self.rows_by_id.values():
+                if row.get("owner_instance_id") == instance_id and row.get("owner_generation") == generation and row.get("state") in self.ACTIVE:
+                    row["lease_expired"] = False
+                    count += 1
+            return count
 
     def next_generation(self):
         with self.lock:
@@ -95,12 +109,19 @@ class FakeRepository:
             )
             return copy.deepcopy(row)
 
-    def create_job(self, snapshot, generation, pending_limit):
+    def create_job(self, snapshot, generation, pending_limit, instance_id, _lease_seconds):
         item_id = snapshot["identity"]["exact_item_id"]
         with self.lock:
             existing = self.rows_by_item.get(item_id)
             if existing and existing["state"] in self.ACTIVE:
-                return "existing", copy.deepcopy(existing)
+                return "same_item_active", copy.deepcopy(existing)
+            for row in self.rows_by_id.values():
+                if row.get("state") not in self.ACTIVE or row.get("exact_item_id") == item_id:
+                    continue
+                if row.get("exact_strm_path_hash") == snapshot["identity"]["exact_strm_path_hash"]:
+                    return "same_path_active", copy.deepcopy(row)
+                if row.get("root_series_key") == snapshot["identity"]["root_series_key"]:
+                    return "same_root_active", copy.deepcopy(row)
             pending = sum(1 for row in self.rows_by_id.values() if row["state"] == "pending")
             if pending >= pending_limit:
                 return "full", {}
@@ -117,33 +138,47 @@ class FakeRepository:
                 state="pending",
                 reason_code=None,
                 generation=generation,
+                owner_instance_id=instance_id,
+                owner_generation=generation,
+                lease_expired=False,
                 post_attempts=0,
                 retry_after=None,
                 snapshot_json=copy.deepcopy(snapshot),
             )
             return "created", copy.deepcopy(existing)
 
-    def mark_running(self, job_id, generation):
+    def mark_running(self, job_id, generation, instance_id, _lease_seconds):
         with self.lock:
             row = self.rows_by_id[job_id]
-            if row["state"] != "pending" or row["generation"] != generation:
+            if row["state"] != "pending" or row["generation"] != generation or row.get("owner_instance_id") != instance_id:
                 return None
             row["state"] = "running"
             return copy.deepcopy(row)
 
-    def mark_submitting(self, job_id, generation):
+    def mark_submitting(self, job_id, generation, instance_id, snapshot, _lease_seconds):
         with self.lock:
             row = self.rows_by_id[job_id]
-            if row["state"] != "running" or row["generation"] != generation:
+            if row["state"] != "running" or row["generation"] != generation or row.get("owner_instance_id") != instance_id or row.get("post_attempts") != 0:
                 return None
             row["state"] = "submitting"
-            row["post_attempts"] += 1
+            row["post_attempts"] = 1
+            row["snapshot_json"] = copy.deepcopy(snapshot)
+            self.events.append(("submitting_committed", job_id, 1))
+            return copy.deepcopy(row)
+
+    def finish_pre_submit(self, job_id, generation, instance_id, *, reason_code, snapshot):
+        with self.lock:
+            row = self.rows_by_id[job_id]
+            if row["state"] != "running" or row["generation"] != generation or row.get("owner_instance_id") != instance_id or row.get("post_attempts") != 0:
+                return None
+            row.update(state="skipped", reason_code=reason_code, snapshot_json=copy.deepcopy(snapshot), owner_instance_id=None, owner_generation=None)
             return copy.deepcopy(row)
 
     def finish_job(
         self,
         job_id,
         generation,
+        instance_id,
         *,
         state,
         reason_code,
@@ -153,7 +188,7 @@ class FakeRepository:
     ):
         with self.lock:
             row = self.rows_by_id[job_id]
-            if row["generation"] != generation:
+            if row["generation"] != generation or row.get("owner_instance_id") != instance_id or row.get("state") != "submitting" or row.get("post_attempts") != 1:
                 return None
             row.update(
                 state=state,
@@ -165,8 +200,22 @@ class FakeRepository:
                     if cooldown_minutes
                     else None
                 ),
+                owner_instance_id=None,
+                owner_generation=None,
             )
             return copy.deepcopy(row)
+
+    def mark_post_ambiguous(self, job_id, generation, instance_id, *, snapshot, response_kind, cooldown_minutes=60):
+        return self.finish_job(
+            job_id,
+            generation,
+            instance_id,
+            state="ambiguous",
+            reason_code="post_result_ambiguous",
+            response_kind=response_kind,
+            snapshot=snapshot,
+            cooldown_minutes=cooldown_minutes,
+        )
 
     def cancel_pending(self, job_id):
         with self.lock:
@@ -176,12 +225,12 @@ class FakeRepository:
             row.update(state="cancelled", reason_code="cancelled_before_start")
             return copy.deepcopy(row)
 
-    def mark_pending_shutdown(self, job_ids):
+    def mark_pending_shutdown(self, job_ids, instance_id, generation):
         with self.lock:
             count = 0
             for job_id in job_ids:
                 row = self.rows_by_id[job_id]
-                if row["state"] == "pending":
+                if row["state"] == "pending" and row.get("owner_instance_id") == instance_id and row.get("owner_generation") == generation:
                     row.update(state="shutdown_before_start", reason_code="shutdown_before_start")
                     count += 1
             return count
@@ -352,8 +401,8 @@ class MediaInfoRepairQueueTests(unittest.TestCase):
             self.assertEqual("accepted", coordinator.submit("a")["result"])
             self.assertTrue(started.wait(timeout=1))
             second = coordinator.submit("b")
-            self.assertEqual("rejected", second["result"])
-            self.assertEqual("repair_already_active", second["reason_code"])
+            self.assertEqual("existing", second["result"])
+            self.assertEqual("same_root_active", second["reason_code"])
         finally:
             release.set()
             coordinator.shutdown()
@@ -374,8 +423,8 @@ class MediaInfoRepairQueueTests(unittest.TestCase):
             first = coordinator.submit("a")
             self.assertEqual("accepted", first["result"])
             second = coordinator.submit("b")
-            self.assertEqual("rejected", second["result"])
-            self.assertEqual("repair_already_active", second["reason_code"])
+            self.assertEqual("existing", second["result"])
+            self.assertEqual("same_path_active", second["reason_code"])
             self.assertTrue(started.wait(timeout=1))
         finally:
             release.set()
@@ -457,7 +506,7 @@ class MediaInfoRepairQueueTests(unittest.TestCase):
     def test_ambiguous_can_upgrade_only_by_readback_and_never_reposts(self):
         repo = FakeRepository()
         state = FakeStateService(
-            readback_states={"a": ["media_streams_empty", "ready"]}
+            readback_states={"a": ["media_streams_empty", "media_streams_empty", "ready"]}
         )
         adapter = RecordingAdapter(AMBIGUOUS)
         coordinator = self.make_coordinator(state, repo, adapter)
@@ -525,9 +574,10 @@ class MediaInfoRepairQueueTests(unittest.TestCase):
     def test_restart_marks_unknown_old_post_ambiguous_and_never_replays_it(self):
         repo = FakeRepository()
         old_snapshot = FakeStateService().observe("old", include_media=True)
-        _, old = repo.create_job(old_snapshot, 1, 128)
-        repo.mark_running(old["id"], 1)
-        repo.mark_submitting(old["id"], 1)
+        _, old = repo.create_job(old_snapshot, 1, 128, "old-instance", 90)
+        repo.mark_running(old["id"], 1, "old-instance", 90)
+        repo.mark_submitting(old["id"], 1, "old-instance", old_snapshot, 90)
+        repo.rows_by_id[old["id"]]["lease_expired"] = True
         adapter = RecordingAdapter(EMPTY)
         coordinator = self.make_coordinator(FakeStateService(), repo, adapter)
         coordinator.start()
@@ -542,9 +592,10 @@ class MediaInfoRepairQueueTests(unittest.TestCase):
     def test_first_status_after_restart_recovers_unknown_post_without_replay(self):
         repo = FakeRepository()
         old_snapshot = FakeStateService().observe("old", include_media=True)
-        _, old = repo.create_job(old_snapshot, 1, 128)
-        repo.mark_running(old["id"], 1)
-        repo.mark_submitting(old["id"], 1)
+        _, old = repo.create_job(old_snapshot, 1, 128, "old-instance", 90)
+        repo.mark_running(old["id"], 1, "old-instance", 90)
+        repo.mark_submitting(old["id"], 1, "old-instance", old_snapshot, 90)
+        repo.rows_by_id[old["id"]]["lease_expired"] = True
         adapter = RecordingAdapter(EMPTY)
         coordinator = self.make_coordinator(FakeStateService(), repo, adapter)
         try:

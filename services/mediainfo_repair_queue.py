@@ -6,6 +6,7 @@ import collections
 import logging
 import threading
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, Optional
 
@@ -30,6 +31,8 @@ DEFAULT_READBACK_DELAY_SECONDS = 5
 DEFAULT_FAILURE_COOLDOWN_MINUTES = 30
 DEFAULT_AMBIGUOUS_COOLDOWN_MINUTES = 60
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 90
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 20
+DEFAULT_LEASE_SECONDS = 90
 
 
 def _snapshot_from_job(job: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -71,6 +74,9 @@ class MediaInfoRepairCoordinator:
         sleep: Callable[[float], None] = time.sleep,
         shutdown_timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
         executor_factory=ThreadPoolExecutor,
+        instance_id: Optional[str] = None,
+        heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
     ):
         self.state_service = state_service or MediaInfoStateService()
         self.repository = repository
@@ -82,6 +88,14 @@ class MediaInfoRepairCoordinator:
         self._sleep = sleep
         self.shutdown_timeout_seconds = max(0.1, float(shutdown_timeout_seconds))
         self._executor_factory = executor_factory
+        self.instance_id = str(instance_id or uuid.uuid4().hex)
+        self.heartbeat_interval_seconds = max(
+            0.01, float(heartbeat_interval_seconds)
+        )
+        self.lease_seconds = max(
+            self.heartbeat_interval_seconds * 2,
+            float(lease_seconds),
+        )
 
         self._condition = threading.Condition(threading.RLock())
         self._state = "stopped"
@@ -92,6 +106,8 @@ class MediaInfoRepairCoordinator:
         self._futures: set[Future] = set()
         self._executor: Optional[ThreadPoolExecutor] = None
         self._dispatcher: Optional[threading.Thread] = None
+        self._heartbeat: Optional[threading.Thread] = None
+        self._heartbeat_stop = threading.Event()
         self._ever_started = False
 
     @property
@@ -132,8 +148,9 @@ class MediaInfoRepairCoordinator:
                 return self._generation
             if self._state == "draining":
                 raise RuntimeError("MediaInfo repair coordinator is draining")
-            self.repository.recover_interrupted_jobs(
-                DEFAULT_AMBIGUOUS_COOLDOWN_MINUTES
+            self.repository.recover_expired_jobs(
+                self.instance_id,
+                DEFAULT_AMBIGUOUS_COOLDOWN_MINUTES,
             )
             self._generation = int(self.repository.next_generation())
             self._ever_started = True
@@ -146,13 +163,48 @@ class MediaInfoRepairCoordinator:
             self._active_items.clear()
             self._futures.clear()
             self._state = "accepting"
+            self._heartbeat_stop = threading.Event()
+            self._heartbeat = threading.Thread(
+                target=self._heartbeat_loop,
+                args=(self._heartbeat_stop, self._generation),
+                name=f"evh-mediainfo-heartbeat-{self._generation}",
+                daemon=True,
+            )
+            self._heartbeat.start()
             self._dispatcher = threading.Thread(
                 target=self._dispatch_loop,
                 name=f"evh-mediainfo-dispatch-{self._generation}",
                 daemon=True,
             )
             self._dispatcher.start()
+            try:
+                deleted = int(self.repository.cleanup_terminal_jobs())
+                if deleted:
+                    logger.info("Cleaned %s old MediaInfo repair job rows", deleted)
+            except Exception:
+                logger.warning("MediaInfo repair history cleanup failed", exc_info=True)
             return self._generation
+
+    def _heartbeat_loop(
+        self,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
+        while not stop_event.is_set():
+            with self._condition:
+                state = self._state
+                current_generation = self._generation
+            if state == "stopped" or current_generation != generation:
+                return
+            try:
+                self.repository.heartbeat_owned_jobs(
+                    self.instance_id,
+                    generation,
+                    self.lease_seconds,
+                )
+            except Exception:
+                logger.error("MediaInfo repair lease heartbeat failed", exc_info=True)
+            stop_event.wait(self.heartbeat_interval_seconds)
 
     def _ensure_started(self) -> None:
         if self.state == "stopped" and not self._ever_started:
@@ -195,6 +247,12 @@ class MediaInfoRepairCoordinator:
             if self._state != "accepting":
                 return {"result": "rejected", "reason_code": "shutdown_before_start"}
         normalized = str(item_id or "").strip()
+        # A peer may have died after this instance started. Reclaim only an
+        # already-expired lease and never enqueue or replay an attempted POST.
+        self.repository.recover_expired_jobs(
+            self.instance_id,
+            DEFAULT_AMBIGUOUS_COOLDOWN_MINUTES,
+        )
         existing = self.repository.get_by_item_id(normalized)
         existing_snapshot = _snapshot_from_job(existing)
         if existing and existing.get("state") in ACTIVE_JOB_STATES:
@@ -209,15 +267,9 @@ class MediaInfoRepairCoordinator:
             include_media=True,
             previous_snapshot=existing_snapshot,
         )
-        conflict = self.repository.get_active_conflict(snapshot)
-        eligibility_job = (
-            existing
-            if existing and existing.get("state") in ACTIVE_JOB_STATES
-            else conflict or existing
-        )
         eligible, reason = self.state_service.repair_eligibility(
             snapshot,
-            active_job=eligibility_job,
+            active_job=existing,
         )
         if not eligible:
             self.repository.upsert_observation(snapshot)
@@ -227,11 +279,19 @@ class MediaInfoRepairCoordinator:
             snapshot,
             self.generation,
             self.pending_limit,
+            self.instance_id,
+            self.lease_seconds,
         )
-        if create_result == "existing":
+        if create_result in {
+            "existing",
+            "same_item_active",
+            "same_path_active",
+            "same_root_active",
+            "active_conflict",
+        }:
             return {
                 "result": "existing",
-                "reason_code": "repair_already_active",
+                "reason_code": create_result,
                 "job": _public_job(job),
             }
         if create_result == "cooldown":
@@ -251,7 +311,9 @@ class MediaInfoRepairCoordinator:
         }
         with self._condition:
             if self._state != "accepting":
-                self.repository.mark_pending_shutdown([pending["id"]])
+                self.repository.mark_pending_shutdown(
+                    [pending["id"]], self.instance_id, self.generation
+                )
                 return {
                     "result": "rejected",
                     "reason_code": "shutdown_before_start",
@@ -349,9 +411,12 @@ class MediaInfoRepairCoordinator:
                     self._pending.clear()
                     self._state = "stopped"
                     self._executor = None
+                    self._heartbeat_stop.set()
                     self._condition.notify_all()
                     logger.exception("MediaInfo repair executor rejected a job")
-                    self.repository.mark_pending_shutdown(pending_ids)
+                    self.repository.mark_pending_shutdown(
+                        pending_ids, self.instance_id, job["generation"]
+                    )
                     try:
                         executor.shutdown(wait=False, cancel_futures=True)
                     except Exception:
@@ -377,29 +442,55 @@ class MediaInfoRepairCoordinator:
                 self._active_items.discard(job["exact_item_id"])
                 if self._state == "draining" and not self._futures:
                     self._state = "stopped"
+                    self._heartbeat_stop.set()
                 self._condition.notify_all()
 
     def _run_job(self, pending: Dict[str, Any]) -> None:
         job = self.repository.mark_running(
             pending["id"],
             pending["generation"],
+            self.instance_id,
+            self.lease_seconds,
         )
         if not job:
             return
         previous_snapshot = _snapshot_from_job(job) or {}
+        post_attempted = False
+        preflight_snapshot = previous_snapshot
         try:
-            adapter = self._adapter_factory()
+            preflight_snapshot = self.state_service.observe(
+                pending["exact_item_id"],
+                include_media=True,
+                previous_snapshot=previous_snapshot,
+            )
+            reason = self._preflight_reason(previous_snapshot, preflight_snapshot)
+            if reason:
+                self.repository.finish_pre_submit(
+                    pending["id"],
+                    pending["generation"],
+                    self.instance_id,
+                    reason_code=reason,
+                    snapshot=preflight_snapshot,
+                )
+                return
             submitting = self.repository.mark_submitting(
                 pending["id"],
                 pending["generation"],
+                self.instance_id,
+                preflight_snapshot,
+                self.lease_seconds,
             )
             if not submitting:
                 return
+            # The call below is the irreversible boundary. The committed row
+            # above must already say submitting/post_attempts=1.
+            adapter = self._adapter_factory()
+            post_attempted = True
             result: SyncResult = adapter.sync_item(pending["exact_item_id"])
             snapshot = self.state_service.observe(
                 pending["exact_item_id"],
                 include_media=True,
-                previous_snapshot=previous_snapshot,
+                previous_snapshot=preflight_snapshot,
             )
             ready = (
                 (snapshot.get("emby_media_status") or {}).get("status") == "ready"
@@ -437,29 +528,89 @@ class MediaInfoRepairCoordinator:
                 )
                 cooldown = DEFAULT_FAILURE_COOLDOWN_MINUTES
 
-            self.repository.finish_job(
+            completed = self.repository.finish_job(
                 pending["id"],
                 pending["generation"],
+                self.instance_id,
                 state=final_state,
                 reason_code=reason_code,
                 response_kind=result.response_kind,
                 snapshot=snapshot,
                 cooldown_minutes=cooldown,
             )
+            if not completed:
+                raise RuntimeError("owned submitting row was not finalized")
         except Exception:
-            logger.exception(
-                "MediaInfo repair orchestration failed for Item %s",
+            if not post_attempted:
+                logger.error(
+                    "MediaInfo repair pre-submit orchestration failed for Item %s",
+                    pending["exact_item_id"],
+                    exc_info=True,
+                )
+                try:
+                    self.repository.finish_pre_submit(
+                        pending["id"],
+                        pending["generation"],
+                        self.instance_id,
+                        reason_code="preflight_unconfirmed",
+                        snapshot=preflight_snapshot,
+                    )
+                except Exception:
+                    logger.error(
+                        "MediaInfo pre-submit failure could not be persisted",
+                        exc_info=True,
+                    )
+                return
+            logger.critical(
+                "MediaInfo POST outcome persistence is uncertain for Item %s",
                 pending["exact_item_id"],
+                exc_info=True,
             )
-            self.repository.finish_job(
-                pending["id"],
-                pending["generation"],
-                state="failed",
-                reason_code="unknown_failure",
-                response_kind="internal_error",
-                snapshot=previous_snapshot,
-                cooldown_minutes=DEFAULT_FAILURE_COOLDOWN_MINUTES,
-            )
+            try:
+                self.repository.mark_post_ambiguous(
+                    pending["id"],
+                    pending["generation"],
+                    self.instance_id,
+                    snapshot=preflight_snapshot,
+                    response_kind="persistence_uncertain",
+                    cooldown_minutes=DEFAULT_AMBIGUOUS_COOLDOWN_MINUTES,
+                )
+            except Exception:
+                # The committed submitting/post_attempts=1 row is intentionally
+                # left untouched for lease-expiry recovery. Never POST again.
+                logger.critical(
+                    "MediaInfo ambiguous fallback persistence also failed",
+                    exc_info=True,
+                )
+
+    def _preflight_reason(
+        self,
+        accepted_snapshot: Dict[str, Any],
+        fresh_snapshot: Dict[str, Any],
+    ) -> Optional[str]:
+        before = accepted_snapshot.get("identity") or {}
+        after = fresh_snapshot.get("identity") or {}
+        for key in (
+            "exact_item_id",
+            "item_type",
+            "exact_strm_path_hash",
+            "root_series_key",
+        ):
+            if before.get(key) != after.get(key):
+                return "path_identity_changed"
+        if (fresh_snapshot.get("strm_status") or {}).get("status") != "present":
+            return "strm_missing_before_submit"
+        if (fresh_snapshot.get("emby_media_status") or {}).get("status") == "ready":
+            return "no_op_before_submit"
+        enabled, reason = self.state_service.repair_eligibility(
+            fresh_snapshot,
+            active_job=None,
+        )
+        if enabled:
+            return None
+        if reason == "repair_disabled":
+            return "repair_disabled_before_submit"
+        return "preflight_unconfirmed"
 
     def shutdown(self) -> None:
         with self._condition:
@@ -473,7 +624,9 @@ class MediaInfoRepairCoordinator:
             futures = set(self._futures)
             executor = self._executor
         if pending_ids:
-            self.repository.mark_pending_shutdown(pending_ids)
+            self.repository.mark_pending_shutdown(
+                pending_ids, self.instance_id, self.generation
+            )
         if dispatcher and dispatcher.is_alive():
             dispatcher.join(timeout=2)
         if futures:
@@ -486,7 +639,15 @@ class MediaInfoRepairCoordinator:
             self._executor = None
             self._dispatcher = None
             self._state = "draining" if still_running else "stopped"
+            if not still_running:
+                self._heartbeat_stop.set()
             self._condition.notify_all()
+        heartbeat = self._heartbeat
+        if not still_running and heartbeat and heartbeat.is_alive():
+            heartbeat.join(timeout=max(1.0, self.heartbeat_interval_seconds * 2))
+        if not still_running:
+            with self._condition:
+                self._heartbeat = None
 
 
 _COORDINATOR_LOCK = threading.Lock()

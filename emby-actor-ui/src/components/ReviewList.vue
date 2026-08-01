@@ -62,7 +62,8 @@
             <n-button
               type="warning"
               ghost
-              :disabled="checkedRowKeys.length === 0 || checkedRowKeys.length > 20 || !repairFeatureEnabled"
+              :loading="batchRepairLoading"
+              :disabled="checkedRowKeys.length === 0 || checkedRowKeys.length > 20 || !repairFeatureEnabled || batchRepairLoading"
             >
               调用神医修复已选项 ({{ checkedRowKeys.length }}/20)
             </n-button>
@@ -118,6 +119,7 @@ import { HeartOutline as AddToWatchlistIcon } from '@vicons/ionicons5';
 import { SearchOutline as SearchIcon, PlayForwardOutline as ReprocessIcon, CheckmarkCircleOutline as MarkDoneIcon, TrashOutline as TrashIcon } from '@vicons/ionicons5';
 
 import { useConfig } from '../composables/useConfig';
+import { createLatestRequestGate } from '../utils/latestRequestGate';
 
 // ✅ [修正] defineProps returns an object, which we've named `props`.
 const props = defineProps({
@@ -145,8 +147,11 @@ const currentRowId = ref(null);
 const isShowingSearchResults = ref(false);
 const checkedRowKeys = ref([]);
 const mediaInfoStatuses = ref({});
+const batchRepairLoading = ref(false);
 let mediaInfoPollTimer = null;
-const repairFeatureEnabled = computed(() => Boolean(configModel.value?.shenyi_mediainfo_repair_enabled));
+const mediaInfoRequestGate = createLatestRequestGate();
+const listRequestGate = createLatestRequestGate();
+const repairFeatureEnabled = computed(() => configModel.value?.shenyi_mediainfo_repair_enabled === true);
 
 const mediaStatusLabels = {
   present: 'STRM存在',
@@ -471,48 +476,63 @@ const paginationProps = computed(() => ({
 }));
 
 const fetchReviewItems = async () => {
+  const request = listRequestGate.begin('review-list');
   loading.value = true;
   error.value = null;
   isShowingSearchResults.value = false;
   try {
     const response = await axios.get(`/api/review_items`, {
+        signal: request.signal,
         params: {
             page: currentPage.value,
             per_page: itemsPerPage.value,
         }
     });
-    tableData.value = response.data.items;
-    totalItems.value = response.data.total_items;
-    checkedRowKeys.value = [];
-    await fetchMediaInfoStatuses(tableData.value);
+    if (!request.commit(() => {
+      tableData.value = response.data.items;
+      totalItems.value = response.data.total_items;
+      checkedRowKeys.value = [];
+    })) return;
+    await fetchMediaInfoStatuses(response.data.items);
   } catch (err) {
-    handleFetchError(err, "加载待处理列表失败。");
+    if (!axios.isCancel(err) && request.isCurrent()) {
+      handleFetchError(err, "加载待处理列表失败。");
+    }
   } finally {
-    loading.value = false;
+    request.commit(() => { loading.value = false; });
+    request.finish();
   }
 };
 
 const searchEmbyLibrary = async () => {
+  const request = listRequestGate.begin('review-list');
   loading.value = true;
   error.value = null;
   isShowingSearchResults.value = true;
   try {
     const response = await axios.get(`/api/search_emby_library`, {
-        params: { query: searchQuery.value }
+        params: { query: searchQuery.value },
+        signal: request.signal,
     });
     // 为搜索结果补充一些待复核列表才有的字段，防止渲染时出错
-    tableData.value = response.data.items.map(item => ({
+    const rows = response.data.items.map(item => ({
         ...item,
         failed_at: null,
         reason: 'N/A',
     }));
-    totalItems.value = response.data.total_items;
-    checkedRowKeys.value = [];
-    await fetchMediaInfoStatuses(tableData.value);
+    if (!request.commit(() => {
+      tableData.value = rows;
+      totalItems.value = response.data.total_items;
+      checkedRowKeys.value = [];
+    })) return;
+    await fetchMediaInfoStatuses(rows);
   } catch (err) {
-    handleFetchError(err, "搜索 Emby 媒体库失败。");
+    if (!axios.isCancel(err) && request.isCurrent()) {
+      handleFetchError(err, "搜索 Emby 媒体库失败。");
+    }
   } finally {
-    loading.value = false;
+    request.commit(() => { loading.value = false; });
+    request.finish();
   }
 };
 
@@ -567,59 +587,98 @@ const handleSearch = () => {
 
 const fetchMediaInfoStatuses = async (rows) => {
   const eligibleRows = (rows || []).filter(row => ['Movie', 'Episode'].includes(row.item_type));
-  const results = await Promise.allSettled(
-    eligibleRows.map(async row => {
-      const response = await axios.get(`/api/media-info/items/${row.item_id}/status`);
-      return [row.item_id, response.data];
-    })
-  );
-  const next = { ...mediaInfoStatuses.value };
-  for (const result of results) {
-    if (result.status === 'fulfilled') {
-      next[result.value[0]] = result.value[1];
+  await Promise.allSettled(eligibleRows.map(async row => {
+    const request = mediaInfoRequestGate.begin(row.item_id);
+    try {
+      const response = await axios.get(`/api/media-info/items/${row.item_id}/status`, {
+        signal: request.signal,
+      });
+      request.commit(() => {
+        mediaInfoStatuses.value = {
+          ...mediaInfoStatuses.value,
+          [row.item_id]: response.data,
+        };
+      });
+    } finally {
+      request.finish();
     }
-  }
-  mediaInfoStatuses.value = next;
+  }));
 };
 
 const recheckMediaInfo = async (row) => {
-  loadingAction.value[`recheck-${row.item_id}`] = true;
+  const request = mediaInfoRequestGate.begin(row.item_id);
+  const actionKey = `recheck-${row.item_id}`;
+  loadingAction.value[actionKey] = request.generation;
   try {
-    const response = await axios.post(`/api/media-info/items/${row.item_id}/recheck`);
-    mediaInfoStatuses.value = { ...mediaInfoStatuses.value, [row.item_id]: response.data };
-    message.success('媒体信息四层状态已重新核对。');
+    const response = await axios.post(`/api/media-info/items/${row.item_id}/recheck`, null, {
+      signal: request.signal,
+    });
+    request.commit(() => {
+      mediaInfoStatuses.value = { ...mediaInfoStatuses.value, [row.item_id]: response.data };
+      message.success('媒体信息四层状态已重新核对。');
+    });
   } catch (err) {
-    message.error(err.response?.data?.error || '重新核对失败。');
+    if (!axios.isCancel(err) && request.isCurrent()) {
+      message.error(err.response?.data?.error || '重新核对失败。');
+    }
   } finally {
-    loadingAction.value[`recheck-${row.item_id}`] = false;
+    if (loadingAction.value[actionKey] === request.generation) {
+      loadingAction.value[actionKey] = false;
+    }
+    request.finish();
   }
 };
 
 const repairMediaInfo = async (row) => {
-  loadingAction.value[`repair-${row.item_id}`] = true;
+  const actionKey = `repair-${row.item_id}`;
+  if (loadingAction.value[actionKey]) return;
+  const request = mediaInfoRequestGate.begin(row.item_id);
+  loadingAction.value[actionKey] = request.generation;
   try {
-    const response = await axios.post(`/api/media-info/items/${row.item_id}/repair`);
+    const response = await axios.post(`/api/media-info/items/${row.item_id}/repair`, null, {
+      signal: request.signal,
+    });
+    if (!request.isCurrent()) return;
     message.success(response.data.result === 'existing' ? '该项目已有修复任务。' : '神医单项修复任务已提交。');
+    loadingAction.value[actionKey] = false;
+    request.finish();
     await fetchMediaInfoStatuses([row]);
   } catch (err) {
-    message.error(err.response?.data?.reason_code || err.response?.data?.error || '修复任务提交失败。');
+    if (!axios.isCancel(err) && request.isCurrent()) {
+      message.error(err.response?.data?.reason_code || err.response?.data?.error || '修复任务提交失败。');
+    }
   } finally {
-    loadingAction.value[`repair-${row.item_id}`] = false;
+    if (mediaInfoRequestGate.isActive() && loadingAction.value[actionKey] === request.generation) {
+      loadingAction.value[actionKey] = false;
+    }
+    request.finish();
   }
 };
 
 const repairSelectedMediaInfo = async () => {
-  if (checkedRowKeys.value.length === 0 || checkedRowKeys.value.length > 20) return;
+  if (batchRepairLoading.value || checkedRowKeys.value.length === 0 || checkedRowKeys.value.length > 20) return;
+  const request = mediaInfoRequestGate.begin('__batch__');
+  const selectedIds = [...checkedRowKeys.value];
+  selectedIds.forEach(itemId => mediaInfoRequestGate.invalidate(itemId));
+  batchRepairLoading.value = true;
   try {
     const response = await axios.post('/api/media-info/repair-batch', {
-      item_ids: checkedRowKeys.value
+      item_ids: selectedIds
+    }, {
+      signal: request.signal,
     });
+    if (!request.isCurrent()) return;
     const data = response.data;
     message.success(`已接受 ${data.accepted.length}，跳过 ${data.skipped.length}，拒绝 ${data.rejected.length}。`);
     const selectedRows = tableData.value.filter(row => checkedRowKeys.value.includes(row.item_id));
     await fetchMediaInfoStatuses(selectedRows);
   } catch (err) {
-    message.error(err.response?.data?.error || '批量修复提交失败。');
+    if (!axios.isCancel(err) && request.isCurrent()) {
+      message.error(err.response?.data?.error || '批量修复提交失败。');
+    }
+  } finally {
+    request.commit(() => { batchRepairLoading.value = false; });
+    request.finish();
   }
 };
 
@@ -652,6 +711,8 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (mediaInfoPollTimer) window.clearInterval(mediaInfoPollTimer);
+  mediaInfoRequestGate.dispose();
+  listRequestGate.dispose();
 });
 </script>
 

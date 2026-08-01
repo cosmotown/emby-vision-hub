@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --force",
     "build": "vite build",
+    "test:mediainfo": "node --test tests/latestRequestGate.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

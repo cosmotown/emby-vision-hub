@@ -66,6 +66,14 @@ class MediaInfoSafetyContractTests(unittest.TestCase):
         self.assertIn("不会刷新整季、整剧或媒体库", review)
         self.assertIn("EVH 不会自行执行 ffprobe", review)
 
+    def test_ui_feature_flag_and_batch_guard_fail_closed(self):
+        review = (ROOT / "emby-actor-ui" / "src" / "components" / "ReviewList.vue").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("shenyi_mediainfo_repair_enabled === true", review)
+        self.assertIn("batchRepairLoading.value", review)
+        self.assertIn("if (batchRepairLoading.value", review)
+
 
 if __name__ == "__main__":
     unittest.main()

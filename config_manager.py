@@ -65,6 +65,16 @@ DYNAMIC_CONFIG_DEF = {
     constants.CONFIG_OPTION_EMBY_LIBRARIES_TO_PROCESS: (constants.CONFIG_SECTION_EMBY, 'list', []),
     constants.CONFIG_OPTION_EMBY_ADMIN_USER: (constants.CONFIG_SECTION_EMBY, 'string', ""),
     constants.CONFIG_OPTION_EMBY_ADMIN_PASS: (constants.CONFIG_SECTION_EMBY, 'password', ""), 
+    constants.CONFIG_OPTION_SHENYI_MEDIAINFO_REPAIR_ENABLED: (
+        constants.CONFIG_SECTION_EMBY,
+        'boolean',
+        False,
+    ),
+    constants.CONFIG_OPTION_SHENYI_MEDIAINFO_JSON_ROOT: (
+        constants.CONFIG_SECTION_EMBY,
+        'string',
+        "",
+    ),
 
     # [ReverseProxy]
     constants.CONFIG_OPTION_PROXY_ENABLED: (constants.CONFIG_SECTION_REVERSE_PROXY, 'boolean', False),

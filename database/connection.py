@@ -141,6 +141,39 @@ def init_db():
                 """)
 
                 cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS media_info_repair_jobs (
+                        id BIGSERIAL PRIMARY KEY,
+                        exact_item_id TEXT NOT NULL UNIQUE,
+                        item_type TEXT NOT NULL,
+                        exact_strm_path_hash TEXT NOT NULL,
+                        redacted_path_hint TEXT,
+                        root_series_key TEXT NOT NULL,
+                        state TEXT NOT NULL DEFAULT 'idle',
+                        reason_code TEXT,
+                        generation BIGINT NOT NULL DEFAULT 0,
+                        post_attempts INTEGER NOT NULL DEFAULT 0,
+                        submitted_at TIMESTAMP WITH TIME ZONE,
+                        started_at TIMESTAMP WITH TIME ZONE,
+                        completed_at TIMESTAMP WITH TIME ZONE,
+                        retry_after TIMESTAMP WITH TIME ZONE,
+                        precheck_fingerprint TEXT,
+                        final_fingerprint TEXT,
+                        response_kind TEXT,
+                        snapshot_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_media_info_repair_jobs_state
+                    ON media_info_repair_jobs (state, updated_at)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_media_info_repair_jobs_root
+                    ON media_info_repair_jobs (root_series_key, state)
+                """)
+
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS person_cleanup_candidates (
                         person_id TEXT PRIMARY KEY,
                         person_name TEXT,

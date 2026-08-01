@@ -100,6 +100,8 @@ CONFIG_OPTION_EMBY_API_TIMEOUT = "emby_api_timeout"     # Emby API 超时时间
 CONFIG_OPTION_EMBY_LIBRARIES_TO_PROCESS = "libraries_to_process" # 需要处理的媒体库名称列表
 CONFIG_OPTION_EMBY_ADMIN_USER = "emby_admin_user"       # (可选) 用于自动登录获取令牌的管理员用户名
 CONFIG_OPTION_EMBY_ADMIN_PASS = "emby_admin_pass"       # (可选) 用于自动登录获取令牌的管理员密码
+CONFIG_OPTION_SHENYI_MEDIAINFO_REPAIR_ENABLED = "shenyi_mediainfo_repair_enabled"
+CONFIG_OPTION_SHENYI_MEDIAINFO_JSON_ROOT = "shenyi_mediainfo_json_root"
 
 # ==============================================================================
 # ✨ 数据处理流程配置 (Processing Workflow)

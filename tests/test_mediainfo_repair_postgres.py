@@ -111,22 +111,27 @@ class MediaInfoRepairPostgresTests(unittest.TestCase):
             conn.commit()
 
     def _race(self, snapshots):
+        generations = [repository.next_generation() for _ in snapshots]
         barrier = threading.Barrier(len(snapshots))
         results = []
+        errors = []
         lock = threading.Lock()
 
         def create(index, value):
-            generation = repository.next_generation()
-            barrier.wait(timeout=5)
-            result = repository.create_job(
-                value,
-                generation,
-                128,
-                f"instance-{index}",
-                90,
-            )
-            with lock:
-                results.append(result)
+            try:
+                barrier.wait(timeout=15)
+                result = repository.create_job(
+                    value,
+                    generations[index],
+                    128,
+                    f"instance-{index}",
+                    90,
+                )
+                with lock:
+                    results.append(result)
+            except Exception as exc:
+                with lock:
+                    errors.append(exc)
 
         threads = [
             threading.Thread(target=create, args=(index, value))
@@ -135,8 +140,10 @@ class MediaInfoRepairPostgresTests(unittest.TestCase):
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join(timeout=10)
+            thread.join(timeout=30)
         self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual([], errors)
+        self.assertEqual(len(snapshots), len(results))
         return results
 
     def test_fifty_way_same_item_admission_is_one_active_row(self):

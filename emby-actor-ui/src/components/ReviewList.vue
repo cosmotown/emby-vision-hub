@@ -54,6 +54,25 @@
             </template>
             确定要重新处理所有 {{ totalItems }} 条待复核记录吗？
         </n-popconfirm>
+        <n-popconfirm
+          @positive-click="repairSelectedMediaInfo"
+          :positive-button-props="{ type: 'warning' }"
+        >
+          <template #trigger>
+            <n-button
+              type="warning"
+              ghost
+              :disabled="checkedRowKeys.length === 0 || checkedRowKeys.length > 20 || !repairFeatureEnabled"
+            >
+              调用神医修复已选项 ({{ checkedRowKeys.length }}/20)
+            </n-button>
+          </template>
+          <div style="max-width: 420px;">
+            将逐项调用神医单 Item MediaInfo 接口，可能访问 STRM 对应的远程媒体，
+            并可能由神医触发 ffprobe/rffmpeg。不会刷新整季、整剧或媒体库，
+            EVH 也不会自行执行 ffprobe。确认继续吗？
+          </div>
+        </n-popconfirm>
 
       <n-spin :show="loading">
         <div v-if="error" class="error-message">
@@ -71,6 +90,8 @@
             size="small"
             :row-key="row => row.item_id"
             :loading="loadingAction[currentRowId]"
+            :checked-row-keys="checkedRowKeys"
+            @update:checked-row-keys="keys => checkedRowKeys = keys"
             remote 
           />
           <n-empty 
@@ -87,11 +108,11 @@
 
 <script setup>
 import { useRouter } from 'vue-router';
-import { ref, onMounted, computed, h } from 'vue';
+import { ref, onMounted, onBeforeUnmount, computed, h } from 'vue';
 import axios from 'axios';
 import {
     NCard, NSpin, NAlert, NText, NDataTable, NButton, NSpace, NPopconfirm, NEmpty, NInput, NIcon,
-    useMessage
+    NTag, useMessage
 } from 'naive-ui';
 import { HeartOutline as AddToWatchlistIcon } from '@vicons/ionicons5';
 import { SearchOutline as SearchIcon, PlayForwardOutline as ReprocessIcon, CheckmarkCircleOutline as MarkDoneIcon, TrashOutline as TrashIcon } from '@vicons/ionicons5';
@@ -122,6 +143,49 @@ const searchQuery = ref('');
 const loadingAction = ref({});
 const currentRowId = ref(null);
 const isShowingSearchResults = ref(false);
+const checkedRowKeys = ref([]);
+const mediaInfoStatuses = ref({});
+let mediaInfoPollTimer = null;
+const repairFeatureEnabled = computed(() => Boolean(configModel.value?.shenyi_mediainfo_repair_enabled));
+
+const mediaStatusLabels = {
+  present: 'STRM存在',
+  missing: 'STRM缺失',
+  unreadable: 'STRM不可读',
+  invalid_content: 'STRM无效',
+  path_unmapped: '路径未映射',
+  indexed: 'Emby已收录',
+  not_indexed: 'Emby未收录',
+  path_mismatch: '路径不匹配',
+  duplicate_match: '重复匹配',
+  lookup_failed: '查询失败',
+  present_valid: '神医持久化有效',
+  present_invalid: '神医持久化无效',
+  present_unreadable: '持久化不可读',
+  not_configured: '持久化未配置',
+  not_observable: '持久化不可观察',
+  identity_mismatch: '持久化身份不符',
+  ready: '媒体流就绪',
+  partial: '媒体流部分就绪',
+  media_source_missing: 'MediaSource缺失',
+  media_streams_empty: 'MediaStreams为空',
+  video_stream_missing: '视频流缺失',
+  read_failed: '媒体流读取失败',
+  unknown: '未知',
+};
+
+const statusTagType = (status) => {
+  if (['present', 'indexed', 'present_valid', 'ready'].includes(status)) return 'success';
+  if (['unknown', 'not_configured', 'not_observable'].includes(status)) return 'default';
+  if (['partial', 'media_streams_empty', 'video_stream_missing'].includes(status)) return 'warning';
+  return 'error';
+};
+
+const statusTag = (label, layer) => h(
+  NTag,
+  { size: 'small', type: statusTagType(layer?.status), bordered: false },
+  { default: () => `${label}: ${mediaStatusLabels[layer?.status] || layer?.status || '未知'}` }
+);
 
 // ... other functions like addToWatchlist, formatDate, etc. remain unchanged ...
 const addToWatchlist = async (rowData) => {
@@ -204,6 +268,12 @@ const handleMarkAsProcessed = async (row) => {
 
 const columns = computed(() => [
   {
+    type: 'selection',
+    disabled(row) {
+      return !['Movie', 'Episode'].includes(row.item_type);
+    }
+  },
+  {
     title: '媒体名称 (ID)',
     key: 'item_name',
     resizable: true,
@@ -246,15 +316,81 @@ const columns = computed(() => [
     }
   },
   {
+    title: 'MediaInfo 四层状态',
+    key: 'media_info_status',
+    width: 260,
+    render(row) {
+      const status = mediaInfoStatuses.value[row.item_id];
+      if (!status) {
+        return h(NText, { depth: 3 }, { default: () => '尚未读取' });
+      }
+      return h(NSpace, { vertical: true, size: 4 }, {
+        default: () => [
+          statusTag('STRM', status.strm_status),
+          statusTag('Emby', status.emby_index_status),
+          statusTag('神医', status.shenyi_persist_status),
+          statusTag('媒体流', status.emby_media_status),
+          h(NText, { depth: 3, style: 'font-size: 0.78em;' }, {
+            default: () => `总结: ${status.summary_status || 'unknown'}`
+          }),
+          status.active_job ? h(NText, { depth: 3, style: 'font-size: 0.78em;' }, {
+            default: () => `任务: ${status.active_job.state}${status.active_job.reason_code ? ` / ${status.active_job.reason_code}` : ''}`
+          }) : null,
+          status.retry_after ? h(NText, { type: 'warning', style: 'font-size: 0.78em;' }, {
+            default: () => `冷却至: ${formatDate(status.retry_after)}`
+          }) : null,
+        ]
+      });
+    }
+  },
+  {
     title: '操作',
     key: 'actions',
-    width: 280,
+    width: 520,
     align: 'center',
     fixed: 'right',
     render(row) {
       const actionButtons = [];
       
       // ✅ [修改] 将“重新处理”按钮移出条件判断，使其在搜索结果中也显示
+      actionButtons.push(
+        h(NButton, {
+          size: 'small',
+          type: 'info',
+          ghost: true,
+          disabled: !['Movie', 'Episode'].includes(row.item_type) || loadingAction.value[`recheck-${row.item_id}`],
+          loading: loadingAction.value[`recheck-${row.item_id}`],
+          onClick: () => recheckMediaInfo(row)
+        }, { default: () => '重新核对' })
+      );
+
+      const mediaStatus = mediaInfoStatuses.value[row.item_id];
+      actionButtons.push(
+        h(NPopconfirm, { onPositiveClick: () => repairMediaInfo(row) }, {
+          trigger: () => h(NButton, {
+            size: 'small',
+            type: 'warning',
+            ghost: true,
+            loading: loadingAction.value[`repair-${row.item_id}`],
+            disabled: !repairFeatureEnabled.value || !mediaStatus?.repair_eligible || loadingAction.value[`repair-${row.item_id}`]
+          }, { default: () => '神医修复' }),
+          default: () => h('div', { style: 'max-width: 420px;' },
+            '将调用神医单 Item MediaInfo 接口，可能访问 STRM 对应远程媒体并由神医触发 ffprobe/rffmpeg；不会刷新整季、整剧或媒体库，EVH 不会自行执行 ffprobe。'
+          )
+        })
+      );
+
+      if (mediaStatus?.active_job?.state === 'pending') {
+        actionButtons.push(
+          h(NButton, {
+            size: 'small',
+            type: 'error',
+            ghost: true,
+            onClick: () => cancelMediaInfoJob(row)
+          }, { default: () => '取消等待' })
+        );
+      }
+
       actionButtons.push(
         h(NPopconfirm, { onPositiveClick: () => handleReprocessItem(row) }, {
             trigger: () => h(NButton, {
@@ -347,6 +483,8 @@ const fetchReviewItems = async () => {
     });
     tableData.value = response.data.items;
     totalItems.value = response.data.total_items;
+    checkedRowKeys.value = [];
+    await fetchMediaInfoStatuses(tableData.value);
   } catch (err) {
     handleFetchError(err, "加载待处理列表失败。");
   } finally {
@@ -369,6 +507,8 @@ const searchEmbyLibrary = async () => {
         reason: 'N/A',
     }));
     totalItems.value = response.data.total_items;
+    checkedRowKeys.value = [];
+    await fetchMediaInfoStatuses(tableData.value);
   } catch (err) {
     handleFetchError(err, "搜索 Emby 媒体库失败。");
   } finally {
@@ -425,8 +565,93 @@ const handleSearch = () => {
   }
 };
 
+const fetchMediaInfoStatuses = async (rows) => {
+  const eligibleRows = (rows || []).filter(row => ['Movie', 'Episode'].includes(row.item_type));
+  const results = await Promise.allSettled(
+    eligibleRows.map(async row => {
+      const response = await axios.get(`/api/media-info/items/${row.item_id}/status`);
+      return [row.item_id, response.data];
+    })
+  );
+  const next = { ...mediaInfoStatuses.value };
+  for (const result of results) {
+    if (result.status === 'fulfilled') {
+      next[result.value[0]] = result.value[1];
+    }
+  }
+  mediaInfoStatuses.value = next;
+};
+
+const recheckMediaInfo = async (row) => {
+  loadingAction.value[`recheck-${row.item_id}`] = true;
+  try {
+    const response = await axios.post(`/api/media-info/items/${row.item_id}/recheck`);
+    mediaInfoStatuses.value = { ...mediaInfoStatuses.value, [row.item_id]: response.data };
+    message.success('媒体信息四层状态已重新核对。');
+  } catch (err) {
+    message.error(err.response?.data?.error || '重新核对失败。');
+  } finally {
+    loadingAction.value[`recheck-${row.item_id}`] = false;
+  }
+};
+
+const repairMediaInfo = async (row) => {
+  loadingAction.value[`repair-${row.item_id}`] = true;
+  try {
+    const response = await axios.post(`/api/media-info/items/${row.item_id}/repair`);
+    message.success(response.data.result === 'existing' ? '该项目已有修复任务。' : '神医单项修复任务已提交。');
+    await fetchMediaInfoStatuses([row]);
+  } catch (err) {
+    message.error(err.response?.data?.reason_code || err.response?.data?.error || '修复任务提交失败。');
+  } finally {
+    loadingAction.value[`repair-${row.item_id}`] = false;
+  }
+};
+
+const repairSelectedMediaInfo = async () => {
+  if (checkedRowKeys.value.length === 0 || checkedRowKeys.value.length > 20) return;
+  try {
+    const response = await axios.post('/api/media-info/repair-batch', {
+      item_ids: checkedRowKeys.value
+    });
+    const data = response.data;
+    message.success(`已接受 ${data.accepted.length}，跳过 ${data.skipped.length}，拒绝 ${data.rejected.length}。`);
+    const selectedRows = tableData.value.filter(row => checkedRowKeys.value.includes(row.item_id));
+    await fetchMediaInfoStatuses(selectedRows);
+  } catch (err) {
+    message.error(err.response?.data?.error || '批量修复提交失败。');
+  }
+};
+
+const cancelMediaInfoJob = async (row) => {
+  const jobId = mediaInfoStatuses.value[row.item_id]?.active_job?.id;
+  if (!jobId) return;
+  try {
+    await axios.post(`/api/media-info/jobs/${jobId}/cancel`);
+    message.success('等待中的任务已取消。');
+    await fetchMediaInfoStatuses([row]);
+  } catch (err) {
+    message.error(err.response?.data?.error || '任务已开始，无法取消。');
+  }
+};
+
+const refreshActiveMediaInfoJobs = async () => {
+  const activeRows = tableData.value.filter(row => {
+    const state = mediaInfoStatuses.value[row.item_id]?.active_job?.state;
+    return ['pending', 'running', 'submitting', 'submitted'].includes(state);
+  });
+  if (activeRows.length) {
+    await fetchMediaInfoStatuses(activeRows);
+  }
+};
+
 onMounted(() => {
   fetchReviewItems();
+  mediaInfoPollTimer = window.setInterval(refreshActiveMediaInfoJobs, 3000);
+});
+
+onBeforeUnmount(() => {
+  if (mediaInfoPollTimer) window.clearInterval(mediaInfoPollTimer);
 });
 </script>
 

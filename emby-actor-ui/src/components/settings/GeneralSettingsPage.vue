@@ -234,6 +234,28 @@
                     <n-form-item label="本地数据源路径" path="local_data_path">
                       <n-input v-model:value="configModel.local_data_path" placeholder="神医TMDB缓存目录 (cache和override的上层)" />
                     </n-form-item>
+                    <n-form-item label="启用神医单项媒体信息修复" path="shenyi_mediainfo_repair_enabled">
+                      <n-switch v-model:value="configModel.shenyi_mediainfo_repair_enabled" />
+                      <template #feedback>
+                        <n-text depth="3" style="font-size:0.8em;">
+                          需要 Emby 已安装兼容版本的神医助手。EVH 只调用
+                          <code>/Items/SyncMediaInfo</code> 的单 Item 模式；
+                          不调用 PlaybackInfo，不刷新整季、整剧或媒体库，也不会自行执行 ffprobe。
+                        </n-text>
+                      </template>
+                    </n-form-item>
+                    <n-form-item label="神医 MediaInfo JSON 根目录" path="shenyi_mediainfo_json_root">
+                      <n-input
+                        v-model:value="configModel.shenyi_mediainfo_json_root"
+                        placeholder="例如 /STRM/JSON；留空表示未配置"
+                      />
+                      <template #feedback>
+                        <n-text depth="3" style="font-size:0.8em;">
+                          仅用于只读观察神医持久化结果。目录未挂载时显示“不可观察”，
+                          EVH 不会修改、删除或将 JSON 作为恢复请求发送。
+                        </n-text>
+                      </template>
+                    </n-form-item>
                     <n-form-item label="TMDB API Key" path="tmdb_api_key">
                       <n-input type="password" show-password-on="mousedown" v-model:value="configModel.tmdb_api_key" placeholder="输入你的 TMDB API Key" />
                     </n-form-item>

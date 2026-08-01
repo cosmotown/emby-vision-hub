@@ -15,6 +15,20 @@ jobs:
   backend:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: evh_test
+          POSTGRES_PASSWORD: evh_test
+          POSTGRES_DB: evh_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U evh_test -d evh_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,6 +49,11 @@ jobs:
         env:
           APP_DATA_DIR: ${{ runner.temp }}/evh-test-data
           TERM: xterm
+          EVH_TEST_POSTGRES_HOST: 127.0.0.1
+          EVH_TEST_POSTGRES_PORT: "5432"
+          EVH_TEST_POSTGRES_USER: evh_test
+          EVH_TEST_POSTGRES_PASSWORD: evh_test
+          EVH_TEST_POSTGRES_DB: evh_test
         run: python -m unittest discover -s tests -p 'test_*.py' -v
 
   frontend:
@@ -54,6 +73,9 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm install --no-fund --legacy-peer-deps
+
+      - name: Run MediaInfo response ordering tests
+        run: npm run test:mediainfo
 
       - name: Build frontend
         run: npm run build

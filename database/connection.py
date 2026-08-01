@@ -141,6 +141,141 @@ def init_db():
                 """)
 
                 cursor.execute("""
+                    SELECT pg_advisory_xact_lock(
+                        hashtext('media_info_repair_schema_v2')
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS media_info_repair_jobs (
+                        id BIGSERIAL PRIMARY KEY,
+                        exact_item_id TEXT NOT NULL UNIQUE,
+                        item_type TEXT NOT NULL,
+                        exact_strm_path_hash TEXT NOT NULL,
+                        redacted_path_hint TEXT,
+                        root_series_key TEXT NOT NULL,
+                        state TEXT NOT NULL DEFAULT 'idle',
+                        reason_code TEXT,
+                        generation BIGINT NOT NULL DEFAULT 0,
+                        post_attempts INTEGER NOT NULL DEFAULT 0,
+                        submitted_at TIMESTAMP WITH TIME ZONE,
+                        started_at TIMESTAMP WITH TIME ZONE,
+                        completed_at TIMESTAMP WITH TIME ZONE,
+                        retry_after TIMESTAMP WITH TIME ZONE,
+                        precheck_fingerprint TEXT,
+                        final_fingerprint TEXT,
+                        response_kind TEXT,
+                        owner_instance_id TEXT,
+                        owner_generation BIGINT,
+                        heartbeat_at TIMESTAMP WITH TIME ZONE,
+                        lease_expires_at TIMESTAMP WITH TIME ZONE,
+                        snapshot_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cursor.execute("""
+                    ALTER TABLE media_info_repair_jobs
+                    ADD COLUMN IF NOT EXISTS owner_instance_id TEXT
+                """)
+                cursor.execute("""
+                    ALTER TABLE media_info_repair_jobs
+                    ADD COLUMN IF NOT EXISTS owner_generation BIGINT
+                """)
+                cursor.execute("""
+                    ALTER TABLE media_info_repair_jobs
+                    ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMP WITH TIME ZONE
+                """)
+                cursor.execute("""
+                    ALTER TABLE media_info_repair_jobs
+                    ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMP WITH TIME ZONE
+                """)
+                cursor.execute("""
+                    CREATE SEQUENCE IF NOT EXISTS media_info_repair_generation_seq
+                """)
+                cursor.execute("""
+                    SELECT setval(
+                        'media_info_repair_generation_seq',
+                        GREATEST(
+                            COALESCE(MAX(generation), 0),
+                            (SELECT last_value FROM media_info_repair_generation_seq),
+                            1
+                        ),
+                        TRUE
+                    )
+                    FROM media_info_repair_jobs
+                """)
+                # Phase B installations may contain active rows admitted before
+                # path/root uniqueness existed. Upgrade fail-closed: keep the
+                # oldest claimant and terminalize every duplicate before adding
+                # the partial unique indexes. Main v7.2.11 has no such rows.
+                cursor.execute("""
+                    WITH duplicate_ids AS (
+                        SELECT id
+                          FROM (
+                            SELECT id,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY exact_strm_path_hash
+                                       ORDER BY id
+                                   ) AS path_rank,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY root_series_key
+                                       ORDER BY id
+                                   ) AS root_rank
+                              FROM media_info_repair_jobs
+                             WHERE state IN ('pending', 'running', 'submitting')
+                          ) ranked
+                         WHERE path_rank > 1 OR root_rank > 1
+                    )
+                    UPDATE media_info_repair_jobs AS jobs
+                       SET state = CASE
+                               WHEN jobs.post_attempts > 0
+                                    OR jobs.state = 'submitting'
+                               THEN 'ambiguous'
+                               ELSE 'shutdown_before_start'
+                           END,
+                           reason_code = CASE
+                               WHEN jobs.post_attempts > 0
+                                    OR jobs.state = 'submitting'
+                               THEN 'post_result_ambiguous'
+                               ELSE 'migration_active_conflict'
+                           END,
+                           completed_at = NOW(),
+                           owner_instance_id = NULL,
+                           owner_generation = NULL,
+                           heartbeat_at = NULL,
+                           lease_expires_at = NULL,
+                           updated_at = NOW()
+                      FROM duplicate_ids
+                     WHERE jobs.id = duplicate_ids.id
+                """)
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        uq_media_info_repair_active_item
+                    ON media_info_repair_jobs (exact_item_id)
+                    WHERE state IN ('pending', 'running', 'submitting')
+                """)
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        uq_media_info_repair_active_path
+                    ON media_info_repair_jobs (exact_strm_path_hash)
+                    WHERE state IN ('pending', 'running', 'submitting')
+                """)
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        uq_media_info_repair_active_root
+                    ON media_info_repair_jobs (root_series_key)
+                    WHERE state IN ('pending', 'running', 'submitting')
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_media_info_repair_jobs_state
+                    ON media_info_repair_jobs (state, updated_at)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_media_info_repair_jobs_root
+                    ON media_info_repair_jobs (root_series_key, state)
+                """)
+
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS person_cleanup_candidates (
                         person_id TEXT PRIMARY KEY,
                         person_name TEXT,

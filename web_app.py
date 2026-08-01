@@ -51,6 +51,7 @@ from tasks.system_update import cleanup_stale_updater_containers
 from routes.unified_auth import unified_auth_bp
 from routes.user_portal import user_portal_bp
 from routes.discover import discover_bp
+from routes.media_info import media_info_bp
 # --- 核心模块导入 ---
 import constants # 你的常量定义\
 import logging
@@ -376,6 +377,9 @@ def application_exit_handler():
     if monitor_service_instance:
         monitor_service_instance.stop()
 
+    from services.mediainfo_repair_queue import shutdown_media_info_coordinator
+    shutdown_media_info_coordinator()
+
     # 4. 关闭其他资源
     if extensions.media_processor_instance: # 从 extensions 获取
         extensions.media_processor_instance.close()
@@ -423,6 +427,7 @@ app.register_blueprint(webhook_bp)
 app.register_blueprint(unified_auth_bp)
 app.register_blueprint(user_portal_bp)
 app.register_blueprint(discover_bp)
+app.register_blueprint(media_info_bp)
 
 def main_app_start():
     """将主应用启动逻辑封装成一个函数"""

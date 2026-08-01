@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -25,6 +25,27 @@ MAX_STRM_BYTES = 64 * 1024
 MAX_PERSIST_BYTES = 16 * 1024 * 1024
 SUPPORTED_ITEM_TYPES = {"Movie", "Episode"}
 ACTIVE_JOB_STATES = {"pending", "running", "submitting", "submitted"}
+CONFIRMED_INCOMPLETE_MEDIA_STATES = {
+    "media_source_missing",
+    "media_streams_empty",
+    "video_stream_missing",
+    "partial",
+}
+logger = logging.getLogger(__name__)
+
+_VOLATILE_FINGERPRINT_KEYS = {
+    "observed_at",
+    "last_checked_at",
+    "snapshot_fingerprint",
+    "submitted_at",
+    "started_at",
+    "completed_at",
+    "updated_at",
+    "heartbeat_at",
+    "lease_expires_at",
+    "request_id",
+    "job_id",
+}
 
 
 def _utc_now() -> str:
@@ -42,6 +63,32 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _semantic_projection(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _semantic_projection(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in _VOLATILE_FINGERPRINT_KEYS
+        }
+    if isinstance(value, (list, tuple, set)):
+        projected = [_semantic_projection(item) for item in value]
+        return sorted(
+            projected,
+            key=lambda item: json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ),
+        )
+    return value
+
+
+def _semantic_fingerprint(snapshot: Dict[str, Any]) -> str:
+    return _fingerprint(_semantic_projection(snapshot))
+
+
 def _path_hash(value: str) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
 
@@ -55,6 +102,103 @@ def _safe_hint(value: str) -> str:
     if not name:
         return "unmapped"
     return re.sub(r"[\r\n\t]", "_", name)[:160]
+
+
+def _safe_relative_parts(root: str, candidate: str) -> Tuple[str, list[str]]:
+    if "\x00" in root or "\x00" in candidate:
+        raise ValueError("NUL in path")
+    if not os.path.isabs(root) or not os.path.isabs(candidate):
+        raise ValueError("paths must be absolute")
+    if os.path.islink(root):
+        raise ValueError("configured root is a symlink")
+    raw_parts = candidate.replace("\\", "/").split("/")
+    if any(part == ".." for part in raw_parts):
+        raise ValueError("path traversal")
+    lexical_root = os.path.abspath(os.path.normpath(root))
+    lexical_candidate = os.path.abspath(os.path.normpath(candidate))
+    if os.path.commonpath([lexical_candidate, lexical_root]) != lexical_root:
+        raise ValueError("candidate escaped root")
+    relative = os.path.relpath(lexical_candidate, lexical_root)
+    parts = relative.split(os.sep)
+    if relative in {"", "."} or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("candidate has invalid components")
+    return lexical_root, parts
+
+
+def _safe_read_under_root(
+    root: str,
+    candidate: str,
+    *,
+    max_bytes: int,
+) -> Tuple[str, Optional[bytes], Optional[os.stat_result]]:
+    """Open every child descriptor-relative and reject all child symlinks."""
+    try:
+        canonical_root, parts = _safe_relative_parts(root, candidate)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory_fd = os.open(canonical_root, directory_flags | nofollow)
+    except FileNotFoundError:
+        return "missing", None, None
+    except (OSError, ValueError):
+        return "unsafe", None, None
+
+    opened_dirs = [directory_fd]
+    file_fd: Optional[int] = None
+    try:
+        for component in parts[:-1]:
+            next_fd = os.open(
+                component,
+                directory_flags | nofollow,
+                dir_fd=directory_fd,
+            )
+            opened_dirs.append(next_fd)
+            directory_fd = next_fd
+        file_fd = os.open(parts[-1], os.O_RDONLY | nofollow, dir_fd=directory_fd)
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            return "unsafe", None, before
+        if before.st_size <= 0 or before.st_size > max_bytes:
+            return "invalid_size", None, before
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(file_fd, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(file_fd)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        if len(raw) > max_bytes or identity_before != identity_after:
+            return "unstable", None, before
+        return "ok", raw, before
+    except FileNotFoundError:
+        return "missing", None, None
+    except (PermissionError, OSError):
+        return "unsafe", None, None
+    finally:
+        if file_fd is not None:
+            try:
+                os.close(file_fd)
+            except OSError:
+                pass
+        for opened_fd in reversed(opened_dirs):
+            try:
+                os.close(opened_fd)
+            except OSError:
+                pass
 
 
 def _observation(
@@ -238,6 +382,8 @@ class MediaInfoStateService:
         ]
 
     def _match_visible_root(self, item_path: str) -> Optional[str]:
+        if not os.path.isabs(str(item_path or "")) or "\x00" in str(item_path):
+            return None
         target = _normalize_path(item_path)
         for excluded in self._configured_excluded_paths():
             normalized_excluded = _normalize_path(excluded)
@@ -252,7 +398,7 @@ class MediaInfoStateService:
                 within = os.path.commonpath([target, normalized_root]) == normalized_root
             except ValueError:
                 within = False
-            if within and os.path.isdir(root):
+            if within and os.path.isdir(root) and not os.path.islink(root):
                 return root
         return None
 
@@ -276,27 +422,38 @@ class MediaInfoStateService:
                     "configured_root_count": len(self._configured_strm_roots()),
                 },
             ), None
-        try:
-            file_stat = os.stat(item_path, follow_symlinks=False)
-        except FileNotFoundError:
+        read_status, raw, file_stat = _safe_read_under_root(
+            root,
+            item_path,
+            max_bytes=MAX_STRM_BYTES,
+        )
+        if read_status == "missing":
             return _observation(
                 "missing",
                 "strm_missing",
                 {"path_fingerprint": _path_hash(item_path)},
             ), root
-        except (PermissionError, OSError):
+        if read_status == "unstable":
             return _observation(
                 "unreadable",
                 "strm_unreadable",
                 {"path_fingerprint": _path_hash(item_path)},
             ), root
-        if not stat.S_ISREG(file_stat.st_mode) or not os.access(item_path, os.R_OK):
+        if read_status == "unsafe":
             return _observation(
                 "unreadable",
                 "strm_unreadable",
+                {"path_fingerprint": _path_hash(item_path)},
+            ), root
+        if read_status == "invalid_size" or file_stat is None or raw is None:
+            return _observation(
+                "invalid_content",
+                "strm_invalid_content",
                 {
                     "path_fingerprint": _path_hash(item_path),
-                    "regular_file": stat.S_ISREG(file_stat.st_mode),
+                    "regular_file": bool(
+                        file_stat and stat.S_ISREG(file_stat.st_mode)
+                    ),
                 },
             ), root
 
@@ -308,12 +465,6 @@ class MediaInfoStateService:
         }
         if item_path.lower().endswith(".strm"):
             try:
-                if file_stat.st_size <= 0 or file_stat.st_size > MAX_STRM_BYTES:
-                    raise ValueError("invalid STRM size")
-                with open(item_path, "rb") as handle:
-                    raw = handle.read(MAX_STRM_BYTES + 1)
-                if len(raw) > MAX_STRM_BYTES:
-                    raise ValueError("STRM too large")
                 text = raw.decode("utf-8-sig").strip()
                 lines = [line.strip() for line in text.splitlines() if line.strip()]
                 if len(lines) != 1:
@@ -349,8 +500,8 @@ class MediaInfoStateService:
                 "shenyi_persist_not_configured",
                 {"configured": False},
             )
-        json_root = os.path.normpath(json_root_value)
-        if not os.path.isdir(json_root):
+        json_root = os.path.abspath(os.path.normpath(json_root_value))
+        if not os.path.isdir(json_root) or os.path.islink(json_root):
             return _observation(
                 "not_observable",
                 "shenyi_persist_not_observable",
@@ -363,6 +514,8 @@ class MediaInfoStateService:
                 {"source_root_mapped": False},
             )
         try:
+            if "\x00" in item_path or ".." in item_path.replace("\\", "/").split("/"):
+                raise ValueError("unsafe media path")
             normalized_item_path = os.path.normpath(item_path)
             if not os.path.isabs(normalized_item_path):
                 raise ValueError("media path is not absolute")
@@ -393,99 +546,75 @@ class MediaInfoStateService:
             "source_path_fingerprint": _path_hash(item_path),
             "identity_rule": "absolute_path_mirror_without_media_extension",
         }
-        try:
-            before = os.lstat(candidate)
-        except FileNotFoundError:
+        read_status, raw, before = _safe_read_under_root(
+            json_root,
+            candidate,
+            max_bytes=MAX_PERSIST_BYTES,
+        )
+        if read_status == "missing":
             return _observation(
                 "missing",
                 "shenyi_persist_missing",
                 evidence,
             )
-        except (PermissionError, OSError):
+        if read_status == "unstable":
+            return _observation(
+                "unknown",
+                "shenyi_write_in_progress",
+                evidence,
+            )
+        if read_status == "unsafe":
             return _observation(
                 "present_unreadable",
                 "shenyi_persist_not_observable",
                 evidence,
             )
-
-        evidence.update(
-            {
-                "size": int(before.st_size),
-                "mtime_ns": int(before.st_mtime_ns),
-            }
-        )
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_size <= 0
-            or before.st_size > MAX_PERSIST_BYTES
-            or not os.access(candidate, os.R_OK)
-        ):
-            reason = (
-                "shenyi_persist_invalid"
-                if before.st_size <= 0 or before.st_size > MAX_PERSIST_BYTES
-                else "shenyi_persist_not_observable"
+        if before is not None:
+            evidence.update(
+                {"size": int(before.st_size), "mtime_ns": int(before.st_mtime_ns)}
             )
-            status_value = (
-                "present_invalid"
-                if reason == "shenyi_persist_invalid"
-                else "present_unreadable"
+        if read_status == "invalid_size" or raw is None:
+            return _observation(
+                "present_invalid",
+                "shenyi_persist_invalid",
+                evidence,
             )
-            return _observation(status_value, reason, evidence)
 
         try:
-            with open(candidate, "rb") as handle:
-                raw = handle.read(MAX_PERSIST_BYTES + 1)
-            after = os.lstat(candidate)
-            before_identity = (
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-            )
-            after_identity = (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-            )
-            if len(raw) > MAX_PERSIST_BYTES or before_identity != after_identity:
-                return _observation(
-                    "unknown",
-                    "shenyi_write_in_progress",
-                    evidence,
-                )
             parsed = json.loads(raw.decode("utf-8"))
             if not isinstance(parsed, list) or not parsed:
                 raise ValueError("top level is not a non-empty array")
-            first = parsed[0]
-            if not isinstance(first, dict):
-                raise ValueError("first entry is not an object")
-            source_info = first.get("MediaSourceInfo")
-            if not isinstance(source_info, dict):
-                raise ValueError("MediaSourceInfo is missing")
-            streams = source_info.get("MediaStreams")
-            if not isinstance(streams, list):
-                raise ValueError("MediaStreams is missing")
+            valid_sources = []
+            streams: list[Dict[str, Any]] = []
+            for entry in parsed:
+                if not isinstance(entry, dict):
+                    continue
+                source_info = entry.get("MediaSourceInfo")
+                if not isinstance(source_info, dict):
+                    continue
+                source_streams = source_info.get("MediaStreams")
+                if not isinstance(source_streams, list) or not source_streams:
+                    continue
+                if any(not isinstance(stream, dict) for stream in source_streams):
+                    continue
+                valid_sources.append(source_info)
+                streams.extend(source_streams)
+            video_count = sum(
+                1
+                for stream in streams
+                if str(stream.get("Type") or "").lower() == "video"
+            )
+            if not valid_sources or not streams or video_count <= 0:
+                raise ValueError("no valid video MediaSourceInfo")
             evidence.update(
                 {
                     "sha256": hashlib.sha256(raw).hexdigest(),
-                    "media_source_count": len(parsed),
+                    "media_source_count": len(valid_sources),
                     "stream_count": len(streams),
-                    "video_stream_count": sum(
-                        1
-                        for stream in streams
-                        if isinstance(stream, dict)
-                        and str(stream.get("Type") or "").lower() == "video"
-                    ),
+                    "video_stream_count": video_count,
                 }
             )
             return _observation("present_valid", None, evidence)
-        except (PermissionError, OSError):
-            return _observation(
-                "present_unreadable",
-                "shenyi_persist_not_observable",
-                evidence,
-            )
         except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
             return _observation(
                 "present_invalid",
@@ -617,8 +746,19 @@ class MediaInfoStateService:
 
         strm_status, visible_root = self._observe_strm(item_path)
         persist_status = self._observe_shenyi_persist(item_path, visible_root)
+        media_recheck_status = None
         if include_media and emby_index["status"] == "indexed":
-            media_status = self.read_emby_media(normalized_item_id)
+            observed_media = self.read_emby_media(normalized_item_id)
+            prior_media = (previous_snapshot or {}).get("emby_media_status")
+            if (
+                observed_media.get("status") == "read_failed"
+                and isinstance(prior_media, dict)
+                and prior_media.get("status") == "ready"
+            ):
+                media_status = prior_media
+                media_recheck_status = observed_media
+            else:
+                media_status = observed_media
         else:
             prior_media = (previous_snapshot or {}).get("emby_media_status")
             media_status = (
@@ -645,9 +785,11 @@ class MediaInfoStateService:
             "emby_media_status": media_status,
             "last_checked_at": _utc_now(),
         }
+        if media_recheck_status is not None:
+            snapshot["emby_media_recheck_status"] = media_recheck_status
         snapshot["summary_status"] = self.derive_summary(snapshot)
         snapshot["suggested_action"] = self.suggest_action(snapshot)
-        snapshot["snapshot_fingerprint"] = _fingerprint(snapshot)
+        snapshot["snapshot_fingerprint"] = _semantic_fingerprint(snapshot)
         return snapshot
 
     @staticmethod
@@ -693,15 +835,17 @@ class MediaInfoStateService:
         feature_enabled: Optional[bool] = None,
         now: Optional[datetime] = None,
     ) -> Tuple[bool, Optional[str]]:
-        enabled = (
-            bool(
-                self.config.get(
-                    constants.CONFIG_OPTION_SHENYI_MEDIAINFO_REPAIR_ENABLED,
-                    False,
-                )
+        raw_enabled = (
+            self.config.get(
+                constants.CONFIG_OPTION_SHENYI_MEDIAINFO_REPAIR_ENABLED,
+                False,
             )
             if feature_enabled is None
-            else bool(feature_enabled)
+            else feature_enabled
+        )
+        enabled = config_manager.parse_strict_boolean(
+            raw_enabled,
+            option_name=constants.CONFIG_OPTION_SHENYI_MEDIAINFO_REPAIR_ENABLED,
         )
         if not enabled:
             return False, "repair_disabled"
@@ -716,7 +860,8 @@ class MediaInfoStateService:
             return False, "repair_not_eligible"
         if (snapshot.get("identity") or {}).get("item_type") not in SUPPORTED_ITEM_TYPES:
             return False, "repair_not_eligible"
-        if (snapshot.get("emby_media_status") or {}).get("status") == "ready":
+        media_status = (snapshot.get("emby_media_status") or {}).get("status")
+        if media_status not in CONFIRMED_INCOMPLETE_MEDIA_STATES:
             return False, "repair_not_eligible"
         if active_job and active_job.get("state") in ACTIVE_JOB_STATES:
             return False, "repair_already_active"
@@ -752,6 +897,7 @@ def public_snapshot(
         "emby_index_status": snapshot.get("emby_index_status"),
         "shenyi_persist_status": snapshot.get("shenyi_persist_status"),
         "emby_media_status": snapshot.get("emby_media_status"),
+        "emby_media_recheck_status": snapshot.get("emby_media_recheck_status"),
         "summary_status": snapshot.get("summary_status"),
         "suggested_action": snapshot.get("suggested_action"),
         "last_checked_at": snapshot.get("last_checked_at"),

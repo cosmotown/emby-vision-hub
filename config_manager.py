@@ -11,6 +11,21 @@ import constants # 你的常量定义
 
 logger = logging.getLogger(__name__)
 
+
+def parse_strict_boolean(value: Any, *, option_name: str = "configuration") -> bool:
+    """Parse documented boolean representations; malformed values fail closed."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    if value is not None:
+        logger.warning("配置项 '%s' 的布尔值无效，已按关闭处理。", option_name)
+    return False
+
 # --- 路径和配置定义 ---
 # 这部分逻辑与配置紧密相关，所以移到这里
 APP_DATA_DIR_ENV = os.environ.get("APP_DATA_DIR")
@@ -288,6 +303,12 @@ def load_config():
                 stored_docker_image,
                 migrated_docker_image,
             )
+        repair_option = constants.CONFIG_OPTION_SHENYI_MEDIAINFO_REPAIR_ENABLED
+        if repair_option in dynamic_config_from_db:
+            dynamic_config_from_db[repair_option] = parse_strict_boolean(
+                dynamic_config_from_db[repair_option],
+                option_name=repair_option,
+            )
         # 将数据库中的配置与 DYNAMIC_CONFIG_DEF 中定义的默认值合并
         # 这样可以确保即使数据库中的配置不完整，或者未来代码中新增了配置项，程序也能正常工作
         final_dynamic_config = {}
@@ -327,6 +348,12 @@ def save_config(new_config: Dict[str, Any]):
         # 步骤 2: 将前端传入的新配置更新（合并）到这个完整的配置对象中
         # 这确保了只更新变化的键，而不会丢失其他键
         full_dynamic_config.update(new_config)
+        repair_option = constants.CONFIG_OPTION_SHENYI_MEDIAINFO_REPAIR_ENABLED
+        if repair_option in full_dynamic_config:
+            full_dynamic_config[repair_option] = parse_strict_boolean(
+                full_dynamic_config[repair_option],
+                option_name=repair_option,
+            )
         if constants.CONFIG_OPTION_DOCKER_IMAGE_NAME in full_dynamic_config:
             full_dynamic_config[constants.CONFIG_OPTION_DOCKER_IMAGE_NAME] = (
                 _normalize_docker_image_name(

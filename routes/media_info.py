@@ -64,9 +64,27 @@ def repair_item(item_id: str):
 @media_info_bp.route("/repair-batch", methods=["POST"])
 @admin_required
 def repair_batch():
-    payload = request.get_json(silent=True) or {}
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify(
+            {
+                "error": "请求正文必须是 JSON 对象",
+                "reason_code": "repair_not_eligible",
+            }
+        ), 400
+    item_ids = payload.get("item_ids")
+    if not isinstance(item_ids, list) or any(
+        isinstance(value, bool) or not isinstance(value, (str, int))
+        for value in item_ids
+    ):
+        return jsonify(
+            {
+                "error": "item_ids 必须是标量 ID 数组",
+                "reason_code": "repair_not_eligible",
+            }
+        ), 422
     try:
-        result = _coordinator().submit_batch(payload.get("item_ids"))
+        result = _coordinator().submit_batch(item_ids)
         return jsonify(result), 202 if result["accepted"] else 200
     except ValueError as exc:
         return jsonify({"error": str(exc), "reason_code": "repair_not_eligible"}), 400

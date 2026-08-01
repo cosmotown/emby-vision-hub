@@ -116,6 +116,22 @@ class MediaInfoApiTests(unittest.TestCase):
         )
         self.assertEqual(400, too_many.status_code)
 
+    def test_malformed_batch_payloads_are_client_errors(self):
+        for payload in ([], "bad", 7, None):
+            with self.subTest(payload=payload):
+                response = self.client.post(
+                    "/api/media-info/repair-batch",
+                    json=payload,
+                )
+                self.assertIn(response.status_code, {400, 422})
+        for item_ids in ({"nested": True}, [["nested"]]):
+            with self.subTest(item_ids=item_ids):
+                response = self.client.post(
+                    "/api/media-info/repair-batch",
+                    json={"item_ids": item_ids},
+                )
+                self.assertEqual(422, response.status_code)
+
     def test_job_and_pending_cancel(self):
         job = self.client.get("/api/media-info/jobs/9")
         cancel = self.client.post("/api/media-info/jobs/9/cancel")

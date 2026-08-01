@@ -186,19 +186,9 @@ class MediaInfoStateTests(unittest.TestCase):
             handle.write(raw)
         self.config[constants.CONFIG_OPTION_SHENYI_MEDIAINFO_JSON_ROOT] = self.json_root
         get.side_effect = self._catalog_responses()
-        original_lstat = os.lstat
-        before = original_lstat(self._json_path())
-        changed = types.SimpleNamespace(
-            st_dev=before.st_dev,
-            st_ino=before.st_ino,
-            st_size=before.st_size + 1,
-            st_mtime_ns=before.st_mtime_ns + 1,
-            st_mode=before.st_mode,
-        )
-
         with mock.patch(
-            "services.mediainfo_state.os.lstat",
-            side_effect=[before, changed],
+            "services.mediainfo_state._safe_read_under_root",
+            return_value=("unstable", None, None),
         ):
             snapshot = self._service().observe("episode-1", include_media=False)
 

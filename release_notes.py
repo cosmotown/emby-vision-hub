@@ -2,6 +2,50 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.12",
+        "published_at": "2026-08-02T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.12",
+        "changelog": """## 神医 MediaInfo 单项修复编排
+
+- 新增 STRM、Emby 收录、神医持久化和 Emby 媒体流四层独立状态。
+- 通过神医公开的单 Item `SyncMediaInfo` 接口，精确修复 Movie 或 Episode 的媒体信息。
+- 神医继续负责媒体源访问、ffprobe/rffmpeg/dffmpeg、MediaInfo 提取和注入；EVH 不重新实现媒体探测。
+- HTTP 成功响应不直接视为修复成功，最终以 Emby MediaSources/MediaStreams 严格回读为准。
+- 神医持久化 JSON 仅作为可选只读证据，不作为成功必要条件，也不会被 EVH 修改或回灌。
+
+### 有限队列与跨实例安全
+
+- 新增独立有限修复队列，默认全局 2 worker、同作品并发 1、单批最多 20 项。
+- 支持 Item、STRM 路径和作品根目录级去重、失败冷却及 pending 取消。
+- 使用 PostgreSQL 原子活动任务约束、实例所有权、generation、heartbeat 和 lease 防止多实例重复提交。
+- 在发送不可重放的神医请求前，先持久化 `submitting + post_attempts=1`。
+- timeout、连接中断、进程崩溃或终态写库失败均 fail-closed，不会自动发送第二次请求。
+- worker 提交前重新核验 Item、类型、路径、STRM、媒体流和功能开关，过期任务不再执行。
+
+### 状态页面与安全加固
+
+- ReviewList 新增四层状态、重新核对、单项修复、最多 20 项批量修复、冷却和任务状态。
+- 设置页新增默认关闭的“神医单项媒体信息修复”开关及可选只读 JSON 根目录。
+- 修复资格采用正向 allowlist；unknown、read_failed、路径冲突和身份冲突均拒绝执行。
+- STRM 与神医 JSON 读取使用逐层 `O_NOFOLLOW`，父目录和最终文件 symlink 均 fail-closed。
+- 前端增加响应 generation，避免旧请求覆盖较新的 ready 或任务状态。
+- 数据库、日志和 API 不保存或输出完整媒体 URL、token、Cookie、pickcode 或完整 MediaInfo JSON。
+
+### 明确不包含
+
+- 不包含 PlaybackInfo 伪播放修复。
+- 不包含 Item、Series、Season 或媒体库级 Refresh fallback。
+- 不包含 EVH 自行执行 ffprobe/dffmpeg/rffmpeg。
+- 不包含 JSON body 自动恢复。
+- 不包含无人值守扫描或自动全库修复。
+- 不包含虚拟库更新延迟专项。
+- 不包含全仓数据库空值语义重构。
+- 不包含 P115StrmHelper 自身兼容性修复。
+
+""",
+    },
+
+    {
         "version": "v7.2.11",
         "published_at": "2026-07-30T21:19:01+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.11",

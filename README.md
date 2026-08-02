@@ -6,7 +6,7 @@
 
 [![中文文档](https://img.shields.io/badge/docs-中文文档-8D51F9)](https://github.com/cosmotown/emby-vision-hub/tree/main/docs/zh)
 [![GitHub license](https://img.shields.io/github/license/cosmotown/emby-vision-hub.svg)](https://github.com/cosmotown/emby-vision-hub/blob/main/LICENSE)
-[![Version](https://img.shields.io/badge/version-7.2.11-6E66ED)](https://github.com/cosmotown/emby-vision-hub/releases)
+[![Version](https://img.shields.io/badge/version-7.2.12-6E66ED)](https://github.com/cosmotown/emby-vision-hub/releases)
 
 EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 STRM 入库协调、元数据增强、智能订阅、媒体整理、合集与虚拟库、封面生成、任务调度、用户权限和运行诊断。
 

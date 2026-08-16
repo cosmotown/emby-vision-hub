@@ -54,6 +54,23 @@
             </template>
             确定要重新处理所有 {{ totalItems }} 条待复核记录吗？
         </n-popconfirm>
+        <n-button
+          type="info"
+          ghost
+          :loading="globalRecheck.running"
+          :disabled="isShowingSearchResults || totalItems === 0 || globalRecheck.running"
+          @click="recheckAllMediaInfo"
+        >
+          重新核对全部
+        </n-button>
+        <n-button
+          v-if="globalRecheck.running"
+          type="error"
+          ghost
+          @click="cancelRecheckAllMediaInfo"
+        >
+          停止核对
+        </n-button>
         <n-popconfirm
           @positive-click="repairSelectedMediaInfo"
           :positive-button-props="{ type: 'warning' }"
@@ -74,6 +91,16 @@
             EVH 也不会自行执行 ffprobe。确认继续吗？
           </div>
         </n-popconfirm>
+
+      <n-alert
+        v-if="globalRecheck.running || globalRecheck.completed > 0"
+        :type="globalRecheck.failed > 0 ? 'warning' : 'info'"
+        style="margin: 16px 0;"
+      >
+        全部核对进度：{{ globalRecheck.completed }}/{{ globalRecheck.total }}，
+        成功 {{ globalRecheck.succeeded }}，失败 {{ globalRecheck.failed }}
+        <span v-if="globalRecheck.cancelled">（已停止）</span>
+      </n-alert>
 
       <n-spin :show="loading">
         <div v-if="error" class="error-message">
@@ -120,6 +147,7 @@ import { SearchOutline as SearchIcon, PlayForwardOutline as ReprocessIcon, Check
 
 import { useConfig } from '../composables/useConfig';
 import { createLatestRequestGate } from '../utils/latestRequestGate';
+import { collectUniqueReviewTargets, runBoundedReadOnlyRecheck } from '../utils/boundedMediaInfoRecheck';
 
 // ✅ [修正] defineProps returns an object, which we've named `props`.
 const props = defineProps({
@@ -148,10 +176,29 @@ const isShowingSearchResults = ref(false);
 const checkedRowKeys = ref([]);
 const mediaInfoStatuses = ref({});
 const batchRepairLoading = ref(false);
+const globalRecheck = ref({
+  running: false,
+  total: 0,
+  completed: 0,
+  succeeded: 0,
+  failed: 0,
+  cancelled: false,
+});
+let globalRecheckGeneration = 0;
+let globalRecheckController = null;
 let mediaInfoPollTimer = null;
 const mediaInfoRequestGate = createLatestRequestGate();
 const listRequestGate = createLatestRequestGate();
 const repairFeatureEnabled = computed(() => configModel.value?.shenyi_mediainfo_repair_enabled === true);
+
+const rowTargetId = (row) => {
+  const explicit = row?.media_info_target?.target_item_id;
+  if (explicit) return String(explicit);
+  if (isShowingSearchResults.value && ['Movie', 'Episode'].includes(row?.item_type)) {
+    return String(row.item_id);
+  }
+  return null;
+};
 
 const mediaStatusLabels = {
   present: 'STRM存在',
@@ -275,7 +322,7 @@ const columns = computed(() => [
   {
     type: 'selection',
     disabled(row) {
-      return !['Movie', 'Episode'].includes(row.item_type);
+      return !rowTargetId(row);
     }
   },
   {
@@ -289,6 +336,12 @@ const columns = computed(() => [
       }, [
         h(NText, { strong: true }, { default: () => row.item_name || '未知名称' }),
         h(NText, { depth: 3, style: 'font-size: 0.8em; display: block; margin-top: 2px;' }, { default: () => `(ID: ${row.item_id || 'N/A'})` })
+        ,
+        row.media_info_target?.target_resolution === 'series_episode'
+          ? h(NText, { depth: 3, style: 'font-size: 0.8em; display: block;' }, {
+              default: () => `MediaInfo 目标: S${row.media_info_target.target_parent_index_number}E${row.media_info_target.target_index_number} / Item ${row.media_info_target.target_item_id}`
+            })
+          : null
       ]);
     }
   },
@@ -327,7 +380,8 @@ const columns = computed(() => [
     render(row) {
       const status = mediaInfoStatuses.value[row.item_id];
       if (!status) {
-        return h(NText, { depth: 3 }, { default: () => '尚未读取' });
+        const reason = row.media_info_target?.target_reason_code;
+        return h(NText, { depth: 3 }, { default: () => reason ? `目标不可确定: ${reason}` : '尚未读取' });
       }
       return h(NSpace, { vertical: true, size: 4 }, {
         default: () => [
@@ -363,7 +417,7 @@ const columns = computed(() => [
           size: 'small',
           type: 'info',
           ghost: true,
-          disabled: !['Movie', 'Episode'].includes(row.item_type) || loadingAction.value[`recheck-${row.item_id}`],
+          disabled: !rowTargetId(row) || globalRecheck.value.running || loadingAction.value[`recheck-${row.item_id}`],
           loading: loadingAction.value[`recheck-${row.item_id}`],
           onClick: () => recheckMediaInfo(row)
         }, { default: () => '重新核对' })
@@ -586,11 +640,11 @@ const handleSearch = () => {
 };
 
 const fetchMediaInfoStatuses = async (rows) => {
-  const eligibleRows = (rows || []).filter(row => ['Movie', 'Episode'].includes(row.item_type));
+  const eligibleRows = (rows || []).filter(row => rowTargetId(row));
   await Promise.allSettled(eligibleRows.map(async row => {
     const request = mediaInfoRequestGate.begin(row.item_id);
     try {
-      const response = await axios.get(`/api/media-info/items/${row.item_id}/status`, {
+      const response = await axios.get(`/api/media-info/items/${rowTargetId(row)}/status`, {
         signal: request.signal,
       });
       request.commit(() => {
@@ -606,11 +660,13 @@ const fetchMediaInfoStatuses = async (rows) => {
 };
 
 const recheckMediaInfo = async (row) => {
+  const targetId = rowTargetId(row);
+  if (!targetId) return;
   const request = mediaInfoRequestGate.begin(row.item_id);
   const actionKey = `recheck-${row.item_id}`;
   loadingAction.value[actionKey] = request.generation;
   try {
-    const response = await axios.post(`/api/media-info/items/${row.item_id}/recheck`, null, {
+    const response = await axios.post(`/api/media-info/items/${targetId}/recheck`, null, {
       signal: request.signal,
     });
     request.commit(() => {
@@ -630,12 +686,14 @@ const recheckMediaInfo = async (row) => {
 };
 
 const repairMediaInfo = async (row) => {
+  const targetId = rowTargetId(row);
+  if (!targetId) return;
   const actionKey = `repair-${row.item_id}`;
   if (loadingAction.value[actionKey]) return;
   const request = mediaInfoRequestGate.begin(row.item_id);
   loadingAction.value[actionKey] = request.generation;
   try {
-    const response = await axios.post(`/api/media-info/items/${row.item_id}/repair`, null, {
+    const response = await axios.post(`/api/media-info/items/${targetId}/repair`, null, {
       signal: request.signal,
     });
     if (!request.isCurrent()) return;
@@ -658,8 +716,9 @@ const repairMediaInfo = async (row) => {
 const repairSelectedMediaInfo = async () => {
   if (batchRepairLoading.value || checkedRowKeys.value.length === 0 || checkedRowKeys.value.length > 20) return;
   const request = mediaInfoRequestGate.begin('__batch__');
-  const selectedIds = [...checkedRowKeys.value];
-  selectedIds.forEach(itemId => mediaInfoRequestGate.invalidate(itemId));
+  const selectedRows = tableData.value.filter(row => checkedRowKeys.value.includes(row.item_id));
+  const selectedIds = [...new Set(selectedRows.map(rowTargetId).filter(Boolean))];
+  selectedRows.forEach(row => mediaInfoRequestGate.invalidate(row.item_id));
   batchRepairLoading.value = true;
   try {
     const response = await axios.post('/api/media-info/repair-batch', {
@@ -670,7 +729,6 @@ const repairSelectedMediaInfo = async () => {
     if (!request.isCurrent()) return;
     const data = response.data;
     message.success(`已接受 ${data.accepted.length}，跳过 ${data.skipped.length}，拒绝 ${data.rejected.length}。`);
-    const selectedRows = tableData.value.filter(row => checkedRowKeys.value.includes(row.item_id));
     await fetchMediaInfoStatuses(selectedRows);
   } catch (err) {
     if (!axios.isCancel(err) && request.isCurrent()) {
@@ -704,6 +762,80 @@ const refreshActiveMediaInfoJobs = async () => {
   }
 };
 
+const cancelRecheckAllMediaInfo = () => {
+  if (!globalRecheck.value.running) return;
+  globalRecheckGeneration += 1;
+  globalRecheck.value = { ...globalRecheck.value, running: false, cancelled: true };
+  globalRecheckController?.abort();
+  globalRecheckController = null;
+};
+
+const recheckAllMediaInfo = async () => {
+  if (globalRecheck.value.running) return;
+  const generation = ++globalRecheckGeneration;
+  globalRecheck.value = {
+    running: true,
+    total: 0,
+    completed: 0,
+    succeeded: 0,
+    failed: 0,
+    cancelled: false,
+  };
+  const controller = new AbortController();
+  globalRecheckController = controller;
+  const sourceRequests = new Map();
+  try {
+    const response = await axios.get('/api/media-info/review-targets', {
+      params: { limit: 1000 },
+      signal: controller.signal,
+    });
+    if (generation !== globalRecheckGeneration) return;
+    if (response.data.truncated) {
+      message.warning(`待复核记录超过 ${response.data.limit} 条，本次按安全上限处理前 ${response.data.limit} 条。`);
+    }
+    const targets = collectUniqueReviewTargets(response.data.targets || []);
+    for (const target of targets) {
+      for (const sourceId of target.sourceIds) {
+        sourceRequests.set(sourceId, mediaInfoRequestGate.begin(sourceId));
+      }
+    }
+    globalRecheck.value = { ...globalRecheck.value, total: targets.length };
+    const summary = await runBoundedReadOnlyRecheck({
+      entries: response.data.targets || [],
+      concurrency: 4,
+      signal: controller.signal,
+      isCurrent: () => generation === globalRecheckGeneration,
+      requestRecheck: async (targetId, signal) => {
+        const result = await axios.post(`/api/media-info/items/${targetId}/recheck`, null, { signal });
+        return result.data;
+      },
+      onResult: (target, result) => {
+        const next = { ...mediaInfoStatuses.value };
+        target.sourceIds.forEach(sourceId => {
+          sourceRequests.get(sourceId)?.commit(() => { next[sourceId] = result; });
+        });
+        mediaInfoStatuses.value = next;
+      },
+      onProgress: progress => {
+        if (generation !== globalRecheckGeneration) return;
+        globalRecheck.value = { ...globalRecheck.value, ...progress };
+      },
+    });
+    if (generation === globalRecheckGeneration) {
+      globalRecheck.value = { ...globalRecheck.value, ...summary, running: false };
+      message.success(`全部核对完成：${globalRecheck.value.succeeded} 成功，${globalRecheck.value.failed} 失败。`);
+    }
+  } catch (err) {
+    if (!axios.isCancel(err) && generation === globalRecheckGeneration) {
+      globalRecheck.value = { ...globalRecheck.value, running: false, failed: globalRecheck.value.failed + 1 };
+      message.error(err.response?.data?.error || '加载全部核对目标失败。');
+    }
+  } finally {
+    sourceRequests.forEach(request => request.finish());
+    if (globalRecheckController === controller) globalRecheckController = null;
+  }
+};
+
 onMounted(() => {
   fetchReviewItems();
   mediaInfoPollTimer = window.setInterval(refreshActiveMediaInfoJobs, 3000);
@@ -713,6 +845,7 @@ onBeforeUnmount(() => {
   if (mediaInfoPollTimer) window.clearInterval(mediaInfoPollTimer);
   mediaInfoRequestGate.dispose();
   listRequestGate.dispose();
+  cancelRecheckAllMediaInfo();
 });
 </script>
 

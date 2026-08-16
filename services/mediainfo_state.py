@@ -24,6 +24,7 @@ import handler.emby as emby
 MAX_STRM_BYTES = 64 * 1024
 MAX_PERSIST_BYTES = 16 * 1024 * 1024
 SUPPORTED_ITEM_TYPES = {"Movie", "Episode"}
+REVIEW_DIRECT_ITEM_TYPES = {"Movie", "Episode"}
 ACTIVE_JOB_STATES = {"pending", "running", "submitting", "submitted"}
 CONFIRMED_INCOMPLETE_MEDIA_STATES = {
     "media_source_missing",
@@ -359,6 +360,127 @@ class MediaInfoStateService:
                 {"configured": True},
             ), item
 
+    def resolve_review_target(
+        self,
+        item_id: str,
+        item_type: str,
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Resolve one review row to an explicit Movie/Episode MediaInfo target.
+
+        Review rows for Series may describe a failed episode in their reason.  The
+        reason is only a coordinate hint; Emby identity is authoritative and must
+        resolve to exactly one Episode before any status or repair action is shown.
+        """
+        source_id = str(item_id or "").strip()
+        source_type = str(item_type or "").strip()
+        result: Dict[str, Any] = {
+            "source_item_id": source_id,
+            "source_item_type": source_type or "Unknown",
+            "target_item_id": None,
+            "target_item_type": None,
+            "target_series_id": None,
+            "target_parent_index_number": None,
+            "target_index_number": None,
+            "target_resolution": "unresolved",
+            "target_reason_code": "unsupported_review_item_type",
+        }
+        if not source_id:
+            result["target_reason_code"] = "review_item_id_missing"
+            return result
+        if source_type in REVIEW_DIRECT_ITEM_TYPES:
+            result.update(
+                {
+                    "target_item_id": source_id,
+                    "target_item_type": source_type,
+                    "target_resolution": "self",
+                    "target_reason_code": None,
+                }
+            )
+            return result
+        if source_type != "Series":
+            return result
+
+        coordinates = {
+            (int(season), int(episode))
+            for season, episode in re.findall(
+                r"(?i)(?<![A-Z0-9])S(\d{1,4})E(\d{1,4})(?![A-Z0-9])",
+                str(reason or ""),
+            )
+        }
+        if len(coordinates) != 1:
+            result["target_reason_code"] = (
+                "episode_coordinate_missing"
+                if not coordinates
+                else "episode_coordinate_ambiguous"
+            )
+            return result
+        season_number, episode_number = next(iter(coordinates))
+
+        base_url, api_key, _ = self._emby_config()
+        if not base_url or not api_key:
+            result["target_reason_code"] = "emby_lookup_failed"
+            return result
+        try:
+            response = emby.emby_client.get(
+                f"{base_url}/Items",
+                params={
+                    "SeriesId": source_id,
+                    "IncludeItemTypes": "Episode",
+                    "Recursive": "true",
+                    # Emby 4.9 accepts these coordinate parameters but does not
+                    # apply them on the global /Items route.  Read one bounded
+                    # Series page and enforce the coordinate locally instead.
+                    "Limit": 500,
+                    "Fields": (
+                        "Id,Name,Type,Path,ParentId,SeriesId,"
+                        "ParentIndexNumber,IndexNumber"
+                    ),
+                },
+                headers={"X-Emby-Token": api_key},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            items = payload.get("Items") if isinstance(payload, dict) else None
+            if not isinstance(items, list):
+                raise ValueError("invalid Emby episode response")
+            total = payload.get("TotalRecordCount", len(items))
+            if not isinstance(total, int) or total > len(items):
+                result["target_reason_code"] = "episode_target_query_truncated"
+                return result
+        except Exception:
+            result["target_reason_code"] = "emby_lookup_failed"
+            return result
+
+        exact = [
+            item
+            for item in items
+            if isinstance(item, dict)
+            and str(item.get("Id") or "").strip()
+            and str(item.get("Type") or "") == "Episode"
+            and str(item.get("SeriesId") or "").strip() == source_id
+            and item.get("ParentIndexNumber") == season_number
+            and item.get("IndexNumber") == episode_number
+        ]
+        if len(exact) != 1:
+            result["target_reason_code"] = (
+                "episode_target_not_found" if not exact else "episode_target_ambiguous"
+            )
+            return result
+        target = exact[0]
+        result.update(
+            {
+                "target_item_id": str(target["Id"]),
+                "target_item_type": "Episode",
+                "target_series_id": source_id,
+                "target_parent_index_number": season_number,
+                "target_index_number": episode_number,
+                "target_resolution": "series_episode",
+                "target_reason_code": None,
+            }
+        )
+        return result
+
     def _configured_strm_roots(self) -> list[str]:
         config = self.config
         roots: list[str] = []
@@ -385,13 +507,6 @@ class MediaInfoStateService:
         if not os.path.isabs(str(item_path or "")) or "\x00" in str(item_path):
             return None
         target = _normalize_path(item_path)
-        for excluded in self._configured_excluded_paths():
-            normalized_excluded = _normalize_path(excluded)
-            try:
-                if os.path.commonpath([target, normalized_excluded]) == normalized_excluded:
-                    return None
-            except ValueError:
-                continue
         for root in self._configured_strm_roots():
             normalized_root = _normalize_path(root)
             try:

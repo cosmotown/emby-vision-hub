@@ -174,7 +174,7 @@
                       </template>
                     </n-form-item>
 
-                    <n-form-item label="全目录查漏间隔" path="monitor_full_scan_interval_hours">
+                    <n-form-item label="库存目录轮转核对间隔" path="monitor_full_scan_interval_hours">
                       <n-input-number
                         v-model:value="configModel.monitor_full_scan_interval_hours"
                         :min="0"
@@ -187,7 +187,7 @@
                       </n-input-number>
                       <template #feedback>
                         <n-text depth="3" style="font-size:0.8em;">
-                          默认每天低频核对一次 STRM 路径库存；设为 0 关闭。失败路径由独立持久队列按约 10、30、60 分钟有限重试，不依赖此间隔。
+                          每次只用 scandir 核对有界数量的具体目录，不在启动或定时任务中递归扫描整个 STRM 根；设为 0 关闭。失败路径仍按约 10、30、60 分钟有限重试。
                         </n-text>
                       </template>
                     </n-form-item>
@@ -245,10 +245,13 @@
                       </template>
                     </n-form-item>
                     <n-form-item label="神医 MediaInfo JSON 根目录" path="shenyi_mediainfo_json_root">
-                      <n-input
-                        v-model:value="configModel.shenyi_mediainfo_json_root"
-                        placeholder="例如 /STRM/JSON；留空表示未配置"
-                      />
+                      <div class="path-picker-row">
+                        <n-input
+                          v-model:value="configModel.shenyi_mediainfo_json_root"
+                          placeholder="例如 /STRM/JSON；留空表示未配置"
+                        />
+                        <n-button @click="openDirectoryPicker('mediainfo-json')">选择</n-button>
+                      </div>
                       <template #feedback>
                         <n-text depth="3" style="font-size:0.8em;">
                           仅用于只读观察神医持久化结果。目录未挂载时显示“不可观察”，
@@ -1102,6 +1105,12 @@ const commonDirectoryParent = (paths) => {
 
 const openDirectoryPicker = (target) => {
   directoryPickerTarget.value = target;
+  if (target === 'mediainfo-json') {
+    const current = String(configModel.value?.shenyi_mediainfo_json_root || '/');
+    directoryPickerInitialPath.value = current || '/';
+    directoryPickerVisible.value = true;
+    return;
+  }
   const paths = target === 'exclude'
     ? configModel.value?.monitor_exclude_dirs
     : configModel.value?.monitor_paths;
@@ -1111,6 +1120,10 @@ const openDirectoryPicker = (target) => {
 
 const handleDirectorySelected = (path) => {
   if (!configModel.value || !path) return;
+  if (directoryPickerTarget.value === 'mediainfo-json') {
+    configModel.value.shenyi_mediainfo_json_root = path;
+    return;
+  }
   const key = directoryPickerTarget.value === 'exclude' ? 'monitor_exclude_dirs' : 'monitor_paths';
   const current = Array.isArray(configModel.value[key]) ? configModel.value[key] : [];
   if (!current.includes(path)) configModel.value[key] = [...current, path];

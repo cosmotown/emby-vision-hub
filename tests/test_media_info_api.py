@@ -155,6 +155,37 @@ class MediaInfoApiTests(unittest.TestCase):
         self.assertNotIn("/STRM/", body)
         self.assertIn("E01.strm", body)
 
+    @mock.patch("routes.media_info.MediaInfoStateService.resolve_review_target")
+    @mock.patch("routes.media_info.log_db.get_review_items_paginated")
+    def test_review_targets_are_bounded_and_explicit(self, get_rows, resolve):
+        get_rows.return_value = (
+            [
+                {
+                    "item_id": "series-1",
+                    "item_type": "Series",
+                    "reason": "MediaInfo incomplete [S01E08]",
+                }
+            ],
+            1200,
+        )
+        resolve.return_value = {
+            "source_item_id": "series-1",
+            "source_item_type": "Series",
+            "target_item_id": "episode-8",
+            "target_item_type": "Episode",
+            "target_resolution": "series_episode",
+            "target_reason_code": None,
+        }
+
+        response = self.client.get("/api/media-info/review-targets?limit=5000")
+
+        self.assertEqual(200, response.status_code)
+        body = response.get_json()
+        self.assertEqual(1000, body["limit"])
+        self.assertTrue(body["truncated"])
+        self.assertEqual("episode-8", body["targets"][0]["target"]["target_item_id"])
+        get_rows.assert_called_once_with(1, 1000, "")
+
 
 if __name__ == "__main__":
     unittest.main()

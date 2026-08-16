@@ -81,8 +81,8 @@
 | `monitor_enabled` | 启用实时监控 |
 | `monitor_paths` | 监控目录列表 |
 | `monitor_extensions` | 扩展名列表 |
-| `monitor_scan_lookback_days` | 回溯扫描天数 |
-| `monitor_full_scan_interval_hours` | STRM 路径库存全量校准间隔，默认 24 小时，0 为关闭 |
+| `monitor_scan_lookback_days` | 兼容旧配置；Inventory v2 启动时不执行递归回溯 |
+| `monitor_full_scan_interval_hours` | Inventory v2 持久目录轮转核对间隔，默认 24 小时，0 为关闭；不会定时递归扫描整棵 STRM |
 | `monitor_exclude_dirs` | 排除路径 |
 | `monitor_exclude_refresh_delay` | 排除路径的入库通知延迟秒数 |
 

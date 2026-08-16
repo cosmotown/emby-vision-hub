@@ -614,7 +614,10 @@ def handle_get_latest_items(user_id, params):
     try:
         base_url, api_key = _get_real_emby_url_and_key()
         virtual_library_id = params.get('ParentId') or params.get('customViewId')
-        limit = int(params.get('Limit', 20))
+        limit = max(1, min(int(params.get('Limit', 20)), 100))
+        offset = max(0, min(int(params.get('StartIndex', 0)), 5000))
+        sort_order = 'Ascending' if params.get('SortOrder') == 'Ascending' else 'Descending'
+        candidate_limit = min(5000, offset + limit)
         fields = params.get('Fields', "PrimaryImageAspectRatio,BasicSyncInfo,DateCreated,UserData")
 
         # --- 辅助函数：获取合集的过滤 ID ---
@@ -649,16 +652,16 @@ def handle_get_latest_items(user_id, params):
             if tmdb_ids_filter is not None and (len(tmdb_ids_filter) == 0 or tmdb_ids_filter == ["-1"]):
                  return Response(json.dumps([]), mimetype='application/json')
 
-            # 确定排序
+            # Latest must be ranked by the newest child Episode for Series.  Sorting
+            # parent rows by DateCreated first can permanently discard an old Series
+            # before Emby ever sees the candidate list.
             item_types = definition.get('item_type', ['Movie'])
-            is_series_only = isinstance(item_types, list) and len(item_types) == 1 and item_types[0] == 'Series'
-            sort_by = 'DateLastContentAdded,DateCreated' if is_series_only else 'DateCreated'
 
             # SQL 过滤权限和规则
             items, total_count = queries_db.query_virtual_library_items(
                 rules=definition.get('rules', []), logic=definition.get('logic', 'AND'),
-                user_id=user_id, limit=500, offset=0,
-                sort_by='DateCreated', sort_order='Descending',
+                user_id=user_id, limit=candidate_limit, offset=0,
+                sort_by='DateLastContentAdded', sort_order=sort_order,
                 item_types=item_types, target_library_ids=definition.get('target_library_ids', []),
                 tmdb_ids=tmdb_ids_filter  # <--- 传入 TMDb ID 限制
             )
@@ -666,11 +669,11 @@ def handle_get_latest_items(user_id, params):
             if not items: return Response(json.dumps([]), mimetype='application/json')
             final_emby_ids = [i['Id'] for i in items]
 
-            # 统一调用代理排序
-            sorted_data = _fetch_sorted_items_via_emby_proxy(
-                user_id, final_emby_ids, sort_by, 'Descending', limit, 0, fields, len(final_emby_ids)
-            )
-            return Response(json.dumps(sorted_data.get("Items", [])), mimetype='application/json')
+            page_ids = final_emby_ids[offset:offset + limit]
+            items_from_emby = _fetch_items_in_chunks(base_url, api_key, user_id, page_ids, fields)
+            items_map = {item['Id']: item for item in items_from_emby}
+            final_items = [items_map[item_id] for item_id in page_ids if item_id in items_map]
+            return Response(json.dumps(final_items), mimetype='application/json')
 
         # 场景二：全局最新 (所有可见合集的聚合)
         elif not virtual_library_id:
@@ -698,26 +701,34 @@ def handle_get_latest_items(user_id, params):
                     rules=definition.get('rules', []),
                     logic=definition.get('logic', 'AND'),
                     user_id=user_id,
-                    limit=limit, 
+                    limit=candidate_limit,
                     offset=0,
-                    sort_by='DateCreated',
-                    sort_order='Descending',
+                    sort_by='DateLastContentAdded',
+                    sort_order=sort_order,
                     item_types=definition.get('item_type', ['Movie']),
                     target_library_ids=definition.get('target_library_ids', []),
                     tmdb_ids=tmdb_ids_filter # <--- 传入 TMDb ID 限制
                 )
                 all_latest.extend(items)
             
-            # 去重并获取详情
-            unique_ids = list({i['Id'] for i in all_latest})
-            if not unique_ids: return Response(json.dumps([]), mimetype='application/json')
-            
-            # 批量获取详情
-            items_details = _fetch_items_in_chunks(base_url, api_key, user_id, unique_ids, "DateCreated")
-            # 内存排序
-            items_details.sort(key=lambda x: x.get('DateCreated', ''), reverse=True)
-            # 截取
-            latest_ids = [i['Id'] for i in items_details[:limit]]
+            # The same item may belong to multiple virtual collections. Keep its
+            # strongest latest-content timestamp, then rank globally before fetching
+            # details. This preserves Movie semantics while letting a newly added
+            # Episode lift its old parent Series.
+            unique_by_id = {}
+            for item in all_latest:
+                item_id = item.get('Id')
+                if not item_id:
+                    continue
+                current = unique_by_id.get(item_id)
+                if current is None or str(item.get('latest_sort_at') or '') > str(current.get('latest_sort_at') or ''):
+                    unique_by_id[item_id] = item
+            ranked = sorted(
+                unique_by_id.values(),
+                key=lambda item: str(item.get('latest_sort_at') or ''),
+                reverse=sort_order == 'Descending',
+            )
+            latest_ids = [item['Id'] for item in ranked[offset:offset + limit]]
 
         else:
             # 原生库请求，直接转发

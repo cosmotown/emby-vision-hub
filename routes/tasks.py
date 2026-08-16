@@ -27,8 +27,10 @@ def get_available_tasks():
     它现在只返回那些被标记为适合在任务链中运行的任务。
     """
     try:
-        # 调用 get_task_registry 时，明确告诉它我们需要用于“任务链”的上下文
-        registry = get_task_registry(context='chain')
+        context = request.args.get('context', 'chain')
+        if context not in {'chain', 'all'}:
+            return jsonify({"error": "不支持的任务列表上下文"}), 400
+        registry = get_task_registry(context=context)
         
         available_tasks = [
             {"key": key, "name": info[1]} 
@@ -181,17 +183,27 @@ def ignore_strm_ingest_event(event_id):
 def request_strm_inventory_full_audit():
     """Explicitly request full logical coverage through bounded directory claims."""
     try:
+        from monitor_service import (
+            inventory_audit_processing_available,
+            request_inventory_audit_processing,
+        )
+
         roots = config_manager.APP_CONFIG.get(
             constants.CONFIG_OPTION_MONITOR_EXCLUDE_DIRS,
             constants.DEFAULT_MONITOR_EXCLUDE_DIRS,
         ) or []
-        scheduled = strm_ingest_db.request_full_inventory_audit(roots)
         if not roots:
             return jsonify({'error': '未配置 STRM 库存根目录'}), 409
+        if not inventory_audit_processing_available():
+            return jsonify({'error': '实时监控服务未运行，无法启动 STRM 查漏'}), 409
+        scheduled = strm_ingest_db.request_full_inventory_audit(roots)
+        if not request_inventory_audit_processing():
+            return jsonify({'error': 'STRM 查漏唤醒失败，目录状态已保留'}), 503
         return jsonify({
-            'message': '完整库存审计已排入有界目录队列',
+            'message': 'STRM 查漏已排入有界目录队列',
             'scheduled_directories': scheduled,
             'recursive_os_walk': False,
+            'manual_only': True,
         }), 202
     except Exception as exc:
         logger.error('请求 STRM 完整库存审计失败: %s', type(exc).__name__)

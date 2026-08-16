@@ -1629,6 +1629,11 @@ def task_scan_monitor_folders(processor):
     persists dirty directory work which the normal leased, bounded scandir loop
     processes without a recursive root walk.
     """
+    from monitor_service import (
+        inventory_audit_processing_available,
+        request_inventory_audit_processing,
+    )
+
     monitor_enabled = processor.config.get(constants.CONFIG_OPTION_MONITOR_ENABLED)
     monitor_paths = processor.config.get(constants.CONFIG_OPTION_MONITOR_PATHS, [])
     exclude_dirs = processor.config.get(
@@ -1637,18 +1642,26 @@ def task_scan_monitor_folders(processor):
     ) or []
 
     if not monitor_enabled or not monitor_paths:
-        logger.info("  ➜ 实时监控未启用或未配置路径，跳过库存审计请求。")
+        logger.info("  ➜ 实时监控未启用或未配置路径，跳过 STRM 查漏请求。")
+        return
+    if not inventory_audit_processing_available():
+        logger.error("  ➜ 实时监控服务未运行，无法启动 STRM 查漏。")
+        task_manager.update_status_from_thread(100, "STRM 查漏未启动：实时监控服务未运行")
         return
     roots = exclude_dirs or monitor_paths
     scheduled = strm_ingest_db.request_full_inventory_audit(roots)
+    if not request_inventory_audit_processing():
+        logger.error("  ➜ STRM 查漏唤醒失败；已排队目录保留，未执行磁盘核对。")
+        task_manager.update_status_from_thread(100, "STRM 查漏唤醒失败，目录已保留")
+        return
     logger.info(
-        "  🧭 已显式请求 STRM 完整逻辑库存审计：%s 个已知目录；"
-        "后台按租约和 cursor 有界核对，不递归扫描根目录。",
+        "  🧭 已人工请求 STRM 查漏：%s 个已知目录；"
+        "后台按租约有界核对，不递归扫描根目录。",
         scheduled,
     )
     task_manager.update_status_from_thread(
         100,
-        f"库存审计已排队：{scheduled} 个目录",
+        f"STRM 查漏已排队：{scheduled} 个目录",
     )
 
 

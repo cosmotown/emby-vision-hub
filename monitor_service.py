@@ -562,6 +562,7 @@ class MediaFileHandler(FileSystemEventHandler):
         extensions: List[str],
         exclude_dirs: List[str] = None,
         inventory_roots: List[str] = None,
+        inventory_audit_notifier: Optional[Callable[[], None]] = None,
     ):
         self.extensions = utils.normalize_monitor_extensions(extensions)
         self.inventory_roots = sorted(
@@ -569,6 +570,7 @@ class MediaFileHandler(FileSystemEventHandler):
             key=len,
             reverse=True,
         )
+        self.inventory_audit_notifier = inventory_audit_notifier
 
         # 记录一下最终生效的监控后缀，方便调试
         logger.trace(f"  [实时监控] 已加载监控后缀: {self.extensions}")
@@ -602,6 +604,7 @@ class MediaFileHandler(FileSystemEventHandler):
             root = self._inventory_root(event.src_path)
             if root:
                 strm_ingest_db.record_directory_created(root, event.src_path)
+                self._notify_inventory_audit()
             return
         if self._is_valid_media_file(event.src_path):
             self._enqueue_file(event.src_path)
@@ -633,6 +636,7 @@ class MediaFileHandler(FileSystemEventHandler):
                     self._enqueue_delete(old_path)
                     if self._is_valid_media_file(new_path):
                         self._enqueue_file(new_path)
+                self._notify_inventory_audit()
             except Exception as exc:
                 logger.warning(f"  ⚠️ 无法持久化目录移动库存，将由增量目录审计补偿: {exc}")
             return
@@ -649,6 +653,8 @@ class MediaFileHandler(FileSystemEventHandler):
                 paths = strm_ingest_db.record_directory_removed(root, event.src_path) if root else []
                 for file_path in paths:
                     self._enqueue_delete(file_path)
+                if root:
+                    self._notify_inventory_audit()
             except Exception as exc:
                 logger.warning(f"  ⚠️ 无法持久化目录删除库存，将由增量目录审计补偿: {exc}")
             return
@@ -669,6 +675,11 @@ class MediaFileHandler(FileSystemEventHandler):
             except ValueError:
                 continue
         return None
+
+    def _notify_inventory_audit(self) -> None:
+        """Wake bounded reconciliation only for an explicit directory event."""
+        if self.inventory_audit_notifier:
+            self.inventory_audit_notifier()
 
     def _persist_file_event(self, file_path: str, *, operation: str) -> None:
         if not str(file_path).lower().endswith('.strm'):
@@ -979,6 +990,7 @@ def _handle_batch_delete_refresh_only(processor, file_paths: List[str]):
 
 class MonitorService:
     processor_instance = None
+    active_instance = None
 
     def __init__(self, config: dict, processor: 'MediaProcessor'):
         self.config = config
@@ -989,14 +1001,8 @@ class MonitorService:
         self.paths = self.config.get(constants.CONFIG_OPTION_MONITOR_PATHS, [])
         self.extensions = self.config.get(constants.CONFIG_OPTION_MONITOR_EXTENSIONS, constants.DEFAULT_MONITOR_EXTENSIONS)
         self.exclude_dirs = self.config.get(constants.CONFIG_OPTION_MONITOR_EXCLUDE_DIRS, constants.DEFAULT_MONITOR_EXCLUDE_DIRS)
-        self.full_scan_interval_hours = max(
-            0,
-            int(self.config.get(
-                constants.CONFIG_OPTION_MONITOR_FULL_SCAN_INTERVAL_HOURS,
-                constants.DEFAULT_MONITOR_FULL_SCAN_INTERVAL_HOURS,
-            ) or 0),
-        )
         self._reconcile_stop = threading.Event()
+        self._inventory_requested = threading.Event()
         self._reconcile_thread = None
         self._retry_thread = None
         self._started = False
@@ -1007,7 +1013,9 @@ class MonitorService:
         self._inventory_owner = f"inventory-{os.getpid()}-{uuid.uuid4().hex}"
         self._inventory = IncrementalStrmInventory(
             owner=self._inventory_owner,
-            audit_interval_hours=max(1, self.full_scan_interval_hours or 24),
+            # This timestamp remains useful for failure backoff and diagnostics,
+            # but no timer consumes it to start a periodic audit.
+            audit_interval_hours=24,
         )
 
     def start(self):
@@ -1033,6 +1041,7 @@ class MonitorService:
             self.extensions,
             self.exclude_dirs,
             inventory_roots=self.exclude_dirs,
+            inventory_audit_notifier=self.request_inventory_audit_processing,
         )
 
         started_paths = []
@@ -1061,7 +1070,7 @@ class MonitorService:
                 try:
                     strm_ingest_db.register_inventory_roots(
                         self.exclude_dirs,
-                        audit_interval_hours=max(1, self.full_scan_interval_hours or 24),
+                        audit_interval_hours=24,
                     )
                     recovered = strm_ingest_db.recover_processing()
                     if recovered:
@@ -1081,6 +1090,7 @@ class MonitorService:
                 anchor_path=os.environ.get('APP_DATA_DIR') or os.getcwd(),
             )
             self._reconcile_stop = threading.Event()
+            self._inventory_requested = threading.Event()
             self._reconcile_thread = None
             self._retry_thread = None
             _ADAPTIVE_REFRESH_STOP = threading.Event()
@@ -1101,6 +1111,7 @@ class MonitorService:
                 logger.exception("  ➜ 实时监控 Observer 启动失败，任务池已安全关闭。")
                 return
             self._started = True
+            MonitorService.active_instance = self
             logger.info(
                 "  👀 实时监控服务已启动：%s 个配置根，%s 个显式 non-recursive watch，"
                 "%s 个 inotify backend 线程，max_user_watches=%s。",
@@ -1124,21 +1135,28 @@ class MonitorService:
                 self._retry_thread.start()
                 logger.info("  🔁 STRM 有限重试队列已启动，失败路径将在约 10、30、60 分钟重试。")
 
-            if self.full_scan_interval_hours > 0 and self.exclude_dirs:
+            if self.exclude_dirs:
                 self._reconcile_thread = threading.Thread(
-                    target=self._run_incremental_reconcile_loop,
-                    name="strm-inventory-incremental",
+                    target=self._run_requested_inventory_loop,
+                    name="strm-inventory-explicit",
                     daemon=True,
                 )
                 self._reconcile_thread.start()
                 logger.info(
-                    f"  🧭 STRM Inventory v2 已启动：每批最多 4 个具体目录，"
-                    f"目录轮转周期 {self.full_scan_interval_hours} 小时。"
+                    "  🧭 STRM Inventory v2 已就绪：仅响应目录事件或人工‘STRM 查漏’，"
+                    "不会执行启动或周期性自动审计。"
                 )
         else:
             logger.warning("  ➜ 没有有效的监控目录，实时监控服务未启动。")
 
-    def _run_incremental_reconcile_loop(self):
+    def request_inventory_audit_processing(self) -> bool:
+        """Wake the bounded worker without adding or widening inventory work."""
+        if not self._started or self._reconcile_stop.is_set():
+            return False
+        self._inventory_requested.set()
+        return True
+
+    def _run_requested_inventory_loop(self):
         def process_ingest(candidate_paths):
             result = reconcile_paths(
                 candidate_paths,
@@ -1153,26 +1171,35 @@ class MonitorService:
             _handle_batch_delete_refresh_only(self.processor, list(removed_paths))
 
         while not self._reconcile_stop.is_set():
-            summary = {'claimed': 0}
-            try:
-                summary = self._inventory.run_once(
-                    on_ingest=process_ingest,
-                    on_delete=process_delete,
-                )
-                if summary['claimed']:
-                    watch_summary = self.observer.sync_from_persistence() if self.observer else {}
-                    logger.info(
-                        "  🧭 STRM 增量目录核对：认领 %(claimed)s，完成 %(completed)s，"
-                        "新增/变化 %(ingest)s，删除 %(delete)s，失败 %(failed)s，"
-                        "物理枚举 %(physical_enumerations)s，条目 %(entries_seen)s，"
-                        "DB 批次 %(db_batches)s，watch %(watch_count)s。",
-                        {**summary, 'watch_count': watch_summary.get('watched', 0)},
-                    )
-            except Exception as exc:
-                logger.error(f"  ❌ STRM 增量目录核对失败，将按持久状态重试: {exc}", exc_info=True)
-            delay = 1 if summary.get('claimed') else 30
-            if self._reconcile_stop.wait(delay):
+            self._inventory_requested.wait()
+            self._inventory_requested.clear()
+            if self._reconcile_stop.is_set():
                 return
+
+            while not self._reconcile_stop.is_set():
+                if self.processor.is_stop_requested():
+                    logger.info("  🛑 STRM 查漏已响应停止请求；未认领目录保留在 PostgreSQL。")
+                    break
+                summary = {'claimed': 0}
+                try:
+                    summary = self._inventory.run_once(
+                        on_ingest=process_ingest,
+                        on_delete=process_delete,
+                    )
+                    if summary['claimed']:
+                        watch_summary = self.observer.sync_from_persistence() if self.observer else {}
+                        logger.info(
+                            "  🧭 STRM 显式目录核对：认领 %(claimed)s，完成 %(completed)s，"
+                            "新增/变化 %(ingest)s，删除 %(delete)s，失败 %(failed)s，"
+                            "物理枚举 %(physical_enumerations)s，条目 %(entries_seen)s，"
+                            "DB 批次 %(db_batches)s，watch %(watch_count)s。",
+                            {**summary, 'watch_count': watch_summary.get('watched', 0)},
+                        )
+                except Exception as exc:
+                    logger.error(f"  ❌ STRM 显式目录核对失败，保留持久状态: {exc}", exc_info=True)
+                    break
+                if not summary.get('claimed'):
+                    break
 
 
     def _retry_existing_ingest_paths(self, existing_paths: List[str]) -> None:
@@ -1345,6 +1372,7 @@ class MonitorService:
         if not self._started:
             return
         self._reconcile_stop.set()
+        self._inventory_requested.set()
         if self.observer:
             logger.info("  ➜ 正在停止实时监控服务...")
             self.observer.stop()
@@ -1387,6 +1415,18 @@ class MonitorService:
             self._retry_thread.join(timeout=5)
         if MonitorService.processor_instance is self.processor:
             MonitorService.processor_instance = None
+        if MonitorService.active_instance is self:
+            MonitorService.active_instance = None
         self._pool_generation = None
         self._started = False
         logger.info("  ➜ 实时监控服务已停止。")
+
+
+def inventory_audit_processing_available() -> bool:
+    instance = MonitorService.active_instance
+    return bool(instance and instance._started and not instance._reconcile_stop.is_set())
+
+
+def request_inventory_audit_processing() -> bool:
+    instance = MonitorService.active_instance
+    return bool(instance and instance.request_inventory_audit_processing())

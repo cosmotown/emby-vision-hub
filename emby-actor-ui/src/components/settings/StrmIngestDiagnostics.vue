@@ -5,9 +5,9 @@
       <n-space>
         <n-popconfirm @positive-click="requestFullAudit">
           <template #trigger>
-            <n-button size="small" ghost :loading="auditLoading">完整库存审计</n-button>
+            <n-button size="small" ghost :loading="auditLoading">STRM 查漏</n-button>
           </template>
-          将所有已持久化目录加入有界增量核对队列；不会递归 os.walk，也不会读取 STRM 指向的视频内容。继续吗？
+          手动核对已持久化 STRM 目录，用于停机或事件遗漏；不会递归 os.walk，也不会读取 STRM 指向的视频内容。继续吗？
         </n-popconfirm>
         <n-button size="small" ghost :loading="loading" @click="loadEvents">刷新</n-button>
       </n-space>

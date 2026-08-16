@@ -18,7 +18,7 @@ CUSTOM_RELEASES = [
 - watchdog 的新增、修改、删除、文件改名和目录移动事件同步维护 PostgreSQL 文件库存与 dirty 目录状态。
 - 新增持久目录 cursor、generation、event version、owner 和 lease；多 EVH 实例使用 `FOR UPDATE SKIP LOCKED` 避免重复认领。
 - 取消启动约 60 秒后的 STRM 根递归库存扫描，并避免 watchdog `recursive=True` 在 Linux 启动时枚举整棵目录树；正常启动从 PostgreSQL 恢复已知目录，以单一 inotify backend 建立显式 non-recursive watches。
-- 原 24 小时全树 `os.walk` 改为有界目录轮转：每批只核对少量明确目录；每个目录一次 `scandir` 形成完整 snapshot，数据库再按最多 500 条一批 compare/upsert，不因 DB 分页重复枚举物理目录。
+- STRM Inventory v2 不再执行启动或周期性自动查漏；正常运行依靠 filesystem event，停机或漏事件由任务中心“STRM 查漏”人工触发有界目录审计。旧 `monitor_full_scan_interval_hours` 配置保留兼容但不再消费。
 - 目录、挂载、权限或 I/O 暂时不可访问时保持原库存并退避重试；只有成功读取父目录并明确确认文件或 child directory 缺失时才进入精确删除链。
 - 管理员可显式请求完整逻辑库存审计；它仍通过有界目录队列完成，不读取 STRM 指向的视频内容，也不递归刷新媒体库。
 - 保留现有精确路径通知、浅层首次发现、10/30/60 分钟有限重试、终态只读自愈和自适应批处理链。

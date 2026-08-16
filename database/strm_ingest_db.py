@@ -737,6 +737,7 @@ def claim_inventory_directories(
                     SELECT root_path, directory_path
                     FROM strm_ingest_inventory_directories
                     WHERE active = TRUE
+                      AND dirty = TRUE
                       AND next_audit_at <= NOW()
                       AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
                     ORDER BY dirty DESC, next_audit_at ASC, directory_path ASC
@@ -895,16 +896,22 @@ def record_inventory_audit_batch(
                     cursor,
                     """
                     INSERT INTO strm_ingest_inventory_directories (
-                        root_path, directory_path, parent_path, active,
+                        root_path, directory_path, parent_path, active, dirty,
                         next_audit_at, seen_generation
                     ) VALUES %s
                     ON CONFLICT (root_path, directory_path) DO UPDATE
                     SET parent_path = EXCLUDED.parent_path, active = TRUE,
+                        dirty = strm_ingest_inventory_directories.dirty
+                                OR NOT strm_ingest_inventory_directories.active,
+                        next_audit_at = CASE
+                            WHEN NOT strm_ingest_inventory_directories.active THEN NOW()
+                            ELSE strm_ingest_inventory_directories.next_audit_at
+                        END,
                         seen_generation = EXCLUDED.seen_generation, updated_at = NOW()
                     """,
                     child_rows[offset : offset + safe_batch_size],
                     template=(
-                        "(%s, %s, %s, TRUE, NOW(), %s)"
+                        "(%s, %s, %s, TRUE, TRUE, NOW(), %s)"
                     ),
                     page_size=safe_batch_size,
                 )

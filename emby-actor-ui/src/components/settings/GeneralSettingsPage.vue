@@ -156,42 +156,6 @@
                       </template>
                     </n-form-item>
 
-                    <!-- 定时扫描回溯天数 -->
-                    <n-form-item label="定时扫描回溯" path="monitor_scan_lookback_days">
-                      <n-input-number 
-                        v-model:value="configModel.monitor_scan_lookback_days" 
-                        :min="1"
-                        :max="7"
-                        placeholder="1" 
-                        style="width: 100%" 
-                      >
-                        <template #suffix>天</template>
-                      </n-input-number>
-                      <template #feedback>
-                        <n-text depth="3" style="font-size:0.8em;">
-                          首次建立路径库存时，仅对最近 N 天发生变化的 STRM 做 Emby 精确入库核对；范围为 1 至 7 天。
-                        </n-text>
-                      </template>
-                    </n-form-item>
-
-                    <n-form-item label="库存目录轮转核对间隔" path="monitor_full_scan_interval_hours">
-                      <n-input-number
-                        v-model:value="configModel.monitor_full_scan_interval_hours"
-                        :min="0"
-                        :max="168"
-                        :step="6"
-                        placeholder="24"
-                        style="width: 100%"
-                      >
-                        <template #suffix>小时</template>
-                      </n-input-number>
-                      <template #feedback>
-                        <n-text depth="3" style="font-size:0.8em;">
-                          每次只用 scandir 核对有界数量的具体目录，不在启动或定时任务中递归扫描整个 STRM 根；设为 0 关闭。失败路径仍按约 10、30、60 分钟有限重试。
-                        </n-text>
-                      </template>
-                    </n-form-item>
-
                     <n-form-item label="监控扩展名" path="monitor_extensions">
                       <n-select
                         v-model:value="configModel.monitor_extensions"

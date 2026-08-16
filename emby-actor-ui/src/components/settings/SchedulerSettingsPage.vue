@@ -180,7 +180,16 @@
         <n-grid cols="1 m:2 l:5" :x-gap="24" :y-gap="16" responsive="screen">
           <n-gi v-for="task in availableTasksForManualRun" :key="task.key">
             <div class="temp-task-item">
-              <n-text>{{ task.name }}</n-text>
+              <div>
+                <n-text>{{ task.name }}</n-text>
+                <n-text
+                  v-if="task.key === 'scan-monitor-folders'"
+                  depth="3"
+                  style="display:block; margin-top:4px; font-size:12px;"
+                >
+                  手动核对 STRM 库存，用于 EVH 停机或文件事件遗漏；正常运行无需定期执行。
+                </n-text>
+              </div>
               <n-button size="small" type="primary" ghost @click="triggerTaskNow(task.key)" :loading="isTriggeringTask === task.key" :disabled="isBackgroundTaskRunning">
                 <template #icon><n-icon :component="Play24Regular" /></template>
                 立即执行

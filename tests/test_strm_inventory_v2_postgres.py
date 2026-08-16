@@ -71,6 +71,22 @@ class StrmInventoryV2PostgresTests(unittest.TestCase):
         self.assertTrue(all(not thread.is_alive() for thread in threads))
         self.assertEqual([0, 1], sorted(len(value) for value in results))
 
+    def test_clean_directory_is_never_claimed_when_legacy_interval_expires(self):
+        root = '/isolated/STRM'
+        strm_ingest_db.register_inventory_roots([root], audit_interval_hours=1)
+        with connection.get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    'UPDATE strm_ingest_inventory_directories '
+                    "SET dirty = FALSE, next_audit_at = NOW() - INTERVAL '48 hours' "
+                    'WHERE root_path = %s',
+                    (root,),
+                )
+        self.assertEqual(
+            [],
+            strm_ingest_db.claim_inventory_directories('legacy-24h-probe', limit=4),
+        )
+
     def test_inaccessible_retry_paths_are_deferred_without_operation_or_attempt_change(self):
         ingest_path = '/isolated/offline/S01E01.strm'
         delete_path = '/isolated/offline/S01E02.strm'
@@ -236,13 +252,13 @@ class StrmInventoryV2PostgresTests(unittest.TestCase):
             episode = os.path.join(show, 'S01E01.strm')
             with open(episode, 'w', encoding='utf-8') as handle:
                 handle.write('controlled://episode')
-            with connection.get_db_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        'UPDATE strm_ingest_inventory_directories SET next_audit_at = NOW() '
-                        'WHERE root_path = %s AND directory_path = %s',
-                        (root, root),
-                    )
+            # Restart alone leaves the clean root unclaimed. Only the explicit
+            # manual audit makes the persisted directory tree eligible.
+            self.assertEqual(
+                [],
+                strm_ingest_db.claim_inventory_directories('restart-probe', limit=1),
+            )
+            strm_ingest_db.request_full_inventory_audit([root])
 
             started = time.monotonic()
             first = IncrementalStrmInventory(owner='after-restart-1', directory_batch_limit=1).run_once()

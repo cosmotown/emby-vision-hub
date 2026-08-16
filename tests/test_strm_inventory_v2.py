@@ -3,12 +3,16 @@ import errno
 import logging
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import constants
 import monitor_service
+from tasks import core as task_core
+from tasks import media as media_tasks
 from services.strm_inventory import IncrementalStrmInventory
 
 if not hasattr(logging.Logger, 'trace'):
@@ -64,7 +68,9 @@ class StrmInventoryV2Tests(unittest.TestCase):
         self.assertNotIn('collect_strm_inventory', source)
         self.assertNotIn('recursive=True', source)
         self.assertIn('PersistedDirectoryObserver', source)
-        self.assertIn('_run_incremental_reconcile_loop', source)
+        self.assertNotIn('_run_incremental_reconcile_loop', source)
+        self.assertIn('_run_requested_inventory_loop', source)
+        self.assertNotIn('CONFIG_OPTION_MONITOR_FULL_SCAN_INTERVAL_HOURS', source)
 
     def test_start_registers_inventory_without_full_walk(self):
         processor = mock.Mock()
@@ -73,7 +79,8 @@ class StrmInventoryV2Tests(unittest.TestCase):
             constants.CONFIG_OPTION_MONITOR_PATHS: ['/STRM'],
             constants.CONFIG_OPTION_MONITOR_EXTENSIONS: ['.strm'],
             constants.CONFIG_OPTION_MONITOR_EXCLUDE_DIRS: ['/STRM'],
-            constants.CONFIG_OPTION_MONITOR_FULL_SCAN_INTERVAL_HOURS: 0,
+            # A legacy non-zero value must be accepted but ignored.
+            constants.CONFIG_OPTION_MONITOR_FULL_SCAN_INTERVAL_HOURS: 24,
         }
         observer = mock.Mock(watch_count=1, backend_thread_count=2, max_user_watches=1048576)
         with mock.patch.object(monitor_service, 'PersistedDirectoryObserver', return_value=observer), \
@@ -84,12 +91,80 @@ class StrmInventoryV2Tests(unittest.TestCase):
              mock.patch.object(monitor_service.strm_ingest_db, 'list_active_inventory_directories', return_value=['/STRM']), \
              mock.patch.object(monitor_service.strm_ingest_db, 'recover_processing', return_value=0), \
              mock.patch.object(monitor_service.strm_ingest_db, 'prune_completed'), \
+             mock.patch.object(monitor_service.strm_ingest_db, 'request_full_inventory_audit') as request_full, \
              mock.patch.object(monitor_service.threading, 'Thread') as thread:
             thread.return_value.is_alive.return_value = False
             service = monitor_service.MonitorService(config, processor)
             service.start()
             service.stop()
         register.assert_called_once_with(['/STRM'], audit_interval_hours=24)
+        request_full.assert_not_called()
+        thread.assert_any_call(
+            target=mock.ANY,
+            name='strm-inventory-explicit',
+            daemon=True,
+        )
+
+    def test_requested_worker_never_runs_for_elapsed_time_or_legacy_interval(self):
+        processor = mock.Mock()
+        processor.is_stop_requested.return_value = False
+        service = monitor_service.MonitorService({
+            constants.CONFIG_OPTION_MONITOR_FULL_SCAN_INTERVAL_HOURS: 1,
+        }, processor)
+        service._started = True
+        service._inventory = mock.Mock()
+        worker = threading.Thread(target=service._run_requested_inventory_loop)
+        worker.start()
+        time.sleep(0.05)
+        service._inventory.run_once.assert_not_called()
+        service._reconcile_stop.set()
+        service._inventory_requested.set()
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+
+    def test_manual_request_wakes_bounded_worker_and_drains_only_claimed_work(self):
+        processor = mock.Mock()
+        processor.is_stop_requested.return_value = False
+        service = monitor_service.MonitorService({}, processor)
+        service._started = True
+        service.observer = mock.Mock()
+        service.observer.sync_from_persistence.return_value = {'watched': 2}
+        completed = threading.Event()
+
+        def run_once(**_kwargs):
+            if service._inventory.run_once.call_count == 1:
+                return {
+                    'claimed': 1, 'completed': 1, 'ingest': 0, 'delete': 0,
+                    'failed': 0, 'physical_enumerations': 1,
+                    'entries_seen': 1, 'db_batches': 0,
+                }
+            completed.set()
+            return {'claimed': 0}
+
+        service._inventory = mock.Mock()
+        service._inventory.run_once.side_effect = run_once
+        worker = threading.Thread(target=service._run_requested_inventory_loop)
+        worker.start()
+        self.assertTrue(service.request_inventory_audit_processing())
+        self.assertTrue(completed.wait(timeout=1))
+        self.assertEqual(2, service._inventory.run_once.call_count)
+        service._reconcile_stop.set()
+        service._inventory_requested.set()
+        worker.join(timeout=1)
+
+    def test_directory_event_wakes_inventory_but_file_event_uses_exact_queue_only(self):
+        notifier = mock.Mock()
+        handler = monitor_service.MediaFileHandler(
+            ['.strm'], inventory_roots=['/STRM'],
+            inventory_audit_notifier=notifier,
+        )
+        with mock.patch.object(
+            monitor_service.strm_ingest_db, 'record_directory_created'
+        ), mock.patch.object(handler, '_enqueue_file') as enqueue:
+            handler.on_created(_Event('/STRM/Show', is_directory=True))
+            handler.on_created(_Event('/STRM/Show/S01E04.strm'))
+        notifier.assert_called_once_with()
+        enqueue.assert_called_once_with('/STRM/Show/S01E04.strm')
 
     def test_directory_move_uses_persisted_paths_and_never_walks_destination(self):
         handler = monitor_service.MediaFileHandler(
@@ -242,6 +317,40 @@ class StrmInventoryV2Tests(unittest.TestCase):
         self.assertIn("'/strm-inventory/full-audit'", source)
         self.assertIn('request_full_inventory_audit', source)
         self.assertIn("'recursive_os_walk': False", source)
+        self.assertIn("'manual_only': True", source)
+
+    def test_strm_gap_task_is_manual_only_and_metadata_sync_remains_separate(self):
+        all_tasks = task_core.get_task_registry(context='all')
+        chain_tasks = task_core.get_task_registry(context='chain')
+        self.assertEqual('STRM 查漏', all_tasks['scan-monitor-folders'][1])
+        self.assertNotIn('scan-monitor-folders', chain_tasks)
+        self.assertIn('populate-metadata', chain_tasks)
+        populate_source = Path(media_tasks.task_populate_metadata_cache.__code__.co_filename).read_text(
+            encoding='utf-8'
+        )
+        start = populate_source.index('def task_populate_metadata_cache')
+        end = populate_source.index('\ndef ', start + 1)
+        body = populate_source[start:end]
+        self.assertNotIn('request_full_inventory_audit', body)
+        self.assertNotIn('IncrementalStrmInventory', body)
+
+    def test_manual_task_marks_inventory_and_wakes_explicit_worker(self):
+        processor = mock.Mock()
+        processor.config = {
+            constants.CONFIG_OPTION_MONITOR_ENABLED: True,
+            constants.CONFIG_OPTION_MONITOR_PATHS: ['/STRM'],
+            constants.CONFIG_OPTION_MONITOR_EXCLUDE_DIRS: ['/STRM'],
+        }
+        with mock.patch(
+            'monitor_service.inventory_audit_processing_available', return_value=True,
+        ), mock.patch(
+            'monitor_service.request_inventory_audit_processing', return_value=True,
+        ) as wake, mock.patch.object(
+            media_tasks.strm_ingest_db, 'request_full_inventory_audit', return_value=7,
+        ) as request_full, mock.patch.object(media_tasks.task_manager, 'update_status_from_thread'):
+            media_tasks.task_scan_monitor_folders(processor)
+        request_full.assert_called_once_with(['/STRM'])
+        wake.assert_called_once_with()
 
 
 if __name__ == '__main__':

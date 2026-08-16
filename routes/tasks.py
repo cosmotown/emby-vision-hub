@@ -6,6 +6,8 @@ from flask import Blueprint, request, jsonify
 
 # 导入您项目中用于管理和执行任务的核心模块
 import task_manager 
+import config_manager
+import constants
 from extensions import admin_required, processor_ready_required, task_lock_required
 from database import strm_ingest_db, webhook_event_db
 # ★★★ 导入任务注册表，这是“翻译”的关键 ★★★
@@ -143,6 +145,7 @@ def get_strm_ingest_events():
         return jsonify({
             'events': strm_ingest_db.list_recent(limit=limit),
             'summary': strm_ingest_db.get_summary(),
+            'inventory': strm_ingest_db.get_inventory_summary(),
         }), 200
     except Exception as exc:
         logger.error(f"获取 STRM 入库诊断失败: {exc}", exc_info=True)
@@ -171,3 +174,25 @@ def ignore_strm_ingest_event(event_id):
     except Exception as exc:
         logger.error(f"忽略 STRM 入库记录 {event_id} 失败: {exc}", exc_info=True)
         return jsonify({'error': '无法忽略 STRM 入库记录'}), 500
+
+
+@tasks_bp.route('/strm-inventory/full-audit', methods=['POST'])
+@admin_required
+def request_strm_inventory_full_audit():
+    """Explicitly request full logical coverage through bounded directory claims."""
+    try:
+        roots = config_manager.APP_CONFIG.get(
+            constants.CONFIG_OPTION_MONITOR_EXCLUDE_DIRS,
+            constants.DEFAULT_MONITOR_EXCLUDE_DIRS,
+        ) or []
+        scheduled = strm_ingest_db.request_full_inventory_audit(roots)
+        if not roots:
+            return jsonify({'error': '未配置 STRM 库存根目录'}), 409
+        return jsonify({
+            'message': '完整库存审计已排入有界目录队列',
+            'scheduled_directories': scheduled,
+            'recursive_os_walk': False,
+        }), 202
+    except Exception as exc:
+        logger.error('请求 STRM 完整库存审计失败: %s', type(exc).__name__)
+        return jsonify({'error': '无法请求 STRM 完整库存审计'}), 500

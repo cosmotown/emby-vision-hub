@@ -772,61 +772,6 @@ def refresh_and_verify_paths(
     return result
 
 
-def collect_recent_media_paths(
-    root_paths: Iterable[str],
-    extensions: Iterable[str],
-    cutoff_timestamp: float,
-    strm_only: bool = False,
-) -> List[str]:
-    normalized_extensions = {
-        ext.lower() if str(ext).startswith('.') else f".{str(ext).lower()}"
-        for ext in extensions or []
-        if str(ext or '').strip()
-    }
-    if strm_only:
-        normalized_extensions &= {'.strm'}
-    paths = []
-    for root_path in normalize_paths(root_paths, require_existing=False):
-        if not os.path.isdir(root_path):
-            continue
-        for dirpath, dirnames, filenames in os.walk(root_path):
-            dirnames[:] = [name for name in dirnames if not name.startswith('.')]
-            for filename in filenames:
-                if filename.startswith('.'):
-                    continue
-                path = os.path.join(dirpath, filename)
-                if os.path.splitext(filename)[1].lower() not in normalized_extensions:
-                    continue
-                try:
-                    stat = os.stat(path)
-                except OSError:
-                    continue
-                if max(stat.st_mtime, stat.st_ctime) >= cutoff_timestamp and stat.st_size > 0:
-                    paths.append(os.path.normpath(path))
-    return sorted(set(paths))
-
-
-def collect_strm_inventory(root_path: str) -> Dict[str, Tuple[int, float]]:
-    """Return exact STRM paths and fingerprints for one low-frequency inventory pass."""
-    root = os.path.normpath(str(root_path or '').strip())
-    if not root or not os.path.isdir(root):
-        return {}
-    inventory: Dict[str, Tuple[int, float]] = {}
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [name for name in dirnames if not name.startswith('.')]
-        for filename in filenames:
-            if filename.startswith('.') or not filename.lower().endswith('.strm'):
-                continue
-            path = os.path.normpath(os.path.join(dirpath, filename))
-            try:
-                stat = os.stat(path)
-            except OSError:
-                continue
-            if stat.st_size > 0:
-                inventory[path] = (int(stat.st_size), float(stat.st_mtime))
-    return inventory
-
-
 def reconcile_paths(
     file_paths: Iterable[str],
     base_url: str,
@@ -859,22 +804,3 @@ def reconcile_paths(
         'unstable': len(unstable),
         'refresh': refresh_result,
     }
-
-
-def reconcile_recent_paths(
-    root_paths: Iterable[str],
-    extensions: Iterable[str],
-    cutoff_timestamp: float,
-    base_url: str,
-    api_key: str,
-    strm_only: bool = False,
-    retry_paths: Iterable[str] = (),
-) -> Dict[str, object]:
-    recent_paths = collect_recent_media_paths(
-        root_paths,
-        extensions,
-        cutoff_timestamp,
-        strm_only=strm_only,
-    )
-    paths = sorted(set(recent_paths) | set(normalize_paths(retry_paths)))
-    return reconcile_paths(paths, base_url, api_key)

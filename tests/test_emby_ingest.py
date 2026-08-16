@@ -16,6 +16,7 @@ sys.modules.setdefault("config_manager", config_manager_stub)
 
 import handler.emby as emby
 from services import emby_ingest
+from services.strm_inventory import IncrementalStrmInventory
 
 
 class EmbyIngestTests(unittest.TestCase):
@@ -30,6 +31,37 @@ class EmbyIngestTests(unittest.TestCase):
                 handle.write(f"http://example.invalid/{index}\n")
             paths.append(path)
         return paths
+
+    def _collect_with_inventory_v2(self, root):
+        inventory = IncrementalStrmInventory(owner='test', entry_batch_limit=500)
+        pending = [os.path.normpath(root)]
+        seen_directories = set()
+        observed = {}
+        while pending:
+            directory = pending.pop(0)
+            if directory in seen_directories:
+                continue
+            seen_directories.add(directory)
+            claim = {
+                'root_path': os.path.normpath(root),
+                'directory_path': directory,
+                'audit_cursor': None,
+                'audit_generation': 1,
+                'event_version': 0,
+                'claim_owner': 'test',
+            }
+
+            def record(_claim, **kwargs):
+                observed.update(kwargs['files'])
+                pending.extend(kwargs['child_directories'])
+                return {'accepted': True, 'complete': kwargs['complete']}
+
+            with mock.patch(
+                'services.strm_inventory.strm_ingest_db.record_inventory_audit_batch',
+                side_effect=record,
+            ):
+                inventory.scan_claim(claim)
+        return observed
 
     def test_batch_stability_wait_is_parallel(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -70,7 +102,7 @@ class EmbyIngestTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(f"https://example.invalid/strm/{index}\n", encoding="utf-8")
 
-            inventory = emby_ingest.collect_strm_inventory(str(root))
+            inventory = self._collect_with_inventory_v2(str(root))
 
         self.assertEqual(len(relative_files), len(inventory))
         self.assertTrue(any("电视剧/测试剧集 (2026)/Season 1" in path for path in inventory))
@@ -148,7 +180,7 @@ class EmbyIngestTests(unittest.TestCase):
     def test_strm_inventory_tracks_each_exact_path_and_fingerprint(self):
         with tempfile.TemporaryDirectory() as directory:
             first, second = self._make_strm_files(directory, 2)
-            inventory = emby_ingest.collect_strm_inventory(directory)
+            inventory = self._collect_with_inventory_v2(directory)
 
             self.assertEqual({first, second}, set(inventory))
             self.assertGreater(inventory[first][0], 0)
@@ -585,15 +617,12 @@ class EmbyIngestTests(unittest.TestCase):
     @mock.patch("services.emby_ingest.refresh_and_verify_paths")
     @mock.patch("services.emby_ingest.wait_for_paths_stable")
     @mock.patch("services.emby_ingest.check_indexed_paths")
-    @mock.patch("services.emby_ingest.collect_recent_media_paths")
     def test_reconcile_returns_old_and_new_confirmed_paths(
         self,
-        collect_paths,
         check_paths,
         wait_stable,
         refresh_paths,
     ):
-        collect_paths.return_value = ["/media/a.strm", "/media/b.strm"]
         check_paths.return_value = ({"/media/a.strm"}, {"/media/b.strm"}, set())
         wait_stable.return_value = (["/media/b.strm"], [])
         refresh_paths.return_value = {
@@ -605,10 +634,8 @@ class EmbyIngestTests(unittest.TestCase):
             "refresh_ok": True,
         }
 
-        result = emby_ingest.reconcile_recent_paths(
-            ["/media"],
-            [".strm"],
-            0,
+        result = emby_ingest.reconcile_paths(
+            ["/media/a.strm", "/media/b.strm"],
             "http://emby",
             "token",
         )
@@ -618,17 +645,14 @@ class EmbyIngestTests(unittest.TestCase):
     @mock.patch("services.emby_ingest.refresh_and_verify_paths")
     @mock.patch("services.emby_ingest.wait_for_paths_stable")
     @mock.patch("services.emby_ingest.check_indexed_paths")
-    @mock.patch("services.emby_ingest.collect_recent_media_paths")
     def test_reconcile_keeps_failed_paths_separate_from_time_window(
         self,
-        collect_paths,
         check_paths,
         wait_stable,
         refresh_paths,
     ):
         with tempfile.TemporaryDirectory() as directory:
             old_path, new_path = self._make_strm_files(directory, 2)
-            collect_paths.return_value = [new_path]
             check_paths.return_value = (set(), {old_path, new_path}, set())
             wait_stable.return_value = ([new_path], [old_path])
             refresh_paths.return_value = {
@@ -640,13 +664,10 @@ class EmbyIngestTests(unittest.TestCase):
                 "refresh_ok": True,
             }
 
-            result = emby_ingest.reconcile_recent_paths(
-                [directory],
-                [".strm"],
-                time.time(),
+            result = emby_ingest.reconcile_paths(
+                [old_path, new_path],
                 "http://emby",
                 "token",
-                retry_paths=[old_path],
             )
 
         checked_paths = check_paths.call_args.args[0]

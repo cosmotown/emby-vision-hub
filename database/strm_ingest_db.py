@@ -472,7 +472,542 @@ def prune_completed(retention_days: int = 30) -> int:
                 DELETE FROM strm_ingest_retry_queue
                 WHERE status IN ('completed', 'cancelled', 'deleted')
                   AND completed_at < NOW() - (%s * INTERVAL '1 day')
+                  AND (
+                      inventory_root_path IS NULL
+                      OR status IN ('cancelled', 'deleted')
+                  )
                 """,
                 (max(1, int(retention_days)),),
             )
             return cursor.rowcount
+
+
+# STRM Inventory v2 ---------------------------------------------------------
+
+def register_inventory_roots(
+    root_paths: Iterable[str],
+    *,
+    audit_interval_hours: int = 24,
+) -> int:
+    """Register roots without touching the filesystem or recursively scanning it."""
+    roots = sorted({os.path.normpath(str(path)) for path in root_paths or [] if str(path or '').strip()})
+    if not roots:
+        return 0
+    interval_hours = max(1, min(int(audit_interval_hours), 24 * 30))
+    interval_seconds = interval_hours * 3600
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            for root in roots:
+                cursor.execute(
+                    """
+                    INSERT INTO strm_ingest_inventory_roots (root_path)
+                    VALUES (%s)
+                    ON CONFLICT (root_path) DO NOTHING
+                    """,
+                    (root,),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO strm_ingest_inventory_directories (
+                        root_path, directory_path, parent_path, active, next_audit_at
+                    ) VALUES (%s, %s, NULL, TRUE, NOW() + (%s * INTERVAL '1 hour'))
+                    ON CONFLICT (root_path, directory_path) DO UPDATE
+                    SET active = TRUE, updated_at = NOW()
+                    """,
+                    (root, root, interval_hours),
+                )
+                like_root = root.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '/%'
+                cursor.execute(
+                    """
+                    UPDATE strm_ingest_retry_queue
+                    SET inventory_root_path = %s,
+                        inventory_directory_path = regexp_replace(file_path, '/[^/]+$', ''),
+                        updated_at = updated_at
+                    WHERE inventory_root_path IS NULL
+                      AND file_path LIKE %s ESCAPE '\\'
+                      AND LOWER(file_path) LIKE '%%.strm'
+                    """,
+                    (root, like_root),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO strm_ingest_inventory_directories (
+                        root_path, directory_path, parent_path, active, next_audit_at
+                    )
+                    SELECT DISTINCT
+                        %s,
+                        q.inventory_directory_path,
+                        CASE
+                            WHEN q.inventory_directory_path = %s THEN NULL
+                            ELSE regexp_replace(q.inventory_directory_path, '/[^/]+$', '')
+                        END,
+                        TRUE,
+                        NOW() + (
+                            MOD(ABS(hashtext(q.inventory_directory_path)::bigint), %s)
+                            * INTERVAL '1 second'
+                        )
+                    FROM strm_ingest_retry_queue q
+                    WHERE q.inventory_root_path = %s
+                      AND q.inventory_directory_path IS NOT NULL
+                      AND LOWER(q.file_path) LIKE '%%.strm'
+                    ON CONFLICT (root_path, directory_path) DO NOTHING
+                    """,
+                    (root, root, interval_seconds, root),
+                )
+    return len(roots)
+
+
+def mark_directory_dirty(root_path: str, directory_path: str, *, event_kind: str = 'watchdog') -> bool:
+    root = os.path.normpath(str(root_path))
+    directory = os.path.normpath(str(directory_path))
+    parent = None if directory == root else os.path.dirname(directory)
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO strm_ingest_inventory_directories (
+                    root_path, directory_path, parent_path, active, dirty,
+                    dirty_since, last_event_at, next_audit_at, event_version, last_error
+                ) VALUES (%s, %s, %s, TRUE, TRUE, NOW(), NOW(), NOW(), 1, NULL)
+                ON CONFLICT (root_path, directory_path) DO UPDATE
+                SET parent_path = EXCLUDED.parent_path,
+                    active = TRUE,
+                    dirty = TRUE,
+                    dirty_since = COALESCE(strm_ingest_inventory_directories.dirty_since, NOW()),
+                    last_event_at = NOW(),
+                    next_audit_at = NOW(),
+                    audit_cursor = NULL,
+                    event_version = strm_ingest_inventory_directories.event_version + 1,
+                    claim_owner = NULL,
+                    claim_expires_at = NULL,
+                    last_error = NULL,
+                    updated_at = NOW()
+                """,
+                (root, directory, parent),
+            )
+            return cursor.rowcount == 1
+
+
+def record_file_event(root_path: str, file_path: str, *, event_kind: str) -> None:
+    root = os.path.normpath(str(root_path))
+    path = os.path.normpath(str(file_path))
+    directory = os.path.dirname(path)
+    mark_directory_dirty(root, directory, event_kind=event_kind)
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE strm_ingest_retry_queue
+                SET inventory_root_path = %s,
+                    inventory_directory_path = %s,
+                    updated_at = NOW()
+                WHERE file_path = %s
+                """,
+                (root, directory, path),
+            )
+
+
+def record_directory_created(root_path: str, directory_path: str) -> None:
+    root = os.path.normpath(str(root_path))
+    directory = os.path.normpath(str(directory_path))
+    mark_directory_dirty(root, os.path.dirname(directory), event_kind='directory_created')
+    mark_directory_dirty(root, directory, event_kind='directory_created')
+
+
+def record_directory_removed(root_path: str, directory_path: str) -> List[str]:
+    root = os.path.normpath(str(root_path))
+    directory = os.path.normpath(str(directory_path))
+    paths = list_active_paths_under(directory)
+    like_directory = directory.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '/%'
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE strm_ingest_inventory_directories
+                SET active = FALSE, dirty = FALSE, claim_owner = NULL,
+                    claim_expires_at = NULL, updated_at = NOW()
+                WHERE root_path = %s
+                  AND (directory_path = %s OR directory_path LIKE %s ESCAPE '\\')
+                """,
+                (root, directory, like_directory),
+            )
+    mark_directory_dirty(root, os.path.dirname(directory), event_kind='directory_removed')
+    return paths
+
+
+def record_directory_moved(root_path: str, old_path: str, new_path: str) -> List[Tuple[str, str]]:
+    """Map known inventory paths to the destination without walking the moved tree."""
+    root = os.path.normpath(str(root_path))
+    old = os.path.normpath(str(old_path))
+    new = os.path.normpath(str(new_path))
+    known = list_active_paths_under(old)
+    pairs = [(path, os.path.normpath(new + path[len(old):])) for path in known]
+    old_like = old.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '/%'
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT directory_path
+                FROM strm_ingest_inventory_directories
+                WHERE root_path = %s
+                  AND active = TRUE
+                  AND (directory_path = %s OR directory_path LIKE %s ESCAPE '\\')
+                ORDER BY directory_path
+                """,
+                (root, old, old_like),
+            )
+            directories = [row['directory_path'] for row in cursor.fetchall()]
+            for directory in directories or [old]:
+                mapped = os.path.normpath(new + directory[len(old):])
+                parent = None if mapped == root else os.path.dirname(mapped)
+                cursor.execute(
+                    """
+                    INSERT INTO strm_ingest_inventory_directories (
+                        root_path, directory_path, parent_path, active, dirty,
+                        dirty_since, last_event_at, next_audit_at, event_version
+                    ) VALUES (%s, %s, %s, TRUE, TRUE, NOW(), NOW(), NOW(), 1)
+                    ON CONFLICT (root_path, directory_path) DO UPDATE
+                    SET parent_path = EXCLUDED.parent_path, active = TRUE, dirty = TRUE,
+                        dirty_since = COALESCE(strm_ingest_inventory_directories.dirty_since, NOW()),
+                        last_event_at = NOW(), next_audit_at = NOW(), audit_cursor = NULL,
+                        event_version = strm_ingest_inventory_directories.event_version + 1,
+                        claim_owner = NULL, claim_expires_at = NULL, updated_at = NOW()
+                    """,
+                    (root, mapped, parent),
+                )
+            cursor.execute(
+                """
+                UPDATE strm_ingest_inventory_directories
+                SET active = FALSE, dirty = FALSE, claim_owner = NULL,
+                    claim_expires_at = NULL, updated_at = NOW()
+                WHERE root_path = %s
+                  AND (directory_path = %s OR directory_path LIKE %s ESCAPE '\\')
+                """,
+                (root, old, old_like),
+            )
+    mark_directory_dirty(root, os.path.dirname(old), event_kind='directory_move_old')
+    mark_directory_dirty(root, os.path.dirname(new), event_kind='directory_move_new')
+    mark_directory_dirty(root, new, event_kind='directory_move_new')
+    return pairs
+
+
+def claim_inventory_directories(
+    owner: str,
+    *,
+    limit: int = 4,
+    lease_seconds: int = 120,
+) -> List[Dict]:
+    safe_limit = max(1, min(int(limit), 32))
+    safe_lease = max(30, min(int(lease_seconds), 900))
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH due AS (
+                    SELECT root_path, directory_path
+                    FROM strm_ingest_inventory_directories
+                    WHERE active = TRUE
+                      AND (dirty = TRUE OR next_audit_at <= NOW())
+                      AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
+                    ORDER BY dirty DESC, next_audit_at ASC, directory_path ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE strm_ingest_inventory_directories d
+                SET claim_owner = %s,
+                    claim_expires_at = NOW() + (%s * INTERVAL '1 second'),
+                    audit_generation = CASE
+                        WHEN d.audit_cursor IS NULL THEN d.audit_generation + 1
+                        ELSE d.audit_generation
+                    END,
+                    updated_at = NOW()
+                FROM due
+                WHERE d.root_path = due.root_path
+                  AND d.directory_path = due.directory_path
+                RETURNING d.*
+                """,
+                (safe_limit, owner, safe_lease),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
+def get_inventory_files_for_directory(root_path: str, directory_path: str) -> Dict[str, Dict]:
+    root = os.path.normpath(str(root_path))
+    directory = os.path.normpath(str(directory_path))
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT file_path, file_size, file_mtime, status, operation,
+                       inventory_seen_generation
+                FROM strm_ingest_retry_queue
+                WHERE inventory_root_path = %s
+                  AND inventory_directory_path = %s
+                  AND LOWER(file_path) LIKE '%%.strm'
+                """,
+                (root, directory),
+            )
+            return {row['file_path']: dict(row) for row in cursor.fetchall()}
+
+
+def record_inventory_audit_batch(
+    claim: Dict,
+    *,
+    files: Dict[str, Tuple[int, float]],
+    child_directories: Iterable[str],
+    next_cursor: Optional[str],
+    complete: bool,
+    audit_interval_hours: int,
+) -> Dict[str, object]:
+    root = os.path.normpath(claim['root_path'])
+    directory = os.path.normpath(claim['directory_path'])
+    generation = int(claim['audit_generation'])
+    event_version = int(claim['event_version'])
+    owner = claim['claim_owner']
+    existing = get_inventory_files_for_directory(root, directory)
+    added, changed = [], []
+    for path, fingerprint in files.items():
+        row = existing.get(path)
+        if not row or row.get('operation') == 'delete' or row.get('status') in {'deleted', 'cancelled'}:
+            added.append(path)
+        elif row.get('file_size') != fingerprint[0] or row.get('file_mtime') != fingerprint[1]:
+            changed.append(path)
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT event_version
+                FROM strm_ingest_inventory_directories
+                WHERE root_path = %s AND directory_path = %s
+                  AND claim_owner = %s
+                FOR UPDATE
+                """,
+                (root, directory, owner),
+            )
+            current = cursor.fetchone()
+            if not current:
+                return {'accepted': False, 'stale': True, 'added': [], 'changed': [], 'removed': []}
+            if int(current['event_version']) != event_version:
+                cursor.execute(
+                    """
+                    UPDATE strm_ingest_inventory_directories
+                    SET dirty = TRUE, audit_cursor = NULL, claim_owner = NULL,
+                        claim_expires_at = NULL, next_audit_at = NOW(), updated_at = NOW()
+                    WHERE root_path = %s AND directory_path = %s AND claim_owner = %s
+                    """,
+                    (root, directory, owner),
+                )
+                return {'accepted': False, 'stale': True, 'added': [], 'changed': [], 'removed': []}
+
+            for path, (size, mtime) in files.items():
+                pending = path in added or path in changed
+                cursor.execute(
+                    """
+                    INSERT INTO strm_ingest_retry_queue (
+                        file_path, operation, source, status, next_attempt_at,
+                        file_size, file_mtime, inventory_root_path,
+                        inventory_directory_path, inventory_seen_generation
+                    ) VALUES (
+                        %s, 'ingest', 'inventory_v2', %s,
+                        NOW() + (600 * INTERVAL '1 second'), %s, %s, %s, %s, %s
+                    )
+                    ON CONFLICT (file_path) DO UPDATE
+                    SET operation = CASE WHEN %s THEN 'ingest' ELSE strm_ingest_retry_queue.operation END,
+                        source = CASE WHEN %s THEN 'inventory_v2' ELSE strm_ingest_retry_queue.source END,
+                        status = CASE WHEN %s THEN 'pending' ELSE strm_ingest_retry_queue.status END,
+                        attempt_count = CASE WHEN %s THEN 0 ELSE strm_ingest_retry_queue.attempt_count END,
+                        next_attempt_at = CASE
+                            WHEN %s THEN NOW() + (600 * INTERVAL '1 second')
+                            ELSE strm_ingest_retry_queue.next_attempt_at
+                        END,
+                        file_size = EXCLUDED.file_size,
+                        file_mtime = EXCLUDED.file_mtime,
+                        inventory_root_path = EXCLUDED.inventory_root_path,
+                        inventory_directory_path = EXCLUDED.inventory_directory_path,
+                        inventory_seen_generation = EXCLUDED.inventory_seen_generation,
+                        updated_at = NOW()
+                    """,
+                    (
+                        path, 'pending' if pending else 'observed', size, mtime,
+                        root, directory, generation,
+                        pending, pending, pending, pending, pending,
+                    ),
+                )
+
+            for child in sorted({os.path.normpath(path) for path in child_directories}):
+                cursor.execute(
+                    """
+                    INSERT INTO strm_ingest_inventory_directories (
+                        root_path, directory_path, parent_path, active,
+                        next_audit_at, seen_generation
+                    ) VALUES (
+                        %s, %s, %s, TRUE,
+                        NOW() + (
+                            MOD(ABS(hashtext(%s)::bigint), %s)
+                            * INTERVAL '1 second'
+                        ),
+                        %s
+                    )
+                    ON CONFLICT (root_path, directory_path) DO UPDATE
+                    SET parent_path = EXCLUDED.parent_path, active = TRUE,
+                        seen_generation = EXCLUDED.seen_generation, updated_at = NOW()
+                    """,
+                    (
+                        root, child, directory, child,
+                        max(1, int(audit_interval_hours) * 3600), generation,
+                    ),
+                )
+
+            removed = []
+            if complete:
+                cursor.execute(
+                    """
+                    SELECT file_path
+                    FROM strm_ingest_retry_queue
+                    WHERE inventory_root_path = %s
+                      AND inventory_directory_path = %s
+                      AND LOWER(file_path) LIKE '%%.strm'
+                      AND inventory_seen_generation != %s
+                      AND operation != 'delete'
+                      AND status NOT IN ('deleted', 'cancelled')
+                    """,
+                    (root, directory, generation),
+                )
+                removed.extend(row['file_path'] for row in cursor.fetchall())
+                cursor.execute(
+                    """
+                    SELECT directory_path
+                    FROM strm_ingest_inventory_directories
+                    WHERE root_path = %s AND parent_path = %s AND active = TRUE
+                      AND seen_generation != %s
+                    """,
+                    (root, directory, generation),
+                )
+                missing_children = [row['directory_path'] for row in cursor.fetchall()]
+                for child in missing_children:
+                    child_like = child.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '/%'
+                    cursor.execute(
+                        """
+                        SELECT file_path FROM strm_ingest_retry_queue
+                        WHERE inventory_root_path = %s
+                          AND (inventory_directory_path = %s OR inventory_directory_path LIKE %s ESCAPE '\\')
+                          AND LOWER(file_path) LIKE '%%.strm'
+                          AND operation != 'delete'
+                          AND status NOT IN ('deleted', 'cancelled')
+                        """,
+                        (root, child, child_like),
+                    )
+                    removed.extend(row['file_path'] for row in cursor.fetchall())
+                    cursor.execute(
+                        """
+                        UPDATE strm_ingest_inventory_directories
+                        SET active = FALSE, dirty = FALSE, claim_owner = NULL,
+                            claim_expires_at = NULL, updated_at = NOW()
+                        WHERE root_path = %s
+                          AND (directory_path = %s OR directory_path LIKE %s ESCAPE '\\')
+                        """,
+                        (root, child, child_like),
+                    )
+                removed = sorted(set(removed))
+                if removed:
+                    cursor.execute(
+                        """
+                        UPDATE strm_ingest_retry_queue
+                        SET operation = 'delete', source = 'inventory_v2', status = 'pending',
+                            attempt_count = 0,
+                            next_attempt_at = NOW() + (600 * INTERVAL '1 second'),
+                            updated_at = NOW(), completed_at = NULL,
+                            last_error = '增量目录库存发现 STRM 已消失'
+                        WHERE file_path = ANY(%s)
+                        """,
+                        (removed,),
+                    )
+                cursor.execute(
+                    """
+                    UPDATE strm_ingest_inventory_directories
+                    SET dirty = FALSE, dirty_since = NULL, last_verified_at = NOW(),
+                        next_audit_at = NOW() + (%s * INTERVAL '1 hour'),
+                        audit_cursor = NULL, claim_owner = NULL, claim_expires_at = NULL,
+                        last_error = NULL, updated_at = NOW()
+                    WHERE root_path = %s AND directory_path = %s AND claim_owner = %s
+                    """,
+                    (max(1, int(audit_interval_hours)), root, directory, owner),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE strm_ingest_inventory_directories
+                    SET dirty = TRUE, audit_cursor = %s, next_audit_at = NOW(),
+                        claim_owner = NULL, claim_expires_at = NULL, updated_at = NOW()
+                    WHERE root_path = %s AND directory_path = %s AND claim_owner = %s
+                    """,
+                    (next_cursor, root, directory, owner),
+                )
+            return {
+                'accepted': True,
+                'stale': False,
+                'added': sorted(added),
+                'changed': sorted(changed),
+                'removed': removed if complete else [],
+                'complete': complete,
+            }
+
+
+def fail_inventory_directory_claim(claim: Dict, error: str, *, delay_seconds: int = 300) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE strm_ingest_inventory_directories
+                SET dirty = TRUE, claim_owner = NULL, claim_expires_at = NULL,
+                    next_audit_at = NOW() + (%s * INTERVAL '1 second'),
+                    last_error = %s, updated_at = NOW()
+                WHERE root_path = %s AND directory_path = %s AND claim_owner = %s
+                """,
+                (
+                    max(30, min(int(delay_seconds), 3600)), str(error or '')[:1000],
+                    claim['root_path'], claim['directory_path'], claim['claim_owner'],
+                ),
+            )
+
+
+def request_full_inventory_audit(root_paths: Iterable[str]) -> int:
+    """Explicitly schedule a logical full audit; workers still scan bounded directories."""
+    roots = sorted({os.path.normpath(str(path)) for path in root_paths or [] if str(path or '').strip()})
+    if not roots:
+        return 0
+    register_inventory_roots(roots)
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE strm_ingest_inventory_directories
+                SET dirty = TRUE, dirty_since = COALESCE(dirty_since, NOW()),
+                    next_audit_at = NOW(), audit_cursor = NULL,
+                    event_version = event_version + 1,
+                    claim_owner = NULL, claim_expires_at = NULL,
+                    updated_at = NOW()
+                WHERE active = TRUE AND root_path = ANY(%s)
+                """,
+                (roots,),
+            )
+            return cursor.rowcount
+
+
+def get_inventory_summary() -> Dict[str, int]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE active = TRUE) AS directory_count,
+                    COUNT(*) FILTER (WHERE active = TRUE AND dirty = TRUE) AS dirty_count,
+                    COUNT(*) FILTER (
+                        WHERE active = TRUE AND claim_expires_at > NOW()
+                    ) AS claimed_count
+                FROM strm_ingest_inventory_directories
+                """
+            )
+            row = cursor.fetchone() or {}
+            return {key: int(value or 0) for key, value in row.items()}

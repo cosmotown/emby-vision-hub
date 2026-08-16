@@ -144,6 +144,36 @@ def claim_due_paths(limit: int = 20) -> List[Dict]:
             return [dict(row) for row in cursor.fetchall()]
 
 
+def defer_claimed_paths(
+    file_paths: Iterable[str],
+    error: str,
+    *,
+    delay_seconds: int = 300,
+) -> int:
+    """Release claimed rows without changing operation or consuming an attempt."""
+    paths = sorted({
+        os.path.normpath(str(path))
+        for path in file_paths or []
+        if str(path or '').strip()
+    })
+    if not paths:
+        return 0
+    safe_delay = max(30, min(int(delay_seconds), 3600))
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE strm_ingest_retry_queue
+                SET status = 'retry',
+                    next_attempt_at = NOW() + (%s * INTERVAL '1 second'),
+                    updated_at = NOW(), last_error = %s
+                WHERE file_path = ANY(%s) AND status = 'processing'
+                """,
+                (safe_delay, str(error or '')[:4000], paths),
+            )
+            return cursor.rowcount
+
+
 def mark_completed(file_paths: Iterable[str]) -> int:
     paths = sorted({os.path.normpath(str(path)) for path in file_paths or [] if str(path or '').strip()})
     if not paths:
@@ -707,7 +737,7 @@ def claim_inventory_directories(
                     SELECT root_path, directory_path
                     FROM strm_ingest_inventory_directories
                     WHERE active = TRUE
-                      AND (dirty = TRUE OR next_audit_at <= NOW())
+                      AND next_audit_at <= NOW()
                       AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
                     ORDER BY dirty DESC, next_audit_at ASC, directory_path ASC
                     LIMIT %s
@@ -716,10 +746,8 @@ def claim_inventory_directories(
                 UPDATE strm_ingest_inventory_directories d
                 SET claim_owner = %s,
                     claim_expires_at = NOW() + (%s * INTERVAL '1 second'),
-                    audit_generation = CASE
-                        WHEN d.audit_cursor IS NULL THEN d.audit_generation + 1
-                        ELSE d.audit_generation
-                    END,
+                    audit_generation = d.audit_generation + 1,
+                    audit_cursor = NULL,
                     updated_at = NOW()
                 FROM due
                 WHERE d.root_path = due.root_path
@@ -757,13 +785,16 @@ def record_inventory_audit_batch(
     child_directories: Iterable[str],
     next_cursor: Optional[str],
     complete: bool,
+    db_batch_size: int = 500,
     audit_interval_hours: int,
 ) -> Dict[str, object]:
+    """Persist one complete physical directory snapshot in bounded SQL batches."""
     root = os.path.normpath(claim['root_path'])
     directory = os.path.normpath(claim['directory_path'])
     generation = int(claim['audit_generation'])
     event_version = int(claim['event_version'])
     owner = claim['claim_owner']
+    safe_batch_size = max(1, min(int(db_batch_size), 500))
     existing = get_inventory_files_for_directory(root, directory)
     added, changed = [], []
     for path, fingerprint in files.items():
@@ -772,6 +803,23 @@ def record_inventory_audit_batch(
             added.append(path)
         elif row.get('file_size') != fingerprint[0] or row.get('file_mtime') != fingerprint[1]:
             changed.append(path)
+
+    file_rows = []
+    for path, (size, mtime) in sorted(files.items()):
+        pending = path in added or path in changed
+        file_rows.append(
+            (
+                path,
+                'pending' if pending else 'observed',
+                size,
+                mtime,
+                root,
+                directory,
+                generation,
+            )
+        )
+    children = sorted({os.path.normpath(path) for path in child_directories})
+    db_batches = 0
 
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -800,26 +848,27 @@ def record_inventory_audit_batch(
                 )
                 return {'accepted': False, 'stale': True, 'added': [], 'changed': [], 'removed': []}
 
-            for path, (size, mtime) in files.items():
-                pending = path in added or path in changed
-                cursor.execute(
+            for offset in range(0, len(file_rows), safe_batch_size):
+                execute_values(
+                    cursor,
                     """
                     INSERT INTO strm_ingest_retry_queue (
                         file_path, operation, source, status, next_attempt_at,
                         file_size, file_mtime, inventory_root_path,
                         inventory_directory_path, inventory_seen_generation
-                    ) VALUES (
-                        %s, 'ingest', 'inventory_v2', %s,
-                        NOW() + (600 * INTERVAL '1 second'), %s, %s, %s, %s, %s
-                    )
+                    ) VALUES %s
                     ON CONFLICT (file_path) DO UPDATE
-                    SET operation = CASE WHEN %s THEN 'ingest' ELSE strm_ingest_retry_queue.operation END,
-                        source = CASE WHEN %s THEN 'inventory_v2' ELSE strm_ingest_retry_queue.source END,
-                        status = CASE WHEN %s THEN 'pending' ELSE strm_ingest_retry_queue.status END,
-                        attempt_count = CASE WHEN %s THEN 0 ELSE strm_ingest_retry_queue.attempt_count END,
+                    SET operation = CASE WHEN EXCLUDED.status = 'pending' THEN 'ingest' ELSE strm_ingest_retry_queue.operation END,
+                        source = CASE WHEN EXCLUDED.status = 'pending' THEN 'inventory_v2' ELSE strm_ingest_retry_queue.source END,
+                        status = CASE WHEN EXCLUDED.status = 'pending' THEN 'pending' ELSE strm_ingest_retry_queue.status END,
+                        attempt_count = CASE WHEN EXCLUDED.status = 'pending' THEN 0 ELSE strm_ingest_retry_queue.attempt_count END,
                         next_attempt_at = CASE
-                            WHEN %s THEN NOW() + (600 * INTERVAL '1 second')
+                            WHEN EXCLUDED.status = 'pending' THEN NOW() + (600 * INTERVAL '1 second')
                             ELSE strm_ingest_retry_queue.next_attempt_at
+                        END,
+                        completed_at = CASE
+                            WHEN EXCLUDED.status = 'pending' THEN NULL
+                            ELSE strm_ingest_retry_queue.completed_at
                         END,
                         file_size = EXCLUDED.file_size,
                         file_mtime = EXCLUDED.file_mtime,
@@ -828,36 +877,38 @@ def record_inventory_audit_batch(
                         inventory_seen_generation = EXCLUDED.inventory_seen_generation,
                         updated_at = NOW()
                     """,
-                    (
-                        path, 'pending' if pending else 'observed', size, mtime,
-                        root, directory, generation,
-                        pending, pending, pending, pending, pending,
+                    file_rows[offset : offset + safe_batch_size],
+                    template=(
+                        "(%s, 'ingest', 'inventory_v2', %s, "
+                        "NOW() + (600 * INTERVAL '1 second'), %s, %s, %s, %s, %s)"
                     ),
+                    page_size=safe_batch_size,
                 )
+                db_batches += 1
 
-            for child in sorted({os.path.normpath(path) for path in child_directories}):
-                cursor.execute(
+            child_rows = [
+                (root, child, directory, generation)
+                for child in children
+            ]
+            for offset in range(0, len(child_rows), safe_batch_size):
+                execute_values(
+                    cursor,
                     """
                     INSERT INTO strm_ingest_inventory_directories (
                         root_path, directory_path, parent_path, active,
                         next_audit_at, seen_generation
-                    ) VALUES (
-                        %s, %s, %s, TRUE,
-                        NOW() + (
-                            MOD(ABS(hashtext(%s)::bigint), %s)
-                            * INTERVAL '1 second'
-                        ),
-                        %s
-                    )
+                    ) VALUES %s
                     ON CONFLICT (root_path, directory_path) DO UPDATE
                     SET parent_path = EXCLUDED.parent_path, active = TRUE,
                         seen_generation = EXCLUDED.seen_generation, updated_at = NOW()
                     """,
-                    (
-                        root, child, directory, child,
-                        max(1, int(audit_interval_hours) * 3600), generation,
+                    child_rows[offset : offset + safe_batch_size],
+                    template=(
+                        "(%s, %s, %s, TRUE, NOW(), %s)"
                     ),
+                    page_size=safe_batch_size,
                 )
+                db_batches += 1
 
             removed = []
             if complete:
@@ -951,6 +1002,8 @@ def record_inventory_audit_batch(
                 'changed': sorted(changed),
                 'removed': removed if complete else [],
                 'complete': complete,
+                'db_batches': db_batches,
+                'directories_discovered': len(children),
             }
 
 
@@ -1011,3 +1064,22 @@ def get_inventory_summary() -> Dict[str, int]:
             )
             row = cursor.fetchone() or {}
             return {key: int(value or 0) for key, value in row.items()}
+
+
+def list_active_inventory_directories(root_paths: Iterable[str]) -> List[str]:
+    """Return persisted watch targets without consulting the filesystem."""
+    roots = sorted({os.path.normpath(str(path)) for path in root_paths or [] if str(path or '').strip()})
+    if not roots:
+        return []
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT directory_path
+                FROM strm_ingest_inventory_directories
+                WHERE active = TRUE AND root_path = ANY(%s)
+                ORDER BY directory_path
+                """,
+                (roots,),
+            )
+            return [row['directory_path'] for row in cursor.fetchall()]

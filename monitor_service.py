@@ -2,13 +2,13 @@
 
 import os
 import re
+import stat
 import time
 import logging
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Any, Callable
-from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from gevent import spawn_later
 
@@ -25,6 +25,7 @@ from services.emby_ingest import (
     wait_for_paths_stable,
 )
 from services.strm_inventory import IncrementalStrmInventory
+from services.persisted_directory_watcher import PersistedDirectoryObserver
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -277,6 +278,34 @@ def _restore_delete_event_paths(file_paths: List[str]) -> None:
                 DEBOUNCE_DELAY,
                 process_delete_batch_queue,
             )
+
+
+def _classify_retry_paths(paths):
+    """Use one successful parent snapshot per directory before inferring missing."""
+    existing = []
+    unresolved_by_parent = {}
+    for raw_path in paths or []:
+        path = os.path.normpath(str(raw_path))
+        if os.path.isfile(path):
+            existing.append(path)
+        else:
+            unresolved_by_parent.setdefault(os.path.dirname(path), []).append(path)
+
+    confirmed_missing = []
+    inaccessible = []
+    for parent, parent_paths in unresolved_by_parent.items():
+        try:
+            with os.scandir(parent) as entries:
+                names = {entry.name for entry in entries}
+        except OSError:
+            inaccessible.extend(parent_paths)
+            continue
+        for path in parent_paths:
+            if os.path.basename(path) in names:
+                inaccessible.append(path)
+            else:
+                confirmed_missing.append(path)
+    return sorted(existing), sorted(confirmed_missing), sorted(inaccessible)
 
 
 def _restore_adaptive_refresh_batch(batch: dict) -> None:
@@ -1000,7 +1029,6 @@ class MonitorService:
             logger.error("  ➜ 另一实时监控实例仍在运行，拒绝启动新的任务池世代。")
             return
 
-        self.observer = Observer()
         event_handler = MediaFileHandler(
             self.extensions,
             self.exclude_dirs,
@@ -1009,16 +1037,49 @@ class MonitorService:
 
         started_paths = []
         for path in self.paths:
-            if os.path.exists(path) and os.path.isdir(path):
-                try:
-                    self.observer.schedule(event_handler, path, recursive=True)
-                    started_paths.append(path)
-                except Exception as e:
-                    logger.error(f"  ➜ 无法监控目录 '{path}': {e}")
-            else:
-                logger.warning(f"  ➜ 监控目录不存在或无效，已跳过: {path}")
+            normalized = os.path.normpath(str(path))
+            try:
+                metadata = os.lstat(normalized)
+            except OSError as exc:
+                # Keep the configured root in the persisted audit lifecycle.
+                # A missing/offline mount gets no watch, but must not disable
+                # retry/backoff or be interpreted as an empty directory.
+                started_paths.append(normalized)
+                logger.warning(
+                    "  ➜ 监控根当前不可访问，将保持持久库存并等待恢复: %s (%s)",
+                    normalized,
+                    type(exc).__name__,
+                )
+                continue
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                logger.warning(f"  ➜ 监控目录不是安全的物理目录，已跳过: {normalized}")
+                continue
+            started_paths.append(normalized)
 
         if started_paths:
+            if self.exclude_dirs:
+                try:
+                    strm_ingest_db.register_inventory_roots(
+                        self.exclude_dirs,
+                        audit_interval_hours=max(1, self.full_scan_interval_hours or 24),
+                    )
+                    recovered = strm_ingest_db.recover_processing()
+                    if recovered:
+                        logger.info(f"  🔁 已恢复 {recovered} 个中断的 STRM 入库重试任务。")
+                    strm_ingest_db.prune_completed(retention_days=30)
+                except Exception:
+                    logger.exception("  ➜ 无法读取 STRM 持久目录状态，实时监控保持停止。")
+                    return
+
+            self.observer = PersistedDirectoryObserver(
+                event_handler,
+                watch_roots=started_paths,
+                persisted_directory_provider=lambda: (
+                    strm_ingest_db.list_active_inventory_directories(self.exclude_dirs)
+                    if self.exclude_dirs else []
+                ),
+                anchor_path=os.environ.get('APP_DATA_DIR') or os.getcwd(),
+            )
             self._reconcile_stop = threading.Event()
             self._reconcile_thread = None
             self._retry_thread = None
@@ -1028,6 +1089,11 @@ class MonitorService:
             try:
                 self.observer.start()
             except Exception:
+                try:
+                    self.observer.stop()
+                    self.observer.join(timeout=5)
+                except Exception:
+                    logger.exception("  ➜ STRM non-recursive watcher 启动回滚失败。")
                 _MONITOR_TASK_POOL.shutdown()
                 self._pool_generation = None
                 if MonitorService.processor_instance is self.processor:
@@ -1035,7 +1101,14 @@ class MonitorService:
                 logger.exception("  ➜ 实时监控 Observer 启动失败，任务池已安全关闭。")
                 return
             self._started = True
-            logger.info(f"  👀 实时监控服务已启动，正在监听 {len(started_paths)} 个目录: {started_paths}")
+            logger.info(
+                "  👀 实时监控服务已启动：%s 个配置根，%s 个显式 non-recursive watch，"
+                "%s 个 inotify backend 线程，max_user_watches=%s。",
+                len(started_paths),
+                self.observer.watch_count,
+                self.observer.backend_thread_count,
+                self.observer.max_user_watches or 'unknown',
+            )
             with QUEUE_LOCK:
                 pending_files = list(FILE_EVENT_QUEUE)
             with DELETE_QUEUE_LOCK:
@@ -1043,14 +1116,6 @@ class MonitorService:
             _restore_file_event_paths(pending_files)
             _restore_delete_event_paths(pending_deletes)
             if self.exclude_dirs:
-                strm_ingest_db.register_inventory_roots(
-                    self.exclude_dirs,
-                    audit_interval_hours=max(1, self.full_scan_interval_hours or 24),
-                )
-                recovered = strm_ingest_db.recover_processing()
-                if recovered:
-                    logger.info(f"  🔁 已恢复 {recovered} 个中断的 STRM 入库重试任务。")
-                strm_ingest_db.prune_completed(retention_days=30)
                 self._retry_thread = threading.Thread(
                     target=self._run_retry_loop,
                     name="strm-ingest-retry",
@@ -1095,10 +1160,13 @@ class MonitorService:
                     on_delete=process_delete,
                 )
                 if summary['claimed']:
+                    watch_summary = self.observer.sync_from_persistence() if self.observer else {}
                     logger.info(
                         "  🧭 STRM 增量目录核对：认领 %(claimed)s，完成 %(completed)s，"
-                        "续扫 %(partial)s，新增/变化 %(ingest)s，删除 %(delete)s，失败 %(failed)s。",
-                        summary,
+                        "新增/变化 %(ingest)s，删除 %(delete)s，失败 %(failed)s，"
+                        "物理枚举 %(physical_enumerations)s，条目 %(entries_seen)s，"
+                        "DB 批次 %(db_batches)s，watch %(watch_count)s。",
+                        {**summary, 'watch_count': watch_summary.get('watched', 0)},
                     )
             except Exception as exc:
                 logger.error(f"  ❌ STRM 增量目录核对失败，将按持久状态重试: {exc}", exc_info=True)
@@ -1205,8 +1273,14 @@ class MonitorService:
                 ingest_events = [event for event in events if event.get('operation') != 'delete']
                 delete_events = [event for event in events if event.get('operation') == 'delete']
                 ingest_paths = [event['file_path'] for event in ingest_events]
-                existing_paths = [path for path in ingest_paths if os.path.isfile(path)]
-                missing_paths = sorted(set(ingest_paths) - set(existing_paths))
+                existing_paths, missing_paths, inaccessible_ingest_paths = _classify_retry_paths(
+                    ingest_paths
+                )
+                if inaccessible_ingest_paths:
+                    strm_ingest_db.defer_claimed_paths(
+                        inaccessible_ingest_paths,
+                        'STRM 父目录当前不可访问，已保留原操作并延后重试',
+                    )
                 if missing_paths:
                     strm_ingest_db.enqueue_paths(
                         missing_paths,
@@ -1221,8 +1295,14 @@ class MonitorService:
 
                 if delete_events:
                     delete_paths = [event['file_path'] for event in delete_events]
-                    reappeared_paths = [path for path in delete_paths if os.path.isfile(path)]
-                    missing_delete_paths = sorted(set(delete_paths) - set(reappeared_paths))
+                    reappeared_paths, missing_delete_paths, inaccessible_delete_paths = _classify_retry_paths(
+                        delete_paths
+                    )
+                    if inaccessible_delete_paths:
+                        strm_ingest_db.defer_claimed_paths(
+                            inaccessible_delete_paths,
+                            'STRM 父目录当前不可访问，删除确认已延后',
+                        )
                     if reappeared_paths:
                         strm_ingest_db.enqueue_paths(
                             reappeared_paths,

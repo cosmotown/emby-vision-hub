@@ -3,7 +3,7 @@
 services:
   emby-vision-hub:
     build: .
-    image: tzyzero186/emby-vision-hub:latest
+    image: tzyzero186/emby-vision-hub:7.2.13
     container_name: emby-vision-hub
     restart: unless-stopped
     volumes:
@@ -18,7 +18,7 @@ services:
       - DB_PASSWORD=change-me
       - DB_NAME=evh
       - CONTAINER_NAME=emby-vision-hub
-      - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:latest
+      - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:7.2.13
     ports:
       - "5257:5257"
       - "8096:8096"

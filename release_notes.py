@@ -15,12 +15,13 @@ CUSTOM_RELEASES = [
 
 ## STRM Inventory v2
 
-- watchdog 的新增、修改、删除、文件改名和目录移动事件同步维护 PostgreSQL 文件库存与 dirty 目录状态。
-- 新增持久目录 cursor、generation、event version、owner 和 lease；多 EVH 实例使用 `FOR UPDATE SKIP LOCKED` 避免重复认领。
+- 普通 STRM 文件新增、修改、删除和改名事件走精确入库或删除回读，不再把目录标记为 dirty，也不会累积潜在目录扫描 backlog；目录创建、移动和删除才进入有界 dirty 目录核对。
+- 新增持久目录 cursor、generation、event version、owner 和 lease；多 EVH 实例使用 `FOR UPDATE SKIP LOCKED` 避免重复认领，并保持一个目录一次 `scandir` 的有界核对语义。
 - 取消启动约 60 秒后的 STRM 根递归库存扫描，并避免 watchdog `recursive=True` 在 Linux 启动时枚举整棵目录树；正常启动从 PostgreSQL 恢复已知目录，以单一 inotify backend 建立显式 non-recursive watches。
 - STRM Inventory v2 不再执行启动或周期性自动查漏；正常运行依靠 filesystem event，停机或漏事件由任务中心“STRM 查漏”人工触发有界目录审计。旧 `monitor_full_scan_interval_hours` 配置保留兼容但不再消费。
 - 目录、挂载、权限或 I/O 暂时不可访问时保持原库存并退避重试；只有成功读取父目录并明确确认文件或 child directory 缺失时才进入精确删除链。
-- 管理员可显式请求完整逻辑库存审计；它仍通过有界目录队列完成，不读取 STRM 指向的视频内容，也不递归刷新媒体库。
+- 管理员可显式运行“STRM 查漏”；进度、pending、claimed、completed、停止和最终完成判定只对应本次 manual generation，不计入或清除普通 event-driven dirty work。
+- 人工停止后不再领取本 generation 的新 claim，当前有界 claim 安全结束，剩余 pending 持久保留并可由下一次人工任务继续；整个审计不读取 STRM 指向的视频内容，也不递归刷新媒体库。
 - 保留现有精确路径通知、浅层首次发现、10/30/60 分钟有限重试、终态只读自愈和自适应批处理链。
 
 ### 明确不包含

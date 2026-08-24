@@ -17,7 +17,7 @@ EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 S
 *   **演员信息处理**：自动翻译演员名、角色名、优先使用豆瓣角色名，没有的调用ai在线翻译。
 *   **外部数据源集成**：从豆瓣获取Tmdb缺失的演员，补充进演员表。
 *   **定时任务**：支持定时自动化按设置的顺序执行后台任务。
-*   **实时处理新入库资源**：按精确路径协调 STRM 新增、修改、移动与删除；未确认入库的路径进入有限重试队列，默认每日低频校准一次路径库存。需先在后台「高级」-「安全设置」配置 Webhook Token，再配置 `http://ip:5257/webhook/emby?token=你的Token`，请求内容类型选择 `application/json`。
+*   **实时处理新入库资源**：按精确路径协调 STRM 新增、修改、移动与删除；未确认入库的路径进入有限重试队列，目录库存查漏仅由任务中心人工触发，不在启动或定时任务中自动扫描。需先在后台「高级」-「安全设置」配置 Webhook Token，再配置 `http://ip:5257/webhook/emby?token=你的Token`，请求内容类型选择 `application/json`。
 *   **合集检查**：扫描库存合集，检查缺失并订阅（需配置MoviePilot）。
 *   **智能追剧**：监控媒体库所有剧集，智能判断并更新状态，对缺失的季以及新出的季进行订阅操作（需配置MoviePilot）。
 *   **演员订阅**：追踪喜欢的演员，按配置订阅过去以及将来的资源（需配置MoviePilot）。
@@ -53,7 +53,7 @@ EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 S
     services:
       # --- 1. Emby Vision Hub 主程序 ---
       emby-vision-hub:
-        image: tzyzero186/emby-vision-hub:latest
+        image: tzyzero186/emby-vision-hub:7.2.13
         container_name: emby-vision-hub
         network_mode: bridge                          # 网络模式
         ports:
@@ -76,7 +76,7 @@ EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 S
           - DB_PASSWORD=请替换为强密码                 # !!! (必填) 与下方保持一致 !!!
           - DB_NAME=evh                               # !!! (可选) 修改为你自己的数据库名
           - CONTAINER_NAME=emby-vision-hub            # 以下两项都是一键更新用，不需要可以不配置
-          - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:latest
+          - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:7.2.13
         restart: unless-stopped
         depends_on:                                   # 确保主程序只在数据库健康检查通过后才启动 
           db:

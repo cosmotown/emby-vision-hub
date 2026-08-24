@@ -1,4 +1,5 @@
 import os
+import uuid
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from psycopg2.extras import execute_values
@@ -610,6 +611,7 @@ def mark_directory_dirty(root_path: str, directory_path: str, *, event_kind: str
                     event_version = strm_ingest_inventory_directories.event_version + 1,
                     claim_owner = NULL,
                     claim_expires_at = NULL,
+                    manual_audit_id = NULL,
                     last_error = NULL,
                     updated_at = NOW()
                 """,
@@ -619,12 +621,27 @@ def mark_directory_dirty(root_path: str, directory_path: str, *, event_kind: str
 
 
 def record_file_event(root_path: str, file_path: str, *, event_kind: str) -> None:
+    """Persist exact-file ownership without scheduling a directory scandir."""
     root = os.path.normpath(str(root_path))
     path = os.path.normpath(str(file_path))
     directory = os.path.dirname(path)
-    mark_directory_dirty(root, directory, event_kind=event_kind)
+    parent = None if directory == root else os.path.dirname(directory)
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO strm_ingest_inventory_directories (
+                    root_path, directory_path, parent_path, active, dirty,
+                    last_event_at, next_audit_at
+                ) VALUES (%s, %s, %s, TRUE, FALSE, NOW(), NOW() + INTERVAL '24 hours')
+                ON CONFLICT (root_path, directory_path) DO UPDATE
+                SET parent_path = EXCLUDED.parent_path,
+                    active = TRUE,
+                    last_event_at = NOW(),
+                    updated_at = NOW()
+                """,
+                (root, directory, parent),
+            )
             cursor.execute(
                 """
                 UPDATE strm_ingest_retry_queue
@@ -701,7 +718,8 @@ def record_directory_moved(root_path: str, old_path: str, new_path: str) -> List
                         dirty_since = COALESCE(strm_ingest_inventory_directories.dirty_since, NOW()),
                         last_event_at = NOW(), next_audit_at = NOW(), audit_cursor = NULL,
                         event_version = strm_ingest_inventory_directories.event_version + 1,
-                        claim_owner = NULL, claim_expires_at = NULL, updated_at = NOW()
+                        claim_owner = NULL, claim_expires_at = NULL,
+                        manual_audit_id = NULL, updated_at = NOW()
                     """,
                     (root, mapped, parent),
                 )
@@ -726,6 +744,7 @@ def claim_inventory_directories(
     *,
     limit: int = 4,
     lease_seconds: int = 120,
+    manual_audit_id: Optional[str] = None,
 ) -> List[Dict]:
     safe_limit = max(1, min(int(limit), 32))
     safe_lease = max(30, min(int(lease_seconds), 900))
@@ -735,12 +754,29 @@ def claim_inventory_directories(
                 """
                 WITH due AS (
                     SELECT root_path, directory_path
-                    FROM strm_ingest_inventory_directories
-                    WHERE active = TRUE
-                      AND dirty = TRUE
-                      AND next_audit_at <= NOW()
-                      AND (claim_expires_at IS NULL OR claim_expires_at <= NOW())
-                    ORDER BY dirty DESC, next_audit_at ASC, directory_path ASC
+                    FROM strm_ingest_inventory_directories candidate
+                    WHERE candidate.active = TRUE
+                      AND candidate.dirty = TRUE
+                      AND candidate.next_audit_at <= NOW()
+                      AND (
+                          candidate.claim_expires_at IS NULL
+                          OR candidate.claim_expires_at <= NOW()
+                      )
+                      AND (
+                          (%s IS NULL AND candidate.manual_audit_id IS NULL)
+                          OR (
+                              candidate.manual_audit_id = %s
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM strm_ingest_inventory_manual_audits a
+                                  WHERE a.audit_id = candidate.manual_audit_id
+                                    AND a.state IN ('queued', 'running')
+                              )
+                          )
+                      )
+                    ORDER BY candidate.dirty DESC,
+                             candidate.next_audit_at ASC,
+                             candidate.directory_path ASC
                     LIMIT %s
                     FOR UPDATE SKIP LOCKED
                 )
@@ -755,7 +791,7 @@ def claim_inventory_directories(
                   AND d.directory_path = due.directory_path
                 RETURNING d.*
                 """,
-                (safe_limit, owner, safe_lease),
+                (manual_audit_id, manual_audit_id, safe_limit, owner, safe_lease),
             )
             return [dict(row) for row in cursor.fetchall()]
 
@@ -795,6 +831,7 @@ def record_inventory_audit_batch(
     generation = int(claim['audit_generation'])
     event_version = int(claim['event_version'])
     owner = claim['claim_owner']
+    manual_audit_id = claim.get('manual_audit_id')
     safe_batch_size = max(1, min(int(db_batch_size), 500))
     existing = get_inventory_files_for_directory(root, directory)
     added, changed = [], []
@@ -826,7 +863,7 @@ def record_inventory_audit_batch(
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT event_version
+                SELECT event_version, manual_audit_id
                 FROM strm_ingest_inventory_directories
                 WHERE root_path = %s AND directory_path = %s
                   AND claim_owner = %s
@@ -837,7 +874,10 @@ def record_inventory_audit_batch(
             current = cursor.fetchone()
             if not current:
                 return {'accepted': False, 'stale': True, 'added': [], 'changed': [], 'removed': []}
-            if int(current['event_version']) != event_version:
+            if (
+                int(current['event_version']) != event_version
+                or current.get('manual_audit_id') != manual_audit_id
+            ):
                 cursor.execute(
                     """
                     UPDATE strm_ingest_inventory_directories
@@ -888,7 +928,7 @@ def record_inventory_audit_batch(
                 db_batches += 1
 
             child_rows = [
-                (root, child, directory, generation)
+                (root, child, directory, generation, manual_audit_id)
                 for child in children
             ]
             for offset in range(0, len(child_rows), safe_batch_size):
@@ -897,7 +937,7 @@ def record_inventory_audit_batch(
                     """
                     INSERT INTO strm_ingest_inventory_directories (
                         root_path, directory_path, parent_path, active, dirty,
-                        next_audit_at, seen_generation
+                        next_audit_at, seen_generation, manual_audit_id
                     ) VALUES %s
                     ON CONFLICT (root_path, directory_path) DO UPDATE
                     SET parent_path = EXCLUDED.parent_path, active = TRUE,
@@ -907,11 +947,16 @@ def record_inventory_audit_batch(
                             WHEN NOT strm_ingest_inventory_directories.active THEN NOW()
                             ELSE strm_ingest_inventory_directories.next_audit_at
                         END,
-                        seen_generation = EXCLUDED.seen_generation, updated_at = NOW()
+                        seen_generation = EXCLUDED.seen_generation,
+                        manual_audit_id = COALESCE(
+                            EXCLUDED.manual_audit_id,
+                            strm_ingest_inventory_directories.manual_audit_id
+                        ),
+                        updated_at = NOW()
                     """,
                     child_rows[offset : offset + safe_batch_size],
                     template=(
-                        "(%s, %s, %s, TRUE, TRUE, NOW(), %s)"
+                        "(%s, %s, %s, TRUE, TRUE, NOW(), %s, %s)"
                     ),
                     page_size=safe_batch_size,
                 )
@@ -987,11 +1032,35 @@ def record_inventory_audit_batch(
                     SET dirty = FALSE, dirty_since = NULL, last_verified_at = NOW(),
                         next_audit_at = NOW() + (%s * INTERVAL '1 hour'),
                         audit_cursor = NULL, claim_owner = NULL, claim_expires_at = NULL,
+                        manual_audit_id = CASE
+                            WHEN manual_audit_id = %s THEN NULL
+                            ELSE manual_audit_id
+                        END,
                         last_error = NULL, updated_at = NOW()
                     WHERE root_path = %s AND directory_path = %s AND claim_owner = %s
                     """,
-                    (max(1, int(audit_interval_hours)), root, directory, owner),
+                    (
+                        max(1, int(audit_interval_hours)), manual_audit_id,
+                        root, directory, owner,
+                    ),
                 )
+                if manual_audit_id and cursor.rowcount == 1:
+                    cursor.execute(
+                        """
+                        UPDATE strm_ingest_inventory_manual_audits
+                        SET state = 'running',
+                            started_at = COALESCE(started_at, NOW()),
+                            completed_directories = completed_directories + 1,
+                            total_directories = completed_directories + 1 + (
+                                SELECT COUNT(*)
+                                FROM strm_ingest_inventory_directories
+                                WHERE active = TRUE AND manual_audit_id = %s
+                            ),
+                            updated_at = NOW()
+                        WHERE audit_id = %s AND state IN ('queued', 'running')
+                        """,
+                        (manual_audit_id, manual_audit_id),
+                    )
             else:
                 cursor.execute(
                     """
@@ -1053,6 +1122,183 @@ def request_full_inventory_audit(root_paths: Iterable[str]) -> int:
                 (roots,),
             )
             return cursor.rowcount
+
+
+def create_manual_inventory_audit(root_paths: Iterable[str]) -> Dict[str, object]:
+    """Create or resume the one persisted manual Inventory generation."""
+    roots = sorted({os.path.normpath(str(path)) for path in root_paths or [] if str(path or '').strip()})
+    if not roots:
+        raise ValueError('manual inventory audit requires at least one root')
+    register_inventory_roots(roots)
+    audit_id = uuid.uuid4().hex
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtext('strm_inventory_manual_audit'))"
+            )
+            cursor.execute(
+                """
+                SELECT audit_id
+                FROM strm_ingest_inventory_manual_audits
+                WHERE state IN ('queued', 'running')
+                ORDER BY created_at
+                LIMIT 1
+                FOR UPDATE
+                """
+            )
+            existing = cursor.fetchone()
+            if existing:
+                return {
+                    'audit_id': existing['audit_id'],
+                    'existing': True,
+                }
+            cursor.execute(
+                """
+                INSERT INTO strm_ingest_inventory_manual_audits (audit_id, state)
+                VALUES (%s, 'queued')
+                """,
+                (audit_id,),
+            )
+            cursor.execute(
+                """
+                UPDATE strm_ingest_inventory_directories
+                SET dirty = TRUE,
+                    dirty_since = COALESCE(dirty_since, NOW()),
+                    next_audit_at = NOW(),
+                    audit_cursor = NULL,
+                    event_version = event_version + 1,
+                    claim_owner = NULL,
+                    claim_expires_at = NULL,
+                    manual_audit_id = %s,
+                    updated_at = NOW()
+                WHERE active = TRUE
+                  AND root_path = ANY(%s)
+                  AND (claim_owner IS NULL OR claim_expires_at <= NOW())
+                  AND (
+                      (dirty = FALSE AND manual_audit_id IS NULL)
+                      OR EXISTS (
+                          SELECT 1
+                          FROM strm_ingest_inventory_manual_audits previous
+                          WHERE previous.audit_id = strm_ingest_inventory_directories.manual_audit_id
+                            AND previous.state = 'cancelled'
+                      )
+                  )
+                """,
+                (audit_id, roots),
+            )
+            total = int(cursor.rowcount or 0)
+            cursor.execute(
+                """
+                UPDATE strm_ingest_inventory_manual_audits
+                SET total_directories = %s,
+                    state = CASE WHEN %s = 0 THEN 'completed' ELSE state END,
+                    completed_at = CASE WHEN %s = 0 THEN NOW() ELSE NULL END,
+                    updated_at = NOW()
+                WHERE audit_id = %s
+                """,
+                (total, total, total, audit_id),
+            )
+    return {'audit_id': audit_id, 'existing': False, 'total_directories': total}
+
+
+def list_active_manual_inventory_audits() -> List[str]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT audit_id
+                FROM strm_ingest_inventory_manual_audits
+                WHERE state IN ('queued', 'running')
+                ORDER BY created_at
+                """
+            )
+            return [str(row['audit_id']) for row in cursor.fetchall()]
+
+
+def get_manual_inventory_audit(audit_id: str) -> Optional[Dict[str, object]]:
+    """Refresh and return durable progress for one manual audit generation."""
+    safe_id = str(audit_id or '').strip()
+    if not safe_id:
+        return None
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM strm_ingest_inventory_manual_audits
+                WHERE audit_id = %s
+                FOR UPDATE
+                """,
+                (safe_id,),
+            )
+            audit = cursor.fetchone()
+            if not audit:
+                return None
+            cursor.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE active = TRUE) AS pending_directories,
+                    COUNT(*) FILTER (
+                        WHERE active = TRUE AND claim_expires_at > NOW()
+                    ) AS claimed_directories
+                FROM strm_ingest_inventory_directories
+                WHERE manual_audit_id = %s
+                """,
+                (safe_id,),
+            )
+            counts = cursor.fetchone() or {}
+            pending = int(counts.get('pending_directories') or 0)
+            claimed = int(counts.get('claimed_directories') or 0)
+            completed = int(audit.get('completed_directories') or 0)
+            total = completed + pending
+            state = str(audit.get('state') or 'queued')
+            if state in {'queued', 'running'} and pending == 0:
+                state = 'completed'
+                cursor.execute(
+                    """
+                    UPDATE strm_ingest_inventory_manual_audits
+                    SET state = 'completed', total_directories = %s,
+                        completed_at = NOW(), updated_at = NOW()
+                    WHERE audit_id = %s AND state IN ('queued', 'running')
+                    """,
+                    (total, safe_id),
+                )
+            elif total != int(audit.get('total_directories') or 0):
+                cursor.execute(
+                    """
+                    UPDATE strm_ingest_inventory_manual_audits
+                    SET total_directories = %s, updated_at = NOW()
+                    WHERE audit_id = %s
+                    """,
+                    (total, safe_id),
+                )
+            progress = 100 if state == 'completed' else (
+                min(99, int((completed * 100) / total)) if total else 0
+            )
+            return {
+                **dict(audit),
+                'state': state,
+                'total_directories': total,
+                'completed_directories': completed,
+                'pending_directories': pending,
+                'claimed_directories': claimed,
+                'progress': progress,
+            }
+
+
+def cancel_manual_inventory_audit(audit_id: str) -> bool:
+    """Stop new claims while preserving every unprocessed dirty directory."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE strm_ingest_inventory_manual_audits
+                SET state = 'cancelled', completed_at = NOW(), updated_at = NOW()
+                WHERE audit_id = %s AND state IN ('queued', 'running')
+                """,
+                (str(audit_id),),
+            )
+            return cursor.rowcount == 1
 
 
 def get_inventory_summary() -> Dict[str, int]:

@@ -1176,10 +1176,9 @@ class MonitorService:
             if self._reconcile_stop.is_set():
                 return
 
+            # Directory-event reconciliation is isolated from manual audit
+            # generations. Exact file events never enter either claim set.
             while not self._reconcile_stop.is_set():
-                if self.processor.is_stop_requested():
-                    logger.info("  🛑 STRM 查漏已响应停止请求；未认领目录保留在 PostgreSQL。")
-                    break
                 summary = {'claimed': 0}
                 try:
                     summary = self._inventory.run_once(
@@ -1200,6 +1199,57 @@ class MonitorService:
                     break
                 if not summary.get('claimed'):
                     break
+                # The web app runs on gevent. A long sequence of short,
+                # synchronous PostgreSQL/scandir claims must explicitly yield
+                # so task status and stop requests remain observable.
+                time.sleep(0.001)
+
+            # A manual generation remains active until all of its persisted
+            # directory rows complete or the task centre cancels it. Claim one
+            # directory at a time so a stop request cannot widen in-flight work.
+            for manual_audit_id in strm_ingest_db.list_active_manual_inventory_audits():
+                while not self._reconcile_stop.is_set():
+                    status = strm_ingest_db.get_manual_inventory_audit(manual_audit_id)
+                    if not status or status.get('state') not in {'queued', 'running'}:
+                        break
+                    if self.processor.is_stop_requested():
+                        logger.info(
+                            "  🛑 STRM 查漏 generation=%s 已响应停止请求；"
+                            "未认领目录保留在 PostgreSQL。",
+                            manual_audit_id,
+                        )
+                        break
+                    summary = {'claimed': 0}
+                    try:
+                        summary = self._inventory.run_once(
+                            on_ingest=process_ingest,
+                            on_delete=process_delete,
+                            manual_audit_id=manual_audit_id,
+                            claim_limit=1,
+                        )
+                        if summary['claimed']:
+                            watch_summary = self.observer.sync_from_persistence() if self.observer else {}
+                            logger.info(
+                                f"  🧭 STRM 人工查漏 generation={manual_audit_id}：认领 %(claimed)s，"
+                                "完成 %(completed)s，新增/变化 %(ingest)s，删除 %(delete)s，"
+                                "失败 %(failed)s，物理枚举 %(physical_enumerations)s，"
+                                "条目 %(entries_seen)s，DB 批次 %(db_batches)s，watch %(watch_count)s。",
+                                {**summary, 'watch_count': watch_summary.get('watched', 0)},
+                            )
+                    except Exception as exc:
+                        logger.error(
+                            "  ❌ STRM 人工查漏 generation=%s 执行失败，持久状态保留: %s",
+                            manual_audit_id,
+                            type(exc).__name__,
+                            exc_info=True,
+                        )
+                    if summary.get('claimed'):
+                        time.sleep(0.001)
+                    status = strm_ingest_db.get_manual_inventory_audit(manual_audit_id)
+                    if not status or status.get('state') not in {'queued', 'running'}:
+                        break
+                    if not summary.get('claimed') and self._reconcile_stop.wait(0.5):
+                        return
 
 
     def _retry_existing_ingest_paths(self, existing_paths: List[str]) -> None:

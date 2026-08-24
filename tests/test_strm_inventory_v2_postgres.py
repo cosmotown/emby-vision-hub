@@ -25,9 +25,15 @@ class StrmInventoryV2PostgresTests(unittest.TestCase):
         config_manager.APP_CONFIG.update({
             constants.CONFIG_OPTION_DB_HOST: POSTGRES_HOST,
             constants.CONFIG_OPTION_DB_PORT: int(os.environ.get('EVH_TEST_POSTGRES_PORT', '5432')),
-            constants.CONFIG_OPTION_DB_USER: os.environ.get('EVH_TEST_POSTGRES_USER', 'evh_test'),
-            constants.CONFIG_OPTION_DB_PASSWORD: os.environ.get('EVH_TEST_POSTGRES_PASSWORD', 'evh_test'),
-            constants.CONFIG_OPTION_DB_NAME: os.environ.get('EVH_TEST_POSTGRES_DB', 'evh_test'),
+            constants.CONFIG_OPTION_DB_USER: os.environ.get(
+                'EVH_TEST_POSTGRES_USER', os.environ.get('EVH_DB_USER', 'evh_test')
+            ),
+            constants.CONFIG_OPTION_DB_PASSWORD: os.environ.get(
+                'EVH_TEST_POSTGRES_PASSWORD', os.environ.get('EVH_DB_PASSWORD', 'evh_test')
+            ),
+            constants.CONFIG_OPTION_DB_NAME: os.environ.get(
+                'EVH_TEST_POSTGRES_DB', os.environ.get('EVH_DB_NAME', 'evh_test')
+            ),
         })
         connection.init_db()
 
@@ -40,7 +46,8 @@ class StrmInventoryV2PostgresTests(unittest.TestCase):
         with connection.get_db_connection() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
-                    'TRUNCATE strm_ingest_inventory_directories, '
+                    'TRUNCATE strm_ingest_inventory_manual_audits, '
+                    'strm_ingest_inventory_directories, '
                     'strm_ingest_inventory_roots, strm_ingest_retry_queue RESTART IDENTITY'
                 )
 
@@ -375,6 +382,225 @@ class StrmInventoryV2PostgresTests(unittest.TestCase):
         scheduled = strm_ingest_db.request_full_inventory_audit([root])
         self.assertEqual(2, scheduled)
         self.assertEqual(2, strm_ingest_db.get_inventory_summary()['dirty_count'])
+
+    def test_one_hundred_exact_file_events_create_no_directory_scan_backlog(self):
+        with tempfile.TemporaryDirectory() as root:
+            strm_ingest_db.register_inventory_roots([root])
+            for index in range(100):
+                directory = os.path.join(root, f'Show {index:03d}')
+                os.mkdir(directory)
+                path = os.path.join(directory, 'E01.strm')
+                with open(path, 'w', encoding='utf-8') as handle:
+                    handle.write('controlled://episode')
+                strm_ingest_db.enqueue_paths(
+                    [path], source='watchdog_inventory', last_error='exact event'
+                )
+                strm_ingest_db.record_file_event(root, path, event_kind='ingest')
+
+            self.assertEqual(0, strm_ingest_db.get_inventory_summary()['dirty_count'])
+            self.assertEqual(
+                [],
+                strm_ingest_db.claim_inventory_directories('file-event-probe', limit=32),
+            )
+
+            new_directory = os.path.join(root, 'New Directory')
+            os.mkdir(new_directory)
+            strm_ingest_db.record_directory_created(root, new_directory)
+            summary = IncrementalStrmInventory(
+                owner='directory-event', directory_batch_limit=2,
+            ).run_once()
+            self.assertEqual(2, summary['claimed'])
+            self.assertEqual(2, summary['physical_enumerations'])
+            self.assertEqual(0, strm_ingest_db.get_inventory_summary()['dirty_count'])
+
+    def test_exact_delete_completes_without_dirty_parent_or_inventory_claim(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = os.path.join(root, 'Show')
+            os.mkdir(directory)
+            path = os.path.join(directory, 'E01.strm')
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write('controlled://episode')
+            strm_ingest_db.register_inventory_roots([root])
+            strm_ingest_db.enqueue_paths(
+                [path], source='watchdog_inventory', last_error='exact ingest'
+            )
+            strm_ingest_db.record_file_event(root, path, event_kind='ingest')
+            os.unlink(path)
+            strm_ingest_db.enqueue_paths(
+                [path], operation='delete', source='watchdog_inventory',
+                last_error='exact delete', initial_delay_seconds=0,
+            )
+            strm_ingest_db.record_file_event(root, path, event_kind='delete')
+
+            self.assertEqual(0, strm_ingest_db.get_inventory_summary()['dirty_count'])
+            self.assertEqual(
+                [],
+                strm_ingest_db.claim_inventory_directories('delete-probe', limit=4),
+            )
+            self.assertEqual(1, strm_ingest_db.mark_deleted([path]))
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        'SELECT operation, status FROM strm_ingest_retry_queue '
+                        'WHERE file_path = %s',
+                        (path,),
+                    )
+                    row = cursor.fetchone()
+            self.assertEqual('delete', row['operation'])
+            self.assertEqual('deleted', row['status'])
+
+    def test_manual_generation_progress_cancel_and_resume_is_persistent(self):
+        with tempfile.TemporaryDirectory() as root:
+            for index in range(100):
+                os.mkdir(os.path.join(root, f'Show {index:03d}'))
+            strm_ingest_db.register_inventory_roots([root])
+            for index in range(100):
+                path = os.path.join(root, f'Show {index:03d}', 'E01.strm')
+                with open(path, 'w', encoding='utf-8') as handle:
+                    handle.write('controlled://episode')
+                strm_ingest_db.enqueue_paths(
+                    [path], source='test', last_error='known directory'
+                )
+                strm_ingest_db.record_file_event(root, path, event_kind='ingest')
+
+            first = strm_ingest_db.create_manual_inventory_audit([root])
+            first_id = first['audit_id']
+            inventory = IncrementalStrmInventory(
+                owner='manual-first', directory_batch_limit=4,
+            )
+            for _ in range(30):
+                result = inventory.run_once(
+                    manual_audit_id=first_id, claim_limit=1,
+                )
+                self.assertEqual(1, result['claimed'])
+            status = strm_ingest_db.get_manual_inventory_audit(first_id)
+            self.assertEqual('running', status['state'])
+            self.assertEqual(30, status['completed_directories'])
+            self.assertGreater(status['pending_directories'], 0)
+            self.assertGreater(status['progress'], 0)
+            self.assertLess(status['progress'], 100)
+
+            self.assertTrue(strm_ingest_db.cancel_manual_inventory_audit(first_id))
+            self.assertEqual(
+                [],
+                strm_ingest_db.claim_inventory_directories(
+                    'cancelled-probe', limit=4, manual_audit_id=first_id,
+                ),
+            )
+            cancelled = strm_ingest_db.get_manual_inventory_audit(first_id)
+            self.assertEqual('cancelled', cancelled['state'])
+            self.assertGreater(cancelled['pending_directories'], 0)
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT COUNT(*) AS count FROM strm_ingest_retry_queue "
+                        "WHERE operation = 'delete'"
+                    )
+                    self.assertEqual(0, cursor.fetchone()['count'])
+
+            second = strm_ingest_db.create_manual_inventory_audit([root])
+            self.assertNotEqual(first_id, second['audit_id'])
+            second_id = second['audit_id']
+            resumed = IncrementalStrmInventory(
+                owner='manual-second', directory_batch_limit=4,
+            )
+            for _ in range(150):
+                status = strm_ingest_db.get_manual_inventory_audit(second_id)
+                if status['state'] == 'completed':
+                    break
+                result = resumed.run_once(
+                    manual_audit_id=second_id, claim_limit=1,
+                )
+                self.assertLessEqual(result['claimed'], 1)
+            final = strm_ingest_db.get_manual_inventory_audit(second_id)
+            self.assertEqual('completed', final['state'])
+            self.assertEqual(100, final['progress'])
+            self.assertEqual(0, final['pending_directories'])
+
+    def test_manual_progress_and_cancel_are_isolated_from_directory_event_work(self):
+        with tempfile.TemporaryDirectory() as root:
+            manual_directory = os.path.join(root, 'Manual Target')
+            existing_event_directory = os.path.join(root, 'Existing Event')
+            os.mkdir(manual_directory)
+            os.mkdir(existing_event_directory)
+            strm_ingest_db.register_inventory_roots([root])
+            for directory in (manual_directory, existing_event_directory):
+                path = os.path.join(directory, 'E01.strm')
+                with open(path, 'w', encoding='utf-8') as handle:
+                    handle.write('controlled://episode')
+                strm_ingest_db.enqueue_paths(
+                    [path], source='test', last_error='known directory'
+                )
+                strm_ingest_db.record_file_event(root, path, event_kind='ingest')
+
+            strm_ingest_db.mark_directory_dirty(
+                root, existing_event_directory, event_kind='directory_created'
+            )
+            event_claim = strm_ingest_db.claim_inventory_directories(
+                'event-owner', limit=1
+            )
+            self.assertEqual([existing_event_directory], [row['directory_path'] for row in event_claim])
+
+            manual = strm_ingest_db.create_manual_inventory_audit([root])
+            audit_id = manual['audit_id']
+            status = strm_ingest_db.get_manual_inventory_audit(audit_id)
+            self.assertEqual(2, status['total_directories'])
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        'SELECT dirty, claim_owner, manual_audit_id '
+                        'FROM strm_ingest_inventory_directories '
+                        'WHERE root_path = %s AND directory_path = %s',
+                        (root, existing_event_directory),
+                    )
+                    existing_event = cursor.fetchone()
+            self.assertTrue(existing_event['dirty'])
+            self.assertEqual('event-owner', existing_event['claim_owner'])
+            self.assertIsNone(existing_event['manual_audit_id'])
+
+            new_event_directory = os.path.join(root, 'New Event')
+            os.mkdir(new_event_directory)
+            strm_ingest_db.record_directory_created(root, new_event_directory)
+            status = strm_ingest_db.get_manual_inventory_audit(audit_id)
+            self.assertEqual(1, status['total_directories'])
+            self.assertEqual(1, status['pending_directories'])
+
+            result = IncrementalStrmInventory(
+                owner='manual-isolated', directory_batch_limit=1,
+            ).run_once(manual_audit_id=audit_id, claim_limit=1)
+            self.assertEqual(1, result['completed'])
+            finished = strm_ingest_db.get_manual_inventory_audit(audit_id)
+            self.assertEqual('completed', finished['state'])
+            self.assertEqual(100, finished['progress'])
+            self.assertGreaterEqual(strm_ingest_db.get_inventory_summary()['dirty_count'], 3)
+
+            second = strm_ingest_db.create_manual_inventory_audit([root])
+            second_id = second['audit_id']
+            stop_event_directory = os.path.join(root, 'Stop Event')
+            os.mkdir(stop_event_directory)
+            strm_ingest_db.record_directory_created(root, stop_event_directory)
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        'SELECT dirty, claim_owner, manual_audit_id '
+                        'FROM strm_ingest_inventory_directories '
+                        'WHERE root_path = %s AND directory_path = %s',
+                        (root, stop_event_directory),
+                    )
+                    before_cancel = dict(cursor.fetchone())
+            self.assertTrue(strm_ingest_db.cancel_manual_inventory_audit(second_id))
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        'SELECT dirty, claim_owner, manual_audit_id '
+                        'FROM strm_ingest_inventory_directories '
+                        'WHERE root_path = %s AND directory_path = %s',
+                        (root, stop_event_directory),
+                    )
+                    after_cancel = dict(cursor.fetchone())
+            self.assertEqual(before_cancel, after_cancel)
+            self.assertTrue(after_cancel['dirty'])
+            self.assertIsNone(after_cancel['manual_audit_id'])
 
 
 if __name__ == '__main__':

@@ -1649,20 +1649,57 @@ def task_scan_monitor_folders(processor):
         task_manager.update_status_from_thread(100, "STRM 查漏未启动：实时监控服务未运行")
         return
     roots = exclude_dirs or monitor_paths
-    scheduled = strm_ingest_db.request_full_inventory_audit(roots)
+    audit = strm_ingest_db.create_manual_inventory_audit(roots)
+    audit_id = audit['audit_id']
     if not request_inventory_audit_processing():
+        strm_ingest_db.cancel_manual_inventory_audit(audit_id)
         logger.error("  ➜ STRM 查漏唤醒失败；已排队目录保留，未执行磁盘核对。")
-        task_manager.update_status_from_thread(100, "STRM 查漏唤醒失败，目录已保留")
-        return
+        raise RuntimeError("STRM 查漏唤醒失败，目录已保留")
+    initial = strm_ingest_db.get_manual_inventory_audit(audit_id) or {}
     logger.info(
-        "  🧭 已人工请求 STRM 查漏：%s 个已知目录；"
+        "  🧭 已人工请求 STRM 查漏 generation=%s：%s 个已知目录；"
         "后台按租约有界核对，不递归扫描根目录。",
-        scheduled,
+        audit_id,
+        initial.get('total_directories', 0),
     )
-    task_manager.update_status_from_thread(
-        100,
-        f"STRM 查漏已排队：{scheduled} 个目录",
-    )
+    while True:
+        if processor.is_stop_requested():
+            strm_ingest_db.cancel_manual_inventory_audit(audit_id)
+            status = strm_ingest_db.get_manual_inventory_audit(audit_id) or {}
+            task_manager.update_status_from_thread(
+                int(status.get('progress') or 0),
+                "STRM 查漏已中止；未处理目录已保留，可再次运行恢复。",
+            )
+            return
+        if not inventory_audit_processing_available():
+            strm_ingest_db.cancel_manual_inventory_audit(audit_id)
+            raise RuntimeError("实时监控已停止；STRM 查漏未处理目录已保留")
+        status = strm_ingest_db.get_manual_inventory_audit(audit_id)
+        if not status:
+            raise RuntimeError("STRM 查漏 generation 状态丢失")
+        state = status.get('state')
+        if state == 'completed':
+            task_manager.update_status_from_thread(
+                100,
+                f"STRM 查漏完成：已核对 {status.get('completed_directories', 0)} 个目录",
+            )
+            return
+        if state == 'cancelled':
+            task_manager.update_status_from_thread(
+                int(status.get('progress') or 0),
+                "STRM 查漏已中止；未处理目录已保留。",
+            )
+            return
+        task_manager.update_status_from_thread(
+            int(status.get('progress') or 0),
+            (
+                "STRM 查漏正在处理："
+                f"{status.get('completed_directories', 0)}/"
+                f"{status.get('total_directories', 0)}，"
+                f"处理中 {status.get('claimed_directories', 0)}"
+            ),
+        )
+        time.sleep(0.25)
 
 
 # --- 从数据库恢复本地覆盖缓存 ---

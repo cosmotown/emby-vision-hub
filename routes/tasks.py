@@ -196,12 +196,17 @@ def request_strm_inventory_full_audit():
             return jsonify({'error': '未配置 STRM 库存根目录'}), 409
         if not inventory_audit_processing_available():
             return jsonify({'error': '实时监控服务未运行，无法启动 STRM 查漏'}), 409
-        scheduled = strm_ingest_db.request_full_inventory_audit(roots)
+        audit = strm_ingest_db.create_manual_inventory_audit(roots)
+        audit_id = audit['audit_id']
         if not request_inventory_audit_processing():
+            strm_ingest_db.cancel_manual_inventory_audit(audit_id)
             return jsonify({'error': 'STRM 查漏唤醒失败，目录状态已保留'}), 503
+        status = strm_ingest_db.get_manual_inventory_audit(audit_id) or {}
         return jsonify({
             'message': 'STRM 查漏已排入有界目录队列',
-            'scheduled_directories': scheduled,
+            'audit_id': audit_id,
+            'state': status.get('state', 'queued'),
+            'scheduled_directories': status.get('total_directories', 0),
             'recursive_os_walk': False,
             'manual_only': True,
         }), 202

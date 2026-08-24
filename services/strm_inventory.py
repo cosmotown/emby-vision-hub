@@ -120,11 +120,19 @@ class IncrementalStrmInventory:
         *,
         on_ingest: Optional[Callable[[Iterable[str]], None]] = None,
         on_delete: Optional[Callable[[Iterable[str]], None]] = None,
+        manual_audit_id: Optional[str] = None,
+        claim_limit: Optional[int] = None,
     ) -> Dict[str, int]:
-        claims = strm_ingest_db.claim_inventory_directories(
-            self.owner,
-            limit=self.directory_batch_limit,
-        )
+        claim_kwargs = {
+            'limit': (
+                self.directory_batch_limit
+                if claim_limit is None
+                else max(1, min(int(claim_limit), self.directory_batch_limit))
+            ),
+        }
+        if manual_audit_id:
+            claim_kwargs['manual_audit_id'] = str(manual_audit_id)
+        claims = strm_ingest_db.claim_inventory_directories(self.owner, **claim_kwargs)
         summary = {
             'claimed': len(claims), 'completed': 0, 'partial': 0,
             'failed': 0, 'ingest': 0, 'delete': 0,

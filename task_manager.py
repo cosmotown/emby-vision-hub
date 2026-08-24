@@ -91,7 +91,10 @@ def _execute_task_with_lock(task_function: Callable, task_name: str, processor: 
             current_progress = background_task_status["progress"]
 
             if processor.is_stop_requested():
-                final_message = "任务已成功中断。"
+                task_message = str(background_task_status.get("message") or "")
+                final_message = (
+                    task_message if "已中止" in task_message else "任务已中止。"
+                )
             elif task_error is not None:
                 final_message = f"执行失败: {task_error}"
                 current_progress = 0

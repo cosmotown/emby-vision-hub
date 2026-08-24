@@ -172,9 +172,37 @@ def init_db():
                     )
                 """)
                 cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS strm_ingest_inventory_manual_audits (
+                        audit_id TEXT PRIMARY KEY,
+                        state TEXT NOT NULL DEFAULT 'queued',
+                        total_directories INTEGER NOT NULL DEFAULT 0,
+                        completed_directories INTEGER NOT NULL DEFAULT 0,
+                        failed_directories INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        started_at TIMESTAMP WITH TIME ZONE,
+                        completed_at TIMESTAMP WITH TIME ZONE,
+                        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cursor.execute("""
+                    ALTER TABLE strm_ingest_inventory_directories
+                    ADD COLUMN IF NOT EXISTS manual_audit_id TEXT
+                """)
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_strm_inventory_one_active_manual_audit
+                    ON strm_ingest_inventory_manual_audits ((TRUE))
+                    WHERE state IN ('queued', 'running')
+                """)
+                cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_strm_inventory_directory_claim
                     ON strm_ingest_inventory_directories (
                         active, dirty, next_audit_at, claim_expires_at
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_strm_inventory_manual_claim
+                    ON strm_ingest_inventory_directories (
+                        manual_audit_id, active, dirty, next_audit_at, claim_expires_at
                     )
                 """)
                 cursor.execute("""

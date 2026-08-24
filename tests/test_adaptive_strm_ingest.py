@@ -239,10 +239,10 @@ class AdaptiveStrmIngestTests(unittest.TestCase):
             constants.CONFIG_OPTION_MONITOR_EXCLUDE_DIRS: [],
             constants.CONFIG_OPTION_MONITOR_FULL_SCAN_INTERVAL_HOURS: 0,
         }
-        observer = mock.Mock()
+        observer = mock.Mock(watch_count=1, backend_thread_count=2, max_user_watches=1048576)
         with mock.patch.object(
             monitor_service,
-            'Observer',
+            'PersistedDirectoryObserver',
             return_value=observer,
         ), mock.patch.object(
             monitor_service.os.path,

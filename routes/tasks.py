@@ -6,6 +6,8 @@ from flask import Blueprint, request, jsonify
 
 # 导入您项目中用于管理和执行任务的核心模块
 import task_manager 
+import config_manager
+import constants
 from extensions import admin_required, processor_ready_required, task_lock_required
 from database import strm_ingest_db, webhook_event_db
 # ★★★ 导入任务注册表，这是“翻译”的关键 ★★★
@@ -25,8 +27,10 @@ def get_available_tasks():
     它现在只返回那些被标记为适合在任务链中运行的任务。
     """
     try:
-        # 调用 get_task_registry 时，明确告诉它我们需要用于“任务链”的上下文
-        registry = get_task_registry(context='chain')
+        context = request.args.get('context', 'chain')
+        if context not in {'chain', 'all'}:
+            return jsonify({"error": "不支持的任务列表上下文"}), 400
+        registry = get_task_registry(context=context)
         
         available_tasks = [
             {"key": key, "name": info[1]} 
@@ -143,6 +147,7 @@ def get_strm_ingest_events():
         return jsonify({
             'events': strm_ingest_db.list_recent(limit=limit),
             'summary': strm_ingest_db.get_summary(),
+            'inventory': strm_ingest_db.get_inventory_summary(),
         }), 200
     except Exception as exc:
         logger.error(f"获取 STRM 入库诊断失败: {exc}", exc_info=True)
@@ -171,3 +176,40 @@ def ignore_strm_ingest_event(event_id):
     except Exception as exc:
         logger.error(f"忽略 STRM 入库记录 {event_id} 失败: {exc}", exc_info=True)
         return jsonify({'error': '无法忽略 STRM 入库记录'}), 500
+
+
+@tasks_bp.route('/strm-inventory/full-audit', methods=['POST'])
+@admin_required
+def request_strm_inventory_full_audit():
+    """Explicitly request full logical coverage through bounded directory claims."""
+    try:
+        from monitor_service import (
+            inventory_audit_processing_available,
+            request_inventory_audit_processing,
+        )
+
+        roots = config_manager.APP_CONFIG.get(
+            constants.CONFIG_OPTION_MONITOR_EXCLUDE_DIRS,
+            constants.DEFAULT_MONITOR_EXCLUDE_DIRS,
+        ) or []
+        if not roots:
+            return jsonify({'error': '未配置 STRM 库存根目录'}), 409
+        if not inventory_audit_processing_available():
+            return jsonify({'error': '实时监控服务未运行，无法启动 STRM 查漏'}), 409
+        audit = strm_ingest_db.create_manual_inventory_audit(roots)
+        audit_id = audit['audit_id']
+        if not request_inventory_audit_processing():
+            strm_ingest_db.cancel_manual_inventory_audit(audit_id)
+            return jsonify({'error': 'STRM 查漏唤醒失败，目录状态已保留'}), 503
+        status = strm_ingest_db.get_manual_inventory_audit(audit_id) or {}
+        return jsonify({
+            'message': 'STRM 查漏已排入有界目录队列',
+            'audit_id': audit_id,
+            'state': status.get('state', 'queued'),
+            'scheduled_directories': status.get('total_directories', 0),
+            'recursive_os_walk': False,
+            'manual_only': True,
+        }), 202
+    except Exception as exc:
+        logger.error('请求 STRM 完整库存审计失败: %s', type(exc).__name__)
+        return jsonify({'error': '无法请求 STRM 完整库存审计'}), 500

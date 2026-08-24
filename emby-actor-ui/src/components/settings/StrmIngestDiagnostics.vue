@@ -2,7 +2,15 @@
   <n-card :bordered="false" class="dashboard-card">
     <template #header><span class="card-title">STRM 入库诊断</span></template>
     <template #header-extra>
-      <n-button size="small" ghost :loading="loading" @click="loadEvents">刷新</n-button>
+      <n-space>
+        <n-popconfirm @positive-click="requestFullAudit">
+          <template #trigger>
+            <n-button size="small" ghost :loading="auditLoading">STRM 查漏</n-button>
+          </template>
+          手动核对已持久化 STRM 目录，用于停机或事件遗漏；不会递归 os.walk，也不会读取 STRM 指向的视频内容。继续吗？
+        </n-popconfirm>
+        <n-button size="small" ghost :loading="loading" @click="loadEvents">刷新</n-button>
+      </n-space>
     </template>
 
     <n-alert v-if="loadError" type="error" :show-icon="true" style="margin-bottom: 14px;">
@@ -18,6 +26,10 @@
         <strong :class="item.className">{{ item.value }}</strong>
       </div>
     </div>
+    <n-text depth="3" style="display:block; margin-top: 10px; font-size: 12px;">
+      Inventory v2：已知目录 {{ inventory.directory_count || 0 }}，
+      待增量核对 {{ inventory.dirty_count || 0 }}，认领中 {{ inventory.claimed_count || 0 }}。
+    </n-text>
 
     <n-divider style="margin: 18px 0 12px;">待处理与异常路径</n-divider>
     <n-empty v-if="!loading && events.length === 0" description="当前没有 STRM 入库异常" />
@@ -64,13 +76,15 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue';
 import axios from 'axios';
-import { NAlert, NButton, NCard, NDivider, NEmpty, NSpace, NTag, useMessage } from 'naive-ui';
+import { NAlert, NButton, NCard, NDivider, NEmpty, NPopconfirm, NSpace, NTag, NText, useMessage } from 'naive-ui';
 
 const message = useMessage();
 const loading = ref(false);
+const auditLoading = ref(false);
 const workingId = ref(null);
 const loadError = ref('');
 const events = ref([]);
+const inventory = ref({ directory_count: 0, dirty_count: 0, claimed_count: 0 });
 const summary = ref({
   pending_count: 0,
   processing_count: 0,
@@ -109,11 +123,25 @@ const loadEvents = async () => {
     const response = await axios.get('/api/tasks/strm-ingest-events?limit=100');
     events.value = response.data.events || [];
     summary.value = { ...summary.value, ...(response.data.summary || {}) };
+    inventory.value = { ...inventory.value, ...(response.data.inventory || {}) };
     loadError.value = '';
   } catch (error) {
     loadError.value = error.response?.data?.error || '无法读取 STRM 入库诊断';
   } finally {
     loading.value = false;
+  }
+};
+
+const requestFullAudit = async () => {
+  auditLoading.value = true;
+  try {
+    const response = await axios.post('/api/tasks/strm-inventory/full-audit');
+    message.success(`${response.data.message}（${response.data.scheduled_directories} 个目录）`);
+    await loadEvents();
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法请求完整库存审计');
+  } finally {
+    auditLoading.value = false;
   }
 };
 

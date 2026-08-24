@@ -137,6 +137,83 @@ def init_db():
 
                 cursor.execute("""
                     ALTER TABLE strm_ingest_retry_queue
+                    ADD COLUMN IF NOT EXISTS inventory_root_path TEXT
+                """)
+                cursor.execute("""
+                    ALTER TABLE strm_ingest_retry_queue
+                    ADD COLUMN IF NOT EXISTS inventory_directory_path TEXT
+                """)
+                cursor.execute("""
+                    ALTER TABLE strm_ingest_retry_queue
+                    ADD COLUMN IF NOT EXISTS inventory_seen_generation BIGINT NOT NULL DEFAULT 0
+                """)
+
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS strm_ingest_inventory_directories (
+                        root_path TEXT NOT NULL,
+                        directory_path TEXT NOT NULL,
+                        parent_path TEXT,
+                        active BOOLEAN NOT NULL DEFAULT TRUE,
+                        dirty BOOLEAN NOT NULL DEFAULT FALSE,
+                        dirty_since TIMESTAMP WITH TIME ZONE,
+                        last_event_at TIMESTAMP WITH TIME ZONE,
+                        last_verified_at TIMESTAMP WITH TIME ZONE,
+                        next_audit_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        audit_generation BIGINT NOT NULL DEFAULT 0,
+                        audit_cursor TEXT,
+                        event_version BIGINT NOT NULL DEFAULT 0,
+                        seen_generation BIGINT NOT NULL DEFAULT 0,
+                        claim_owner TEXT,
+                        claim_expires_at TIMESTAMP WITH TIME ZONE,
+                        last_error TEXT,
+                        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (root_path, directory_path)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS strm_ingest_inventory_manual_audits (
+                        audit_id TEXT PRIMARY KEY,
+                        state TEXT NOT NULL DEFAULT 'queued',
+                        total_directories INTEGER NOT NULL DEFAULT 0,
+                        completed_directories INTEGER NOT NULL DEFAULT 0,
+                        failed_directories INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        started_at TIMESTAMP WITH TIME ZONE,
+                        completed_at TIMESTAMP WITH TIME ZONE,
+                        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cursor.execute("""
+                    ALTER TABLE strm_ingest_inventory_directories
+                    ADD COLUMN IF NOT EXISTS manual_audit_id TEXT
+                """)
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_strm_inventory_one_active_manual_audit
+                    ON strm_ingest_inventory_manual_audits ((TRUE))
+                    WHERE state IN ('queued', 'running')
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_strm_inventory_directory_claim
+                    ON strm_ingest_inventory_directories (
+                        active, dirty, next_audit_at, claim_expires_at
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_strm_inventory_manual_claim
+                    ON strm_ingest_inventory_directories (
+                        manual_audit_id, active, dirty, next_audit_at, claim_expires_at
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_strm_inventory_file_directory
+                    ON strm_ingest_retry_queue (
+                        inventory_root_path, inventory_directory_path, inventory_seen_generation
+                    )
+                """)
+
+                cursor.execute("""
+                    ALTER TABLE strm_ingest_retry_queue
                     ADD COLUMN IF NOT EXISTS operation TEXT NOT NULL DEFAULT 'ingest'
                 """)
 
@@ -718,6 +795,11 @@ def init_db():
                     
                     # 3. 【层级关系】查找某部剧的所有季和集 (非常重要！)
                     cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_parent_series ON media_metadata (parent_series_tmdb_id);")
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_mm_series_latest_episode
+                        ON media_metadata (parent_series_tmdb_id, date_added DESC)
+                        WHERE item_type = 'Episode' AND in_library = TRUE
+                    """)
                     
                     # 4. 【订阅系统】查找“想看”或“待发布”的项目
                     cursor.execute("CREATE INDEX IF NOT EXISTS idx_mm_subscription_status ON media_metadata (subscription_status) WHERE in_library = FALSE;")

@@ -151,16 +151,34 @@ def query_virtual_library_items(
     """
     【核心函数】根据筛选规则 + 用户实时权限，查询媒体项。
     """
+    primary_sort = str(sort_by or 'DateCreated').split(',')[0]
+    latest_content_expr = """
+        CASE
+            WHEN m.item_type = 'Series' THEN COALESCE(
+                (
+                    SELECT MAX(ep.date_added)
+                    FROM media_metadata ep
+                    WHERE ep.item_type = 'Episode'
+                      AND ep.in_library = TRUE
+                      AND ep.parent_series_tmdb_id = m.tmdb_id
+                ),
+                m.date_added
+            )
+            ELSE m.date_added
+        END
+    """
+    selected_sort_expr = latest_content_expr if primary_sort == 'DateLastContentAdded' else "m.date_added"
     
     # 1. 基础 SQL 结构
     if user_id:
         base_select = """
             SELECT 
                 m.emby_item_ids_json->>0 as emby_id,
-                m.tmdb_id
+                m.tmdb_id,
+                {selected_sort_expr} AS latest_sort_at
             FROM media_metadata m
             JOIN emby_users u ON u.id = %s
-        """
+        """.format(selected_sort_expr=selected_sort_expr)
         base_count = """
             SELECT COUNT(*) 
             FROM media_metadata m
@@ -171,9 +189,10 @@ def query_virtual_library_items(
         base_select = """
             SELECT 
                 m.emby_item_ids_json->>0 as emby_id,
-                m.tmdb_id
+                m.tmdb_id,
+                {selected_sort_expr} AS latest_sort_at
             FROM media_metadata m
-        """
+        """.format(selected_sort_expr=selected_sort_expr)
         base_count = """
             SELECT COUNT(*) 
             FROM media_metadata m
@@ -678,6 +697,7 @@ def query_virtual_library_items(
     # 8. 排序映射
     sort_map = {
         'DateCreated': 'm.date_added',
+        'DateLastContentAdded': latest_content_expr,
         'DatePlayed': 'm.date_added',
         'SortName': 'm.title',
         'ProductionYear': 'm.release_year',
@@ -685,7 +705,7 @@ def query_virtual_library_items(
         'PremiereDate': 'm.release_date',
         'Random': 'RANDOM()'
     }
-    db_sort_col = sort_map.get(sort_by, 'm.date_added')
+    db_sort_col = sort_map.get(primary_sort, 'm.date_added')
     
     if db_sort_col == 'RANDOM()':
         db_sort_dir = ""
@@ -707,7 +727,7 @@ def query_virtual_library_items(
                 final_query_sql = f"""
                     {base_select}
                     WHERE {full_where}
-                    ORDER BY {db_sort_col} {db_sort_dir}
+                    ORDER BY {db_sort_col} {db_sort_dir}, m.date_added {db_sort_dir}, m.tmdb_id ASC
                     LIMIT %s OFFSET %s
                 """
                 query_params = params + [limit, offset]
@@ -718,7 +738,8 @@ def query_virtual_library_items(
                 items = [
                     {
                         'Id': row['emby_id'], 
-                        'tmdb_id': row['tmdb_id']
+                        'tmdb_id': row['tmdb_id'],
+                        'latest_sort_at': row.get('latest_sort_at')
                     } 
                     for row in rows if row['emby_id']
                 ]

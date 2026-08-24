@@ -2,6 +2,39 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.13",
+        "published_at": "2026-08-16T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.13",
+        "changelog": """## MediaInfo 集成与虚拟库近期入库
+
+- ReviewList 的 Series 失败记录由后端按 Series、季号和集号解析为唯一 Episode ItemID；找不到、重复或身份不一致时失败关闭。
+- 修正监控路径同时属于“排除预处理路径”时的 MediaInfo 可见性，继续保留逐层 `O_NOFOLLOW` 与 symlink 失败关闭。
+- 神医 MediaInfo JSON 只读观察根目录复用现有目录选择器，仍允许手工输入，EVH 不创建、修改或回灌 JSON。
+- 新增跨分页“重新核对全部”：目标去重、4 并发、可停止并防止旧响应覆盖；该操作只读，不会调用神医 SyncMediaInfo。
+- 虚拟库电视剧“近期入库”在候选裁剪前按最新 Episode 的有效新增时间排序；旧剧追更后可与 Emby 原生 Latest 保持一致，Movie 排序语义不变。
+
+## STRM Inventory v2
+
+- watchdog 的新增、修改、删除、文件改名和目录移动事件同步维护 PostgreSQL 文件库存与 dirty 目录状态。
+- 新增持久目录 cursor、generation、event version、owner 和 lease；多 EVH 实例使用 `FOR UPDATE SKIP LOCKED` 避免重复认领。
+- 取消启动约 60 秒后的 STRM 根递归库存扫描，并避免 watchdog `recursive=True` 在 Linux 启动时枚举整棵目录树；正常启动从 PostgreSQL 恢复已知目录，以单一 inotify backend 建立显式 non-recursive watches。
+- STRM Inventory v2 不再执行启动或周期性自动查漏；正常运行依靠 filesystem event，停机或漏事件由任务中心“STRM 查漏”人工触发有界目录审计。旧 `monitor_full_scan_interval_hours` 配置保留兼容但不再消费。
+- 目录、挂载、权限或 I/O 暂时不可访问时保持原库存并退避重试；只有成功读取父目录并明确确认文件或 child directory 缺失时才进入精确删除链。
+- 管理员可显式请求完整逻辑库存审计；它仍通过有界目录队列完成，不读取 STRM 指向的视频内容，也不递归刷新媒体库。
+- 保留现有精确路径通知、浅层首次发现、10/30/60 分钟有限重试、终态只读自愈和自适应批处理链。
+
+### 明确不包含
+
+- 不包含 Hills 或其他第三方客户端的偶发白色封面修复，也未修改虚拟库图片代理或封面生成器。
+- 不新增 EVH Emby Companion Plugin，不要求 CloudDrive2 插件，也不修改 CD2 本体或插件。
+- 不改变神医对媒体源、ffprobe/rffmpeg/dffmpeg、MediaInfo JSON 和媒体流注入的职责。
+- 不增加 PlaybackInfo、Series/Season/媒体库级 MediaInfo fallback 或自动全库修复。
+- 不改变 MoviePilot、115 助手或相关插件的业务边界。
+
+""",
+    },
+
+    {
         "version": "v7.2.12",
         "published_at": "2026-08-02T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.12",

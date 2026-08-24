@@ -18,15 +18,9 @@ import constants
 import handler.tmdb as tmdb
 import handler.emby as emby
 import handler.telegram as telegram
-from database import connection, settings_db, media_db, queries_db
+from database import connection, settings_db, media_db, queries_db, strm_ingest_db
 from .helpers import parse_full_asset_details, reconstruct_metadata_from_db, translate_tmdb_metadata_recursively
 from extensions import UPDATING_METADATA
-from services.emby_ingest import (
-    check_indexed_paths,
-    collect_recent_media_paths,
-    refresh_and_verify_paths,
-    wait_for_paths_stable,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -1629,124 +1623,83 @@ def task_sync_ratings_to_emby(processor):
 
 # --- 扫描监控目录查漏补缺 ---
 def task_scan_monitor_folders(processor):
-    """
-    Check recently changed paths directly against Emby and repair only missing items.
+    """Explicitly request full logical coverage through Inventory v2.
 
-    Excluded paths skip Toolkit metadata processing but still participate in Emby
-    ingestion reconciliation, which is the intended mode for MP-managed STRM roots.
+    This task intentionally does not enumerate files or contact Emby itself.  It
+    persists dirty directory work which the normal leased, bounded scandir loop
+    processes without a recursive root walk.
     """
+    from monitor_service import (
+        inventory_audit_processing_available,
+        request_inventory_audit_processing,
+    )
+
     monitor_enabled = processor.config.get(constants.CONFIG_OPTION_MONITOR_ENABLED)
     monitor_paths = processor.config.get(constants.CONFIG_OPTION_MONITOR_PATHS, [])
-    extensions = processor.config.get(
-        constants.CONFIG_OPTION_MONITOR_EXTENSIONS,
-        constants.DEFAULT_MONITOR_EXTENSIONS,
-    )
-    lookback_days = max(0, int(processor.config.get(
-        constants.CONFIG_OPTION_MONITOR_SCAN_LOOKBACK_DAYS,
-        constants.DEFAULT_MONITOR_SCAN_LOOKBACK_DAYS,
-    ) or 0))
     exclude_dirs = processor.config.get(
         constants.CONFIG_OPTION_MONITOR_EXCLUDE_DIRS,
         constants.DEFAULT_MONITOR_EXCLUDE_DIRS,
     ) or []
 
     if not monitor_enabled or not monitor_paths:
-        logger.info("  ➜ 实时监控未启用或未配置路径，跳过扫描。")
+        logger.info("  ➜ 实时监控未启用或未配置路径，跳过 STRM 查漏请求。")
         return
-
-    cutoff_time = 0 if lookback_days == 0 else time.time() - (lookback_days * 86400)
-    recent_paths = collect_recent_media_paths(
-        monitor_paths,
-        utils.normalize_monitor_extensions(extensions),
-        cutoff_time,
-    )
+    if not inventory_audit_processing_available():
+        logger.error("  ➜ 实时监控服务未运行，无法启动 STRM 查漏。")
+        task_manager.update_status_from_thread(100, "STRM 查漏未启动：实时监控服务未运行")
+        return
+    roots = exclude_dirs or monitor_paths
+    audit = strm_ingest_db.create_manual_inventory_audit(roots)
+    audit_id = audit['audit_id']
+    if not request_inventory_audit_processing():
+        strm_ingest_db.cancel_manual_inventory_audit(audit_id)
+        logger.error("  ➜ STRM 查漏唤醒失败；已排队目录保留，未执行磁盘核对。")
+        raise RuntimeError("STRM 查漏唤醒失败，目录已保留")
+    initial = strm_ingest_db.get_manual_inventory_audit(audit_id) or {}
     logger.info(
-        f"  ➜ 开始监控目录查漏：回溯 {lookback_days} 天，"
-        f"发现 {len(recent_paths)} 个最近文件。"
+        "  🧭 已人工请求 STRM 查漏 generation=%s：%s 个已知目录；"
+        "后台按租约有界核对，不递归扫描根目录。",
+        audit_id,
+        initial.get('total_directories', 0),
     )
-    if not recent_paths:
-        task_manager.update_status_from_thread(100, "扫描完成，未发现最近变动的媒体文件")
-        return
-
-    task_manager.update_status_from_thread(35, f"正在向 Emby 核对 {len(recent_paths)} 个媒体路径...")
-    indexed, missing, query_failed = check_indexed_paths(
-        recent_paths,
-        processor.emby_url,
-        processor.emby_api_key,
-    )
-    candidates = sorted(missing | query_failed)
-    if not candidates:
-        processor.enqueue_confirmed_ingest_postprocessing(sorted(indexed))
-        task_manager.update_status_from_thread(100, f"扫描完成，{len(indexed)} 个文件均已入库")
-        return
-
-    stable_paths, unstable_paths = wait_for_paths_stable(candidates)
-    if unstable_paths:
-        logger.warning(f"  ⚠️ {len(unstable_paths)} 个文件仍在写入或已消失，留待下次查漏。")
-
-    normalized_excludes = [
-        os.path.normcase(os.path.normpath(path))
-        for path in exclude_dirs
-        if str(path or '').strip()
-    ]
-
-    def is_excluded(path):
-        normalized = os.path.normcase(os.path.normpath(path))
-        return any(
-            normalized == excluded or normalized.startswith(excluded + os.sep)
-            for excluded in normalized_excludes
-        )
-
-    regular_paths = [path for path in stable_paths if not is_excluded(path)]
-    excluded_paths = [path for path in stable_paths if is_excluded(path)]
-
-    # Generate Toolkit override data once per folder. Emby refresh is handled in
-    # one guarded batch below and can never fall back to the library root.
-    representatives = {}
-    for path in regular_paths:
-        representatives.setdefault(os.path.dirname(path), path)
-    for index, path in enumerate(representatives.values(), start=1):
+    while True:
+        if processor.is_stop_requested():
+            strm_ingest_db.cancel_manual_inventory_audit(audit_id)
+            status = strm_ingest_db.get_manual_inventory_audit(audit_id) or {}
+            task_manager.update_status_from_thread(
+                int(status.get('progress') or 0),
+                "STRM 查漏已中止；未处理目录已保留，可再次运行恢复。",
+            )
+            return
+        if not inventory_audit_processing_available():
+            strm_ingest_db.cancel_manual_inventory_audit(audit_id)
+            raise RuntimeError("实时监控已停止；STRM 查漏未处理目录已保留")
+        status = strm_ingest_db.get_manual_inventory_audit(audit_id)
+        if not status:
+            raise RuntimeError("STRM 查漏 generation 状态丢失")
+        state = status.get('state')
+        if state == 'completed':
+            task_manager.update_status_from_thread(
+                100,
+                f"STRM 查漏完成：已核对 {status.get('completed_directories', 0)} 个目录",
+            )
+            return
+        if state == 'cancelled':
+            task_manager.update_status_from_thread(
+                int(status.get('progress') or 0),
+                "STRM 查漏已中止；未处理目录已保留。",
+            )
+            return
         task_manager.update_status_from_thread(
-            50,
-            f"正在预处理新媒体 {index}/{len(representatives)}: {os.path.basename(path)}",
-        )
-        try:
-            processor.process_file_actively(path, skip_refresh=True)
-        except Exception as exc:
-            logger.error(f"  🚫 预处理文件失败 '{path}': {exc}", exc_info=True)
-
-    results = []
-    if regular_paths:
-        results.append(refresh_and_verify_paths(
-            regular_paths,
-            processor.emby_url,
-            processor.emby_api_key,
-        ))
-    if excluded_paths:
-        results.append(refresh_and_verify_paths(
-            excluded_paths,
-            processor.emby_url,
-            processor.emby_api_key,
-            initial_delay_seconds=processor.config.get(
-                constants.CONFIG_OPTION_MONITOR_EXCLUDE_REFRESH_DELAY,
-                constants.DEFAULT_MONITOR_EXCLUDE_REFRESH_DELAY,
+            int(status.get('progress') or 0),
+            (
+                "STRM 查漏正在处理："
+                f"{status.get('completed_directories', 0)}/"
+                f"{status.get('total_directories', 0)}，"
+                f"处理中 {status.get('claimed_directories', 0)}"
             ),
-        ))
-
-    confirmed = sum(int(result.get('indexed', 0)) for result in results)
-    confirmed_paths = set(indexed)
-    for result in results:
-        confirmed_paths.update(result.get('confirmed_paths') or [])
-    processor.enqueue_confirmed_ingest_postprocessing(sorted(confirmed_paths))
-    pending = sum(len(result.get('pending') or []) for result in results)
-    logger.info(
-        f"  ➜ 监控目录查漏完成。近期 {len(recent_paths)}，"
-        f"已存 {len(indexed)}，新确认 {confirmed}，待重试 {pending}。"
-    )
-    task_manager.update_status_from_thread(
-        100,
-        f"扫描完成：确认入库 {confirmed}，待重试 {pending}",
-    )
+        )
+        time.sleep(0.25)
 
 
 # --- 从数据库恢复本地覆盖缓存 ---

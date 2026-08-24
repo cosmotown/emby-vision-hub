@@ -67,6 +67,7 @@ def _task_run_chain_internal(processor, task_name: str, sequence_config_key: str
     try:
         # --- 主任务循环 ---
         registry = get_task_registry(context='all')
+        chain_task_keys = set(get_task_registry(context='chain'))
 
         for i, task_key in enumerate(task_sequence):
             if main_processor.is_stop_requested():
@@ -77,6 +78,12 @@ def _task_run_chain_internal(processor, task_name: str, sequence_config_key: str
             task_info = registry.get(task_key)
             if not task_info:
                 logger.error(f"任务链警告：在注册表中未找到任务 '{task_key}'，已跳过。")
+                continue
+            if task_key not in chain_task_keys:
+                logger.warning(
+                    "任务链中的任务 '%s' 仅允许人工执行，已从旧配置中跳过。",
+                    task_key,
+                )
                 continue
 
             try:
@@ -198,7 +205,7 @@ def get_task_registry(context: str = 'all'):
         'sync_ratings_to_emby': (task_sync_ratings_to_emby, "同步分级数据", 'media', True),
         'refresh_completed_series': (task_refresh_completed_series, "全量刷新剧集", 'watchlist', True),
         'execute-auto-tagging-rules': (task_execute_auto_tagging_rules, "自动打标规则", 'media', True),
-        'scan-monitor-folders': (task_scan_monitor_folders, "扫描监控目录", 'media', True),
+        'scan-monitor-folders': (task_scan_monitor_folders, "STRM 查漏", 'media', False),
         'restore-cache-from-db': (task_restore_local_cache_from_db, "恢复覆盖缓存", 'media', True),
         'scan-incomplete-assets': (task_scan_incomplete_assets, "检查媒体信息", 'media', True),
         'system-auto-update': (task_check_and_update_container, "系统自动更新", 'media', True),

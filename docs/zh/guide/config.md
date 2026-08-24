@@ -81,8 +81,8 @@
 | `monitor_enabled` | 启用实时监控 |
 | `monitor_paths` | 监控目录列表 |
 | `monitor_extensions` | 扩展名列表 |
-| `monitor_scan_lookback_days` | 回溯扫描天数 |
-| `monitor_full_scan_interval_hours` | STRM 路径库存全量校准间隔，默认 24 小时，0 为关闭 |
+| `monitor_scan_lookback_days` | 废弃兼容键；v7.2.13 不再消费，不触发启动查漏 |
+| `monitor_full_scan_interval_hours` | 废弃兼容键；旧值继续允许保存，但不再触发任何自动 Inventory audit |
 | `monitor_exclude_dirs` | 排除路径 |
 | `monitor_exclude_refresh_delay` | 排除路径的入库通知延迟秒数 |
 

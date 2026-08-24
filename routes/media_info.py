@@ -5,7 +5,9 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request
 
 from extensions import admin_required
+from database import log_db
 from services.mediainfo_repair_queue import get_media_info_coordinator
+from services.mediainfo_state import MediaInfoStateService
 
 
 media_info_bp = Blueprint("media_info", __name__, url_prefix="/api/media-info")
@@ -13,6 +15,37 @@ media_info_bp = Blueprint("media_info", __name__, url_prefix="/api/media-info")
 
 def _coordinator():
     return get_media_info_coordinator()
+
+
+@media_info_bp.route("/review-targets", methods=["GET"])
+@admin_required
+def get_review_targets():
+    """Return a bounded, explicit target inventory for read-only global recheck."""
+    requested_limit = request.args.get("limit", 1000, type=int)
+    limit = max(1, min(requested_limit, 1000))
+    rows, total = log_db.get_review_items_paginated(1, limit, "")
+    resolver = MediaInfoStateService()
+    targets = []
+    for row in rows:
+        resolved = resolver.resolve_review_target(
+            row.get("item_id"), row.get("item_type"), row.get("reason")
+        )
+        targets.append(
+            {
+                "source_item_id": row.get("item_id"),
+                "source_item_type": row.get("item_type"),
+                "target": resolved,
+            }
+        )
+    return jsonify(
+        {
+            "targets": targets,
+            "returned": len(targets),
+            "total": total,
+            "truncated": total > limit,
+            "limit": limit,
+        }
+    )
 
 
 @media_info_bp.route("/items/<item_id>/status", methods=["GET"])

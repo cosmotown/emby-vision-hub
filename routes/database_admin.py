@@ -13,6 +13,7 @@ import config_manager
 import task_manager
 import constants
 from database import log_db, maintenance_db, settings_db
+from services.mediainfo_state import MediaInfoStateService
 
 # 导入共享模块
 import extensions
@@ -322,7 +323,13 @@ def api_get_review_items():
     per_page = request.args.get('per_page', 20, type=int)
     query_filter = request.args.get('query', '', type=str).strip()
     try:
+        per_page = max(1, min(per_page, 100))
         items, total = log_db.get_review_items_paginated(page, per_page, query_filter)
+        resolver = MediaInfoStateService()
+        for item in items:
+            item['media_info_target'] = resolver.resolve_review_target(
+                item.get('item_id'), item.get('item_type'), item.get('reason')
+            )
         total_pages = (total + per_page - 1) // per_page if total > 0 else 0
         return jsonify({
             "items": items, "total_items": total, "total_pages": total_pages,

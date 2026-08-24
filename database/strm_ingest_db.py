@@ -858,6 +858,7 @@ def record_inventory_audit_batch(
         )
     children = sorted({os.path.normpath(path) for path in child_directories})
     db_batches = 0
+    watch_set_changed = False
 
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -926,6 +927,25 @@ def record_inventory_audit_batch(
                     page_size=safe_batch_size,
                 )
                 db_batches += 1
+
+            existing_active_children = set()
+            if children:
+                cursor.execute(
+                    """
+                    SELECT directory_path
+                    FROM strm_ingest_inventory_directories
+                    WHERE root_path = %s
+                      AND directory_path = ANY(%s)
+                      AND active = TRUE
+                    """,
+                    (root, children),
+                )
+                existing_active_children = {
+                    row['directory_path'] for row in cursor.fetchall()
+                }
+                watch_set_changed = bool(
+                    set(children) - existing_active_children
+                )
 
             child_rows = [
                 (root, child, directory, generation, manual_audit_id)
@@ -1013,6 +1033,7 @@ def record_inventory_audit_batch(
                     (root, directory, generation),
                 )
                 missing_children = [row['directory_path'] for row in cursor.fetchall()]
+                watch_set_changed = watch_set_changed or bool(missing_children)
                 manual_terminalized = 0
                 for child in missing_children:
                     child_like = child.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '/%'
@@ -1134,6 +1155,7 @@ def record_inventory_audit_batch(
                 'complete': complete,
                 'db_batches': db_batches,
                 'directories_discovered': len(children),
+                'watch_set_changed': watch_set_changed,
             }
 
 
@@ -1153,6 +1175,42 @@ def fail_inventory_directory_claim(claim: Dict, error: str, *, delay_seconds: in
                     claim['root_path'], claim['directory_path'], claim['claim_owner'],
                 ),
             )
+
+
+def release_inventory_directory_claims(claims: Iterable[Dict]) -> int:
+    """Release leased-but-unstarted directories without changing generation ownership."""
+    rows = [
+        (
+            str(claim.get('root_path') or ''),
+            str(claim.get('directory_path') or ''),
+            str(claim.get('claim_owner') or ''),
+        )
+        for claim in claims or []
+        if claim.get('root_path') and claim.get('directory_path') and claim.get('claim_owner')
+    ]
+    if not rows:
+        return 0
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            execute_values(
+                cursor,
+                """
+                UPDATE strm_ingest_inventory_directories AS directory
+                SET dirty = TRUE,
+                    next_audit_at = NOW(),
+                    claim_owner = NULL,
+                    claim_expires_at = NULL,
+                    updated_at = NOW()
+                FROM (VALUES %s) AS released(root_path, directory_path, claim_owner)
+                WHERE directory.root_path = released.root_path
+                  AND directory.directory_path = released.directory_path
+                  AND directory.claim_owner = released.claim_owner
+                """,
+                rows,
+                template='(%s, %s, %s)',
+                page_size=min(len(rows), 500),
+            )
+            return int(cursor.rowcount or 0)
 
 
 def request_full_inventory_audit(root_paths: Iterable[str]) -> int:

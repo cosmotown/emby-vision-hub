@@ -153,11 +153,12 @@ class StrmInventoryV2Tests(unittest.TestCase):
             self.assertTrue(service.request_inventory_audit_processing())
             self.assertTrue(completed.wait(timeout=1))
             self.assertEqual(2, service._inventory.run_once.call_count)
+            service.observer.sync_from_persistence.assert_not_called()
             service._reconcile_stop.set()
             service._inventory_requested.set()
             worker.join(timeout=1)
 
-    def test_manual_worker_claims_one_directory_per_stop_boundary(self):
+    def test_manual_worker_claims_four_directories_serially_with_stop_callback(self):
         processor = mock.Mock()
         processor.is_stop_requested.return_value = False
         service = monitor_service.MonitorService({}, processor)
@@ -165,7 +166,7 @@ class StrmInventoryV2Tests(unittest.TestCase):
         service.observer = mock.Mock()
         service.observer.sync_from_persistence.return_value = {'watched': 1}
         service._inventory = mock.Mock()
-        service._inventory.run_once.side_effect = [
+        results = [
             {'claimed': 0},
             {
                 'claimed': 1, 'completed': 1, 'ingest': 0, 'delete': 0,
@@ -173,6 +174,7 @@ class StrmInventoryV2Tests(unittest.TestCase):
                 'entries_seen': 0, 'db_batches': 0,
             },
         ]
+        service._inventory.run_once.side_effect = results
         manual_done = threading.Event()
 
         def status(_audit_id):
@@ -199,8 +201,55 @@ class StrmInventoryV2Tests(unittest.TestCase):
             worker.join(timeout=1)
         manual_call = service._inventory.run_once.call_args_list[1]
         self.assertEqual('audit-1', manual_call.kwargs['manual_audit_id'])
-        self.assertEqual(1, manual_call.kwargs['claim_limit'])
+        self.assertEqual(4, manual_call.kwargs['claim_limit'])
+        self.assertIs(manual_call.kwargs['should_stop'], processor.is_stop_requested)
         cooperative_sleep.assert_any_call(0.001)
+
+    def test_watch_sync_happens_once_for_changed_batch_and_never_for_unchanged_batch(self):
+        processor = mock.Mock()
+        processor.is_stop_requested.return_value = False
+        service = monitor_service.MonitorService({}, processor)
+        service._started = True
+        service.observer = mock.Mock()
+        service.observer.sync_from_persistence.return_value = {'watched': 5}
+        service._inventory = mock.Mock()
+        results = [
+            {
+                'claimed': 4, 'completed': 4, 'ingest': 0, 'delete': 0,
+                'failed': 0, 'physical_enumerations': 4,
+                'entries_seen': 0, 'db_batches': 0,
+                'watch_set_changed': False,
+            },
+            {
+                'claimed': 4, 'completed': 4, 'ingest': 0, 'delete': 0,
+                'failed': 0, 'physical_enumerations': 4,
+                'entries_seen': 1, 'db_batches': 1,
+                'watch_set_changed': True,
+            },
+            {'claimed': 0, 'watch_set_changed': False},
+        ]
+        drained = threading.Event()
+
+        def run_once(**kwargs):
+            value = results.pop(0)
+            if not value.get('claimed'):
+                drained.set()
+            return value
+
+        service._inventory.run_once.side_effect = run_once
+        with mock.patch.object(
+            monitor_service.strm_ingest_db,
+            'list_active_manual_inventory_audits',
+            return_value=[],
+        ):
+            worker = threading.Thread(target=service._run_requested_inventory_loop)
+            worker.start()
+            self.assertTrue(service.request_inventory_audit_processing())
+            self.assertTrue(drained.wait(timeout=1))
+            service._reconcile_stop.set()
+            service._inventory_requested.set()
+            worker.join(timeout=1)
+        service.observer.sync_from_persistence.assert_called_once_with()
 
     def test_directory_event_wakes_inventory_but_file_event_uses_exact_queue_only(self):
         notifier = mock.Mock()
@@ -213,8 +262,23 @@ class StrmInventoryV2Tests(unittest.TestCase):
         ), mock.patch.object(handler, '_enqueue_file') as enqueue:
             handler.on_created(_Event('/STRM/Show', is_directory=True))
             handler.on_created(_Event('/STRM/Show/S01E04.strm'))
-        notifier.assert_called_once_with()
+        notifier.assert_called_once_with(True)
         enqueue.assert_called_once_with('/STRM/Show/S01E04.strm')
+
+    def test_directory_move_and_remove_request_watch_set_sync(self):
+        notifier = mock.Mock()
+        handler = monitor_service.MediaFileHandler(
+            ['.strm'], inventory_roots=['/STRM'],
+            inventory_audit_notifier=notifier,
+        )
+        with mock.patch.object(
+            monitor_service.strm_ingest_db, 'record_directory_moved', return_value=[],
+        ), mock.patch.object(
+            monitor_service.strm_ingest_db, 'record_directory_removed', return_value=[],
+        ):
+            handler.on_moved(_Event('/STRM/Old', dest_path='/STRM/New', is_directory=True))
+            handler.on_deleted(_Event('/STRM/New', is_directory=True))
+        self.assertEqual([mock.call(True), mock.call(True)], notifier.call_args_list)
 
     def test_directory_move_uses_persisted_paths_and_never_walks_destination(self):
         handler = monitor_service.MediaFileHandler(
@@ -327,6 +391,41 @@ class StrmInventoryV2Tests(unittest.TestCase):
             result = inventory.run_once()
         self.assertEqual(0, result['claimed'])
         self.assertEqual(3, claim.call_args.kwargs['limit'])
+
+    def test_stop_releases_unstarted_claims_without_parallel_scans(self):
+        claims = [
+            {
+                'root_path': '/STRM', 'directory_path': f'/STRM/{index}',
+                'audit_generation': 1, 'event_version': 0,
+                'claim_owner': 'owner', 'manual_audit_id': 'audit',
+            }
+            for index in range(4)
+        ]
+        inventory = IncrementalStrmInventory(owner='owner', directory_batch_limit=4)
+        stop = mock.Mock(side_effect=[False, True])
+        with mock.patch(
+            'services.strm_inventory.strm_ingest_db.claim_inventory_directories',
+            return_value=claims,
+        ) as claim, mock.patch.object(
+            inventory, 'scan_claim',
+            return_value={
+                'accepted': True, 'complete': True, 'added': [], 'changed': [],
+                'removed': [], 'physical_enumerations': 1, 'entries_seen': 0,
+                'db_batches': 0, 'watch_set_changed': False,
+            },
+        ) as scan, mock.patch(
+            'services.strm_inventory.strm_ingest_db.release_inventory_directory_claims',
+            return_value=3,
+        ) as release:
+            result = inventory.run_once(
+                manual_audit_id='audit', claim_limit=4, should_stop=stop,
+            )
+        self.assertEqual(4, claim.call_args.kwargs['limit'])
+        self.assertEqual(1, scan.call_count)
+        release.assert_called_once_with(claims[1:])
+        self.assertEqual(1, result['completed'])
+        self.assertEqual(3, result['released'])
+        self.assertEqual(1, result['physical_enumerations'])
 
     def test_permission_error_is_fail_closed_with_zero_delete(self):
         claim = {

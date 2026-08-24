@@ -562,7 +562,7 @@ class MediaFileHandler(FileSystemEventHandler):
         extensions: List[str],
         exclude_dirs: List[str] = None,
         inventory_roots: List[str] = None,
-        inventory_audit_notifier: Optional[Callable[[], None]] = None,
+        inventory_audit_notifier: Optional[Callable[[bool], None]] = None,
     ):
         self.extensions = utils.normalize_monitor_extensions(extensions)
         self.inventory_roots = sorted(
@@ -604,7 +604,7 @@ class MediaFileHandler(FileSystemEventHandler):
             root = self._inventory_root(event.src_path)
             if root:
                 strm_ingest_db.record_directory_created(root, event.src_path)
-                self._notify_inventory_audit()
+                self._notify_inventory_audit(watch_set_changed=True)
             return
         if self._is_valid_media_file(event.src_path):
             self._enqueue_file(event.src_path)
@@ -636,7 +636,7 @@ class MediaFileHandler(FileSystemEventHandler):
                     self._enqueue_delete(old_path)
                     if self._is_valid_media_file(new_path):
                         self._enqueue_file(new_path)
-                self._notify_inventory_audit()
+                self._notify_inventory_audit(watch_set_changed=True)
             except Exception as exc:
                 logger.warning(f"  ⚠️ 无法持久化目录移动库存，将由增量目录审计补偿: {exc}")
             return
@@ -654,7 +654,7 @@ class MediaFileHandler(FileSystemEventHandler):
                 for file_path in paths:
                     self._enqueue_delete(file_path)
                 if root:
-                    self._notify_inventory_audit()
+                    self._notify_inventory_audit(watch_set_changed=True)
             except Exception as exc:
                 logger.warning(f"  ⚠️ 无法持久化目录删除库存，将由增量目录审计补偿: {exc}")
             return
@@ -676,10 +676,10 @@ class MediaFileHandler(FileSystemEventHandler):
                 continue
         return None
 
-    def _notify_inventory_audit(self) -> None:
+    def _notify_inventory_audit(self, *, watch_set_changed: bool = False) -> None:
         """Wake bounded reconciliation only for an explicit directory event."""
         if self.inventory_audit_notifier:
-            self.inventory_audit_notifier()
+            self.inventory_audit_notifier(bool(watch_set_changed))
 
     def _persist_file_event(self, file_path: str, *, operation: str) -> None:
         if not str(file_path).lower().endswith('.strm'):
@@ -1003,6 +1003,7 @@ class MonitorService:
         self.exclude_dirs = self.config.get(constants.CONFIG_OPTION_MONITOR_EXCLUDE_DIRS, constants.DEFAULT_MONITOR_EXCLUDE_DIRS)
         self._reconcile_stop = threading.Event()
         self._inventory_requested = threading.Event()
+        self._watch_sync_requested = threading.Event()
         self._reconcile_thread = None
         self._retry_thread = None
         self._started = False
@@ -1091,6 +1092,7 @@ class MonitorService:
             )
             self._reconcile_stop = threading.Event()
             self._inventory_requested = threading.Event()
+            self._watch_sync_requested = threading.Event()
             self._reconcile_thread = None
             self._retry_thread = None
             _ADAPTIVE_REFRESH_STOP = threading.Event()
@@ -1149,12 +1151,26 @@ class MonitorService:
         else:
             logger.warning("  ➜ 没有有效的监控目录，实时监控服务未启动。")
 
-    def request_inventory_audit_processing(self) -> bool:
+    def request_inventory_audit_processing(self, watch_set_changed: bool = False) -> bool:
         """Wake the bounded worker without adding or widening inventory work."""
         if not self._started or self._reconcile_stop.is_set():
             return False
+        if watch_set_changed:
+            self._watch_sync_requested.set()
         self._inventory_requested.set()
         return True
+
+    def _sync_inventory_watches_if_needed(self, summary: Optional[dict] = None) -> dict:
+        if summary and summary.get('watch_set_changed'):
+            self._watch_sync_requested.set()
+        if not self._watch_sync_requested.is_set() or not self.observer:
+            return {}
+        self._watch_sync_requested.clear()
+        try:
+            return self.observer.sync_from_persistence()
+        except Exception:
+            self._watch_sync_requested.set()
+            raise
 
     def _run_requested_inventory_loop(self):
         def process_ingest(candidate_paths):
@@ -1186,7 +1202,7 @@ class MonitorService:
                         on_delete=process_delete,
                     )
                     if summary['claimed']:
-                        watch_summary = self.observer.sync_from_persistence() if self.observer else {}
+                        watch_summary = self._sync_inventory_watches_if_needed(summary)
                         logger.info(
                             "  🧭 STRM 显式目录核对：认领 %(claimed)s，完成 %(completed)s，"
                             "新增/变化 %(ingest)s，删除 %(delete)s，失败 %(failed)s，"
@@ -1196,8 +1212,16 @@ class MonitorService:
                         )
                 except Exception as exc:
                     logger.error(f"  ❌ STRM 显式目录核对失败，保留持久状态: {exc}", exc_info=True)
+                    try:
+                        self._sync_inventory_watches_if_needed(summary)
+                    except Exception:
+                        logger.error("  ❌ STRM persisted watch 同步失败，保留重试信号。", exc_info=True)
                     break
                 if not summary.get('claimed'):
+                    try:
+                        self._sync_inventory_watches_if_needed(summary)
+                    except Exception:
+                        logger.error("  ❌ STRM persisted watch 同步失败，保留重试信号。", exc_info=True)
                     break
                 # The web app runs on gevent. A long sequence of short,
                 # synchronous PostgreSQL/scandir claims must explicitly yield
@@ -1205,8 +1229,9 @@ class MonitorService:
                 time.sleep(0.001)
 
             # A manual generation remains active until all of its persisted
-            # directory rows complete or the task centre cancels it. Claim one
-            # directory at a time so a stop request cannot widen in-flight work.
+            # directory rows complete or the task centre cancels it. Claim at
+            # most four directories, process them serially, and release every
+            # leased-but-unstarted row as soon as a stop request is observed.
             for manual_audit_id in strm_ingest_db.list_active_manual_inventory_audits():
                 while not self._reconcile_stop.is_set():
                     status = strm_ingest_db.get_manual_inventory_audit(manual_audit_id)
@@ -1225,10 +1250,11 @@ class MonitorService:
                             on_ingest=process_ingest,
                             on_delete=process_delete,
                             manual_audit_id=manual_audit_id,
-                            claim_limit=1,
+                            claim_limit=4,
+                            should_stop=self.processor.is_stop_requested,
                         )
                         if summary['claimed']:
-                            watch_summary = self.observer.sync_from_persistence() if self.observer else {}
+                            watch_summary = self._sync_inventory_watches_if_needed(summary)
                             logger.info(
                                 f"  🧭 STRM 人工查漏 generation={manual_audit_id}：认领 %(claimed)s，"
                                 "完成 %(completed)s，新增/变化 %(ingest)s，删除 %(delete)s，"

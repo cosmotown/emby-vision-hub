@@ -122,6 +122,7 @@ class IncrementalStrmInventory:
         on_delete: Optional[Callable[[Iterable[str]], None]] = None,
         manual_audit_id: Optional[str] = None,
         claim_limit: Optional[int] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, int]:
         claim_kwargs = {
             'limit': (
@@ -137,8 +138,14 @@ class IncrementalStrmInventory:
             'claimed': len(claims), 'completed': 0, 'partial': 0,
             'failed': 0, 'ingest': 0, 'delete': 0,
             'physical_enumerations': 0, 'entries_seen': 0, 'db_batches': 0,
+            'released': 0, 'watch_set_changed': False,
         }
-        for claim in claims:
+        for index, claim in enumerate(claims):
+            if should_stop and should_stop():
+                summary['released'] += strm_ingest_db.release_inventory_directory_claims(
+                    claims[index:]
+                )
+                break
             try:
                 result = self.scan_claim(claim)
                 if not result.get('accepted'):
@@ -154,6 +161,9 @@ class IncrementalStrmInventory:
                 summary['physical_enumerations'] += int(result.get('physical_enumerations') or 0)
                 summary['entries_seen'] += int(result.get('entries_seen') or 0)
                 summary['db_batches'] += int(result.get('db_batches') or 0)
+                summary['watch_set_changed'] = bool(
+                    summary['watch_set_changed'] or result.get('watch_set_changed')
+                )
                 summary['completed' if result.get('complete') else 'partial'] += 1
             except Exception as exc:
                 summary['failed'] += 1

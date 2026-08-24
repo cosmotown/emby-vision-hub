@@ -5,6 +5,8 @@ import threading
 import time
 import unittest
 
+from psycopg2.extras import execute_values
+
 import config_manager
 import constants
 from database import connection, strm_ingest_db
@@ -516,6 +518,386 @@ class StrmInventoryV2PostgresTests(unittest.TestCase):
             self.assertEqual('completed', final['state'])
             self.assertEqual(100, final['progress'])
             self.assertEqual(0, final['pending_directories'])
+
+    def test_manual_parent_rediscovery_does_not_create_clean_generation_ghosts(self):
+        with tempfile.TemporaryDirectory() as root:
+            children = []
+            for index in range(100):
+                directory = os.path.join(root, f'Existing {index:03d}')
+                os.mkdir(directory)
+                children.append(directory)
+
+            strm_ingest_db.register_inventory_roots([root])
+            for directory in children:
+                strm_ingest_db.record_file_event(
+                    root,
+                    os.path.join(directory, 'E01.strm'),
+                    event_kind='ingest',
+                )
+
+            audit = strm_ingest_db.create_manual_inventory_audit([root])
+            audit_id = audit['audit_id']
+            inventory = IncrementalStrmInventory(
+                owner='ghost-reproduction', directory_batch_limit=1,
+            )
+
+            # Complete one child before its parent. The later successful parent
+            # snapshot must not attach that clean child to the generation again.
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE strm_ingest_inventory_directories "
+                        "SET next_audit_at = NOW() + INTERVAL '1 hour' "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, root),
+                    )
+            first = inventory.run_once(manual_audit_id=audit_id, claim_limit=1)
+            self.assertEqual(1, first['completed'])
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE strm_ingest_inventory_directories "
+                        "SET next_audit_at = NOW() - INTERVAL '1 hour' "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, root),
+                    )
+            parent = inventory.run_once(manual_audit_id=audit_id, claim_limit=1)
+            self.assertEqual(1, parent['completed'])
+
+            for _ in range(150):
+                result = inventory.run_once(
+                    manual_audit_id=audit_id, claim_limit=1,
+                )
+                if not result['claimed']:
+                    break
+
+            status = strm_ingest_db.get_manual_inventory_audit(audit_id)
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT COUNT(*) AS count "
+                        "FROM strm_ingest_inventory_directories "
+                        "WHERE active = TRUE AND dirty = FALSE "
+                        "AND manual_audit_id = %s",
+                        (audit_id,),
+                    )
+                    ghost_count = int(cursor.fetchone()['count'])
+
+            self.assertEqual(0, ghost_count, status)
+            self.assertEqual('completed', status['state'])
+            self.assertEqual(status['total_directories'], status['completed_directories'])
+            self.assertEqual(0, status['pending_directories'])
+            self.assertEqual(0, status['claimed_directories'])
+
+    def test_completed_child_rediscovery_does_not_inflate_manual_progress(self):
+        with tempfile.TemporaryDirectory() as root:
+            child = os.path.join(root, 'Already Complete')
+            os.mkdir(child)
+            strm_ingest_db.register_inventory_roots([root])
+            strm_ingest_db.record_file_event(
+                root, os.path.join(child, 'E01.strm'), event_kind='ingest'
+            )
+            audit_id = strm_ingest_db.create_manual_inventory_audit([root])['audit_id']
+            inventory = IncrementalStrmInventory(
+                owner='completed-child', directory_batch_limit=1,
+            )
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE strm_ingest_inventory_directories "
+                        "SET next_audit_at = NOW() + INTERVAL '1 hour' "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, root),
+                    )
+            self.assertEqual(
+                1,
+                inventory.run_once(
+                    manual_audit_id=audit_id, claim_limit=1,
+                )['completed'],
+            )
+            before_parent = strm_ingest_db.get_manual_inventory_audit(audit_id)
+            self.assertEqual(2, before_parent['total_directories'])
+            self.assertEqual(1, before_parent['completed_directories'])
+
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE strm_ingest_inventory_directories "
+                        "SET next_audit_at = NOW() - INTERVAL '1 hour' "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, root),
+                    )
+            self.assertEqual(
+                1,
+                inventory.run_once(
+                    manual_audit_id=audit_id, claim_limit=1,
+                )['completed'],
+            )
+            final = strm_ingest_db.get_manual_inventory_audit(audit_id)
+            self.assertEqual('completed', final['state'])
+            self.assertEqual(2, final['total_directories'])
+            self.assertEqual(2, final['completed_directories'])
+            self.assertEqual(0, final['pending_directories'])
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT dirty, manual_audit_id "
+                        "FROM strm_ingest_inventory_directories "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, child),
+                    )
+                    row = cursor.fetchone()
+            self.assertFalse(row['dirty'])
+            self.assertIsNone(row['manual_audit_id'])
+
+    def test_clean_generation_owned_child_is_repaired_to_claimable(self):
+        with tempfile.TemporaryDirectory() as root:
+            child = os.path.join(root, 'Pending Child')
+            os.mkdir(child)
+            strm_ingest_db.register_inventory_roots([root])
+            strm_ingest_db.record_file_event(
+                root, os.path.join(child, 'E01.strm'), event_kind='ingest'
+            )
+            audit_id = strm_ingest_db.create_manual_inventory_audit([root])['audit_id']
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE strm_ingest_inventory_directories "
+                        "SET dirty = FALSE, next_audit_at = NOW() + INTERVAL '1 hour' "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, child),
+                    )
+
+            status = strm_ingest_db.get_manual_inventory_audit(audit_id)
+            self.assertEqual(2, status['pending_directories'])
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT dirty, next_audit_at <= NOW() AS due, manual_audit_id "
+                        "FROM strm_ingest_inventory_directories "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, child),
+                    )
+                    repaired = cursor.fetchone()
+            self.assertTrue(repaired['dirty'])
+            self.assertTrue(repaired['due'])
+            self.assertEqual(audit_id, repaired['manual_audit_id'])
+
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE strm_ingest_inventory_directories "
+                        "SET next_audit_at = NOW() + INTERVAL '1 hour' "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, root),
+                    )
+            claims = strm_ingest_db.claim_inventory_directories(
+                'repaired-claim', limit=1, manual_audit_id=audit_id,
+            )
+            self.assertEqual([child], [row['directory_path'] for row in claims])
+
+    def test_manual_parent_snapshot_terminalizes_missing_child_and_generation(self):
+        with tempfile.TemporaryDirectory() as root:
+            missing_child = os.path.join(root, 'Historical Season')
+            episode = os.path.join(missing_child, 'S01E01.strm')
+            strm_ingest_db.register_inventory_roots([root])
+            strm_ingest_db.record_file_event(root, episode, event_kind='ingest')
+            strm_ingest_db.enqueue_paths(
+                [episode], source='test', last_error='known historical file'
+            )
+            audit_id = strm_ingest_db.create_manual_inventory_audit([root])['audit_id']
+            deleted = []
+            result = IncrementalStrmInventory(
+                owner='missing-parent-proof', directory_batch_limit=1,
+            ).run_once(
+                manual_audit_id=audit_id,
+                claim_limit=1,
+                on_delete=lambda paths: deleted.extend(paths),
+            )
+            self.assertEqual(1, result['completed'])
+            self.assertEqual([episode], deleted)
+
+            status = strm_ingest_db.get_manual_inventory_audit(audit_id)
+            self.assertEqual('completed', status['state'])
+            self.assertEqual(2, status['total_directories'])
+            self.assertEqual(2, status['completed_directories'])
+            self.assertEqual(0, status['pending_directories'])
+            self.assertEqual(0, status['claimed_directories'])
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT active, dirty, manual_audit_id, last_error "
+                        "FROM strm_ingest_inventory_directories "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, missing_child),
+                    )
+                    child_row = cursor.fetchone()
+                    cursor.execute(
+                        "SELECT operation, status FROM strm_ingest_retry_queue "
+                        "WHERE file_path = %s",
+                        (episode,),
+                    )
+                    file_row = cursor.fetchone()
+            self.assertFalse(child_row['active'])
+            self.assertFalse(child_row['dirty'])
+            self.assertIsNone(child_row['manual_audit_id'])
+            self.assertIsNone(child_row['last_error'])
+            self.assertEqual('delete', file_row['operation'])
+            self.assertEqual('pending', file_row['status'])
+
+    def test_inaccessible_parent_never_infers_manual_child_deletion(self):
+        with tempfile.TemporaryDirectory() as root:
+            missing_parent = os.path.join(root, 'Unavailable Parent')
+            child = os.path.join(missing_parent, 'Season 1')
+            episode = os.path.join(child, 'S01E01.strm')
+            strm_ingest_db.register_inventory_roots([root])
+            strm_ingest_db.record_file_event(
+                root,
+                os.path.join(missing_parent, 'parent-placeholder.strm'),
+                event_kind='ingest',
+            )
+            strm_ingest_db.record_file_event(root, episode, event_kind='ingest')
+            strm_ingest_db.enqueue_paths(
+                [episode], source='test', last_error='known historical file'
+            )
+            audit_id = strm_ingest_db.create_manual_inventory_audit([root])['audit_id']
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE strm_ingest_inventory_directories "
+                        "SET next_audit_at = CASE "
+                        "WHEN directory_path = %s THEN NOW() - INTERVAL '1 hour' "
+                        "ELSE NOW() + INTERVAL '1 hour' END "
+                        "WHERE root_path = %s",
+                        (missing_parent, root),
+                    )
+            deleted = []
+            result = IncrementalStrmInventory(
+                owner='inaccessible-parent', directory_batch_limit=1,
+            ).run_once(
+                manual_audit_id=audit_id,
+                claim_limit=1,
+                on_delete=lambda paths: deleted.extend(paths),
+            )
+            self.assertEqual(1, result['failed'])
+            self.assertEqual([], deleted)
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT active, dirty, manual_audit_id "
+                        "FROM strm_ingest_inventory_directories "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, child),
+                    )
+                    child_row = cursor.fetchone()
+                    cursor.execute(
+                        "SELECT operation, status FROM strm_ingest_retry_queue "
+                        "WHERE file_path = %s",
+                        (episode,),
+                    )
+                    file_row = cursor.fetchone()
+            self.assertTrue(child_row['active'])
+            self.assertTrue(child_row['dirty'])
+            self.assertEqual(audit_id, child_row['manual_audit_id'])
+            self.assertNotEqual('delete', file_row['operation'])
+
+    def test_manual_generation_converges_with_five_thousand_persisted_directories(self):
+        with tempfile.TemporaryDirectory() as root:
+            strm_ingest_db.register_inventory_roots([root])
+            children = [
+                os.path.join(root, f'Persisted {index:04d}')
+                for index in range(4999)
+            ]
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    execute_values(
+                        cursor,
+                        """
+                        INSERT INTO strm_ingest_inventory_directories (
+                            root_path, directory_path, parent_path, active, dirty
+                        ) VALUES %s
+                        """,
+                        [(root, child, root, True, False) for child in children],
+                        page_size=500,
+                    )
+            audit_id = strm_ingest_db.create_manual_inventory_audit([root])['audit_id']
+
+            # Model a long-running production generation: 3969 directories are
+            # already complete and clean before their parent is rediscovered.
+            completed_children = children[:3969]
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE strm_ingest_inventory_directories "
+                        "SET dirty = FALSE, manual_audit_id = NULL "
+                        "WHERE root_path = %s AND directory_path = ANY(%s)",
+                        (root, completed_children),
+                    )
+                    cursor.execute(
+                        "UPDATE strm_ingest_inventory_manual_audits "
+                        "SET state = 'running', completed_directories = 3969, "
+                        "total_directories = 5000, started_at = NOW() "
+                        "WHERE audit_id = %s",
+                        (audit_id,),
+                    )
+                    cursor.execute(
+                        "UPDATE strm_ingest_inventory_directories "
+                        "SET next_audit_at = CASE "
+                        "WHEN directory_path = %s THEN NOW() - INTERVAL '1 hour' "
+                        "ELSE NOW() + INTERVAL '1 hour' END "
+                        "WHERE root_path = %s",
+                        (root, root),
+                    )
+
+            root_claim = strm_ingest_db.claim_inventory_directories(
+                'scale-root', limit=1, manual_audit_id=audit_id,
+            )
+            self.assertEqual([root], [row['directory_path'] for row in root_claim])
+            root_result = strm_ingest_db.record_inventory_audit_batch(
+                root_claim[0],
+                files={},
+                child_directories=children,
+                next_cursor=None,
+                complete=True,
+                db_batch_size=500,
+                audit_interval_hours=24,
+            )
+            self.assertTrue(root_result['accepted'])
+            self.assertEqual(10, root_result['db_batches'])
+
+            while True:
+                claims = strm_ingest_db.claim_inventory_directories(
+                    'scale-children', limit=32, manual_audit_id=audit_id,
+                )
+                if not claims:
+                    break
+                for claim in claims:
+                    strm_ingest_db.record_inventory_audit_batch(
+                        claim,
+                        files={},
+                        child_directories=[],
+                        next_cursor=None,
+                        complete=True,
+                        db_batch_size=500,
+                        audit_interval_hours=24,
+                    )
+
+            final = strm_ingest_db.get_manual_inventory_audit(audit_id)
+            self.assertEqual('completed', final['state'])
+            self.assertEqual(5000, final['total_directories'])
+            self.assertEqual(5000, final['completed_directories'])
+            self.assertEqual(0, final['pending_directories'])
+            self.assertEqual(0, final['claimed_directories'])
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT COUNT(*) AS count "
+                        "FROM strm_ingest_inventory_directories "
+                        "WHERE active = TRUE AND dirty = FALSE "
+                        "AND manual_audit_id = %s",
+                        (audit_id,),
+                    )
+                    self.assertEqual(0, cursor.fetchone()['count'])
 
     def test_manual_progress_and_cancel_are_isolated_from_directory_event_work(self):
         with tempfile.TemporaryDirectory() as root:

@@ -121,6 +121,43 @@ def get_review_items_paginated(page: int, per_page: int, query_filter: str) -> T
         logger.error(f"  ➜ 获取待复核列表失败: {e}", exc_info=True)
         raise
 
+def get_all_review_items() -> List[Dict]:
+    """Return a stable snapshot of all review rows for an explicit bulk action."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT item_id, item_name, failed_at, reason, item_type, score
+                    FROM failed_log
+                    ORDER BY failed_at DESC, item_id ASC
+                    """
+                )
+                return [dict(row) for row in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"  ➜ 获取全部待复核记录失败: {e}", exc_info=True)
+        raise
+
+def remove_review_items(item_ids: List[str]) -> int:
+    """Atomically remove only the explicitly confirmed review row IDs."""
+    normalized = sorted({str(item_id).strip() for item_id in item_ids if str(item_id).strip()})
+    if not normalized:
+        return 0
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM failed_log WHERE item_id = ANY(%s)",
+                    (normalized,),
+                )
+                removed = cursor.rowcount
+            conn.commit()
+        logger.info("  ➜ 已从待复核列表移除 %s 条重新核验确认的记录。", removed)
+        return removed
+    except Exception as e:
+        logger.error("  ➜ 批量移除已确认待复核记录失败", exc_info=True)
+        raise
+
 def mark_review_item_as_processed(item_id: str) -> bool:
     """从待复核列表中移除一个项目。"""
     try:
@@ -138,16 +175,5 @@ def mark_review_item_as_processed(item_id: str) -> bool:
         raise
 
 def clear_all_review_items() -> int:
-    """清空所有待复核项。"""
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("DELETE FROM failed_log")
-                deleted_count = cursor.rowcount
-                conn.commit()
-                
-            logger.info(f"  ➜ 成功从待复核列表删除 {deleted_count} 条记录。")
-            return deleted_count
-    except Exception as e:
-        logger.error(f"  ➜ 清空待复核列表时发生异常：{e}", exc_info=True)
-        return 0
+    """Fail closed: unconditional ReviewList deletion is intentionally disabled."""
+    raise RuntimeError("unconditional review cleanup is disabled")

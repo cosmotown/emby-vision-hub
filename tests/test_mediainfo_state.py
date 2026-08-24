@@ -67,6 +67,19 @@ class MediaInfoStateTests(unittest.TestCase):
             responses.append(FakeResponse(media))
         return responses
 
+    @staticmethod
+    def _series_identity(series_id="series-1"):
+        return FakeResponse({"Items": [{"Id": series_id, "Type": "Series"}]})
+
+    def _episode(self, number, *, item_id=None, series_id="series-1"):
+        return dict(
+            self.item,
+            Id=item_id or f"episode-{number}",
+            SeriesId=series_id,
+            ParentIndexNumber=1,
+            IndexNumber=number,
+        )
+
     @mock.patch("services.mediainfo_state.emby.emby_client.get")
     def test_lightweight_observation_never_requests_media_sources(self, get):
         get.side_effect = self._catalog_responses()
@@ -118,63 +131,73 @@ class MediaInfoStateTests(unittest.TestCase):
         self.assertEqual("present", snapshot["strm_status"]["status"])
 
     @mock.patch("services.mediainfo_state.emby.emby_client.get")
-    def test_series_review_resolves_exact_episode_from_emby_identity(self, get):
-        target = dict(
-            self.item,
-            Id="episode-8",
-            SeriesId="series-1",
-            ParentIndexNumber=1,
-            IndexNumber=8,
-        )
-        get.return_value = FakeResponse({"Items": [target]})
-
-        resolved = self._service().resolve_review_target(
-            "series-1", "Series", "MediaInfo incomplete [S01E08]"
-        )
-
-        self.assertEqual("episode-8", resolved["target_item_id"])
-        self.assertEqual("Episode", resolved["target_item_type"])
-        self.assertEqual("series_episode", resolved["target_resolution"])
-        self.assertEqual(1, resolved["target_parent_index_number"])
-        self.assertEqual(8, resolved["target_index_number"])
-        params = get.call_args.kwargs["params"]
-        self.assertEqual("series-1", params["SeriesId"])
-        self.assertEqual("Episode", params["IncludeItemTypes"])
-        self.assertNotIn("ParentIndexNumber", params)
-        self.assertNotIn("IndexNumber", params)
-        self.assertEqual(500, params["Limit"])
+    def test_six_episode_series_resolves_first_and_last_by_exact_series_identity(self, get):
+        episodes = [self._episode(number) for number in range(1, 7)]
+        for number in (1, 6):
+            with self.subTest(number=number):
+                get.reset_mock()
+                get.side_effect = [
+                    self._series_identity(),
+                    FakeResponse({"Items": episodes, "TotalRecordCount": 6}),
+                ]
+                resolved = self._service().resolve_review_target(
+                    "series-1", "Series", f"MediaInfo incomplete [S01E{number:02d}]"
+                )
+                self.assertEqual(f"episode-{number}", resolved["target_item_id"])
+                self.assertEqual("Episode", resolved["target_item_type"])
+                self.assertEqual("series_episode", resolved["target_resolution"])
+                self.assertEqual(1, resolved["target_parent_index_number"])
+                self.assertEqual(number, resolved["target_index_number"])
+                self.assertEqual(2, get.call_count)
+                episode_call = get.call_args_list[1]
+                self.assertTrue(episode_call.args[0].endswith("/Shows/series-1/Episodes"))
+                self.assertEqual(1, episode_call.kwargs["params"]["Season"])
+                self.assertEqual(0, episode_call.kwargs["params"]["StartIndex"])
+                self.assertEqual(100, episode_call.kwargs["params"]["Limit"])
+                self.assertNotIn("SeriesId", episode_call.kwargs["params"])
+                self.assertNotIn("SearchTerm", episode_call.kwargs["params"])
+                self.assertNotIn("AnyProviderIdEquals", episode_call.kwargs["params"])
 
     @mock.patch("services.mediainfo_state.emby.emby_client.get")
-    def test_series_review_target_is_fail_closed_when_query_is_truncated(self, get):
-        target = dict(
-            self.item,
-            Id="episode-8",
-            SeriesId="series-1",
-            ParentIndexNumber=1,
-            IndexNumber=8,
-        )
-        get.return_value = FakeResponse({"Items": [target], "TotalRecordCount": 501})
-
+    def test_series_review_missing_coordinate_is_fail_closed(self, get):
+        episodes = [self._episode(number) for number in range(1, 7)]
+        get.side_effect = [
+            self._series_identity(),
+            FakeResponse({"Items": episodes, "TotalRecordCount": 6}),
+        ]
         resolved = self._service().resolve_review_target(
-            "series-1", "Series", "MediaInfo incomplete S01E08"
+            "series-1", "Series", "MediaInfo incomplete S01E07"
         )
-
         self.assertIsNone(resolved["target_item_id"])
+        self.assertEqual("episode_target_not_found", resolved["target_reason_code"])
+
+    @mock.patch("services.mediainfo_state.EPISODE_QUERY_PAGE_SIZE", 2)
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_large_series_is_safely_paginated_until_unique_target(self, get):
+        episodes = [self._episode(number) for number in range(1, 7)]
+        get.side_effect = [
+            self._series_identity(),
+            FakeResponse({"Items": episodes[:2], "TotalRecordCount": 6}),
+            FakeResponse({"Items": episodes[2:4], "TotalRecordCount": 6}),
+            FakeResponse({"Items": episodes[4:], "TotalRecordCount": 6}),
+        ]
+        resolved = self._service().resolve_review_target(
+            "series-1", "Series", "MediaInfo incomplete S01E06"
+        )
+        self.assertEqual("episode-6", resolved["target_item_id"])
         self.assertEqual(
-            "episode_target_query_truncated", resolved["target_reason_code"]
+            [0, 2, 4],
+            [call.kwargs["params"]["StartIndex"] for call in get.call_args_list[1:]],
         )
 
     @mock.patch("services.mediainfo_state.emby.emby_client.get")
     def test_series_review_target_is_fail_closed_when_ambiguous(self, get):
-        first = dict(
-            self.item,
-            Id="episode-a",
-            SeriesId="series-1",
-            ParentIndexNumber=1,
-            IndexNumber=8,
-        )
+        first = self._episode(8, item_id="episode-a")
         second = dict(first, Id="episode-b")
-        get.return_value = FakeResponse({"Items": [first, second]})
+        get.side_effect = [
+            self._series_identity(),
+            FakeResponse({"Items": [first, second], "TotalRecordCount": 2}),
+        ]
 
         resolved = self._service().resolve_review_target(
             "series-1", "Series", "MediaInfo incomplete S01E08"
@@ -182,6 +205,57 @@ class MediaInfoStateTests(unittest.TestCase):
 
         self.assertIsNone(resolved["target_item_id"])
         self.assertEqual("episode_target_ambiguous", resolved["target_reason_code"])
+
+    @mock.patch("services.mediainfo_state.EPISODE_QUERY_PAGE_SIZE", 2)
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_duplicate_coordinate_on_later_page_is_fail_closed(self, get):
+        get.side_effect = [
+            self._series_identity(),
+            FakeResponse(
+                {"Items": [self._episode(1, item_id="episode-a"), self._episode(2)], "TotalRecordCount": 4}
+            ),
+            FakeResponse(
+                {"Items": [self._episode(1, item_id="episode-b"), self._episode(3)], "TotalRecordCount": 4}
+            ),
+        ]
+        resolved = self._service().resolve_review_target(
+            "series-1", "Series", "MediaInfo incomplete S01E01"
+        )
+        self.assertIsNone(resolved["target_item_id"])
+        self.assertEqual("episode_target_ambiguous", resolved["target_reason_code"])
+
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_series_review_api_failure_is_fail_closed(self, get):
+        get.side_effect = [self._series_identity(), RuntimeError("Emby unavailable")]
+        resolved = self._service().resolve_review_target(
+            "series-1", "Series", "MediaInfo incomplete S01E01"
+        )
+        self.assertIsNone(resolved["target_item_id"])
+        self.assertEqual("emby_lookup_failed", resolved["target_reason_code"])
+
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_missing_series_is_historical_not_lookup_failure(self, get):
+        get.return_value = FakeResponse({"Items": []})
+        resolved = self._service().resolve_review_target(
+            "series-gone", "Series", "MediaInfo incomplete S01E01"
+        )
+        self.assertIsNone(resolved["target_item_id"])
+        self.assertEqual("historical_item_missing", resolved["target_reason_code"])
+        self.assertEqual(1, get.call_count)
+
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_exact_series_endpoint_mixing_another_series_is_fail_closed(self, get):
+        get.side_effect = [
+            self._series_identity(),
+            FakeResponse(
+                {"Items": [self._episode(1, series_id="series-other")], "TotalRecordCount": 1}
+            ),
+        ]
+        resolved = self._service().resolve_review_target(
+            "series-1", "Series", "MediaInfo incomplete S01E01"
+        )
+        self.assertIsNone(resolved["target_item_id"])
+        self.assertEqual("episode_target_series_mismatch", resolved["target_reason_code"])
 
     @mock.patch("services.mediainfo_state.emby.emby_client.get")
     def test_series_review_without_unique_coordinate_never_queries_emby(self, get):
@@ -192,6 +266,29 @@ class MediaInfoStateTests(unittest.TestCase):
                 )
                 self.assertIsNone(resolved["target_item_id"])
         get.assert_not_called()
+
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_confirmed_missing_item_stops_all_downstream_observation(self, get):
+        get.return_value = FakeResponse({"Items": []})
+        snapshot = self._service().observe("episode-gone", include_media=True)
+        self.assertEqual("historical_item_missing", snapshot["summary_status"])
+        self.assertEqual(
+            "historical_item_missing", snapshot["emby_index_status"]["status"]
+        )
+        for layer in ("strm_status", "shenyi_persist_status", "emby_media_status"):
+            self.assertEqual("not_observable", snapshot[layer]["status"])
+        self.assertEqual("remove_review_record", snapshot["suggested_action"])
+        self.assertEqual(1, get.call_count)
+
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_temporary_lookup_failure_is_not_historical(self, get):
+        get.side_effect = RuntimeError("temporary Emby outage")
+        snapshot = self._service().observe("episode-1", include_media=True)
+        self.assertEqual("emby_lookup_failed", snapshot["summary_status"])
+        self.assertEqual("lookup_failed", snapshot["emby_index_status"]["status"])
+        self.assertNotEqual(
+            "identity_mismatch", snapshot["shenyi_persist_status"]["status"]
+        )
 
     def _json_path(self):
         _drive, absolute_tail = os.path.splitdrive(os.path.normpath(self.item_path))

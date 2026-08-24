@@ -30,30 +30,24 @@
           <n-icon :component="SearchIcon" @click="handleSearch" style="cursor: pointer;" />
         </template>
       </n-input>
-      <n-popconfirm
-          @positive-click="clearAllReviewItems"
-          :positive-button-props="{ type: 'error' }"
+        <n-button
+          type="success"
+          ghost
+          :loading="cleanupLoading.ready"
+          :disabled="isShowingSearchResults || totalItems === 0 || cleanupLoading.ready || globalRecheck.running"
+          @click="prepareReviewCleanup('ready')"
         >
-          <template #trigger>
-            <n-button type="error" ghost :disabled="tableData.length === 0 || loading || isShowingSearchResults">
-              <template #icon><n-icon :component="TrashIcon" /></template>
-              清空所有待复核项
-            </n-button>
-          </template>
-          确定要清空所有 {{ totalItems }} 条待复核记录吗？此操作不可恢复。
-        </n-popconfirm>
-        <n-popconfirm
-            @positive-click="reprocessAllReviewItems"
+          清理已恢复记录
+        </n-button>
+        <n-button
+          type="warning"
+          ghost
+          :loading="cleanupLoading.historical_item_missing"
+          :disabled="isShowingSearchResults || totalItems === 0 || cleanupLoading.historical_item_missing || globalRecheck.running"
+          @click="prepareReviewCleanup('historical_item_missing')"
         >
-            <template #trigger>
-                <!-- ✅ [修正] Access prop via `props.taskStatus` -->
-                <n-button type="warning" ghost :disabled="tableData.length === 0 || loading || props.taskStatus?.is_running || isShowingSearchResults">
-                    <template #icon><n-icon :component="ReprocessIcon" /></template>
-                    重新处理所有
-                </n-button>
-            </template>
-            确定要重新处理所有 {{ totalItems }} 条待复核记录吗？
-        </n-popconfirm>
+          清理失效历史记录
+        </n-button>
         <n-button
           type="info"
           ghost
@@ -140,10 +134,10 @@ import { ref, onMounted, onBeforeUnmount, computed, h } from 'vue';
 import axios from 'axios';
 import {
     NCard, NSpin, NAlert, NText, NDataTable, NButton, NSpace, NPopconfirm, NEmpty, NInput, NIcon,
-    NTag, useMessage
+    NTag, useDialog, useMessage
 } from 'naive-ui';
 import { HeartOutline as AddToWatchlistIcon } from '@vicons/ionicons5';
-import { SearchOutline as SearchIcon, PlayForwardOutline as ReprocessIcon, CheckmarkCircleOutline as MarkDoneIcon, TrashOutline as TrashIcon } from '@vicons/ionicons5';
+import { SearchOutline as SearchIcon, PlayForwardOutline as ReprocessIcon, CheckmarkCircleOutline as MarkDoneIcon } from '@vicons/ionicons5';
 
 import { useConfig } from '../composables/useConfig';
 import { createLatestRequestGate } from '../utils/latestRequestGate';
@@ -160,6 +154,7 @@ const props = defineProps({
 });
 
 const router = useRouter();
+const dialog = useDialog();
 const message = useMessage();
 const { configModel } = useConfig();
 
@@ -176,6 +171,7 @@ const isShowingSearchResults = ref(false);
 const checkedRowKeys = ref([]);
 const mediaInfoStatuses = ref({});
 const batchRepairLoading = ref(false);
+const cleanupLoading = ref({ ready: false, historical_item_missing: false });
 const globalRecheck = ref({
   running: false,
   total: 0,
@@ -211,11 +207,12 @@ const mediaStatusLabels = {
   path_mismatch: '路径不匹配',
   duplicate_match: '重复匹配',
   lookup_failed: '查询失败',
+  historical_item_missing: '项目已不存在',
   present_valid: '神医持久化有效',
   present_invalid: '神医持久化无效',
   present_unreadable: '持久化不可读',
   not_configured: '持久化未配置',
-  not_observable: '持久化不可观察',
+  not_observable: '不可核对',
   identity_mismatch: '持久化身份不符',
   ready: '媒体流就绪',
   partial: '媒体流部分就绪',
@@ -228,7 +225,7 @@ const mediaStatusLabels = {
 
 const statusTagType = (status) => {
   if (['present', 'indexed', 'present_valid', 'ready'].includes(status)) return 'success';
-  if (['unknown', 'not_configured', 'not_observable'].includes(status)) return 'default';
+  if (['unknown', 'not_configured', 'not_observable', 'historical_item_missing'].includes(status)) return 'default';
   if (['partial', 'media_streams_empty', 'video_stream_missing'].includes(status)) return 'warning';
   return 'error';
 };
@@ -238,6 +235,34 @@ const statusTag = (label, layer) => h(
   { size: 'small', type: statusTagType(layer?.status), bordered: false },
   { default: () => `${label}: ${mediaStatusLabels[layer?.status] || layer?.status || '未知'}` }
 );
+
+const historicalReviewStatus = {
+  strm_status: { status: 'not_observable' },
+  emby_index_status: { status: 'historical_item_missing' },
+  shenyi_persist_status: { status: 'not_observable' },
+  emby_media_status: { status: 'not_observable' },
+  summary_status: 'historical_item_missing',
+  repair_eligible: false,
+};
+
+const rowMediaStatus = (row) => {
+  const current = mediaInfoStatuses.value[row?.item_id];
+  if (current) return current;
+  if (row?.media_info_target?.target_reason_code === 'historical_item_missing') {
+    return historicalReviewStatus;
+  }
+  return null;
+};
+
+const rowIsHistorical = (row) => rowMediaStatus(row)?.summary_status === 'historical_item_missing';
+
+const summaryStatusLabel = (status) => ({
+  ready: '已恢复',
+  historical_item_missing: 'Item 已不存在',
+  emby_lookup_failed: 'Emby 查询失败',
+  media_info_incomplete: '当前仍缺失媒体信息',
+  media_info_read_failed: '媒体流读取失败',
+}[status] || status || '当前状态未知');
 
 // ... other functions like addToWatchlist, formatDate, etc. remain unchanged ...
 const addToWatchlist = async (rowData) => {
@@ -279,22 +304,8 @@ const formatDate = (timestamp) => {
   }
 };
 
-const clearAllReviewItems = async () => {
-  loading.value = true;
-  try {
-    const response = await axios.post('/api/actions/clear_review_items');
-    message.success(response.data.message);
-    await fetchReviewItems(); 
-  } catch (err) {
-    console.error("清空待复核列表失败:", err);
-    message.error(`操作失败: ${err.response?.data?.error || err.message}`);
-  } finally {
-    loading.value = false;
-  }
-};
-
 const goToEditPage = (row) => {
-  if (row && row.item_id) {
+  if (row && row.item_id && !rowIsHistorical(row)) {
     router.push({ name: 'MediaEditPage', params: { itemId: row.item_id } });
   } else {
     message.error("无效的媒体项，无法跳转到编辑页面！");
@@ -317,12 +328,51 @@ const handleMarkAsProcessed = async (row) => {
   }
 };
 
+const prepareReviewCleanup = async (category) => {
+  if (cleanupLoading.value[category]) return;
+  cleanupLoading.value = { ...cleanupLoading.value, [category]: true };
+  try {
+    const preview = await axios.post('/api/media-info/review-cleanup/preview', { category });
+    const count = Number(preview.data.candidate_count || 0);
+    if (count === 0) {
+      message.info(category === 'ready' ? '当前没有可清理的已恢复记录。' : '当前没有可清理的失效历史记录。');
+      return;
+    }
+    const title = category === 'ready' ? '清理已恢复记录' : '清理失效历史记录';
+    const description = category === 'ready'
+      ? `准备移出 ${count} 条当前已恢复记录；其他异常记录不会处理。`
+      : `准备移出 ${count} 条已确认 Item 不存在的历史记录；查询失败或临时不可用记录不会处理。`;
+    dialog.warning({
+      title,
+      content: description,
+      positiveText: '确认移出',
+      negativeText: '取消',
+      onPositiveClick: async () => {
+        cleanupLoading.value = { ...cleanupLoading.value, [category]: true };
+        try {
+          const response = await axios.post('/api/media-info/review-cleanup/execute', { category });
+          message.success(`已移出 ${response.data.removed_count} 条记录；其他异常记录未处理。`);
+          await fetchReviewItems();
+        } catch (err) {
+          message.error(err.response?.data?.error || '批量清理失败。');
+        } finally {
+          cleanupLoading.value = { ...cleanupLoading.value, [category]: false };
+        }
+      },
+    });
+  } catch (err) {
+    message.error(err.response?.data?.error || '重新核验待复核记录失败。');
+  } finally {
+    cleanupLoading.value = { ...cleanupLoading.value, [category]: false };
+  }
+};
+
 
 const columns = computed(() => [
   {
     type: 'selection',
     disabled(row) {
-      return !rowTargetId(row);
+      return !rowTargetId(row) || rowIsHistorical(row);
     }
   },
   {
@@ -362,8 +412,7 @@ const columns = computed(() => [
     resizable: true,
     render(row) { return isShowingSearchResults.value ? 'N/A' : formatDate(row.failed_at); }
   },
-  // ✅【关键修复】将 key 从 'error_message' 改为 'reason'
-  { title: '原因', key: 'reason', resizable: true, ellipsis: { tooltip: true } },
+  { title: '历史原因', key: 'reason', resizable: true, ellipsis: { tooltip: true } },
   {
     title: '评分',
     key: 'score',
@@ -378,7 +427,7 @@ const columns = computed(() => [
     key: 'media_info_status',
     width: 260,
     render(row) {
-      const status = mediaInfoStatuses.value[row.item_id];
+      const status = rowMediaStatus(row);
       if (!status) {
         const reason = row.media_info_target?.target_reason_code;
         return h(NText, { depth: 3 }, { default: () => reason ? `目标不可确定: ${reason}` : '尚未读取' });
@@ -390,7 +439,7 @@ const columns = computed(() => [
           statusTag('神医', status.shenyi_persist_status),
           statusTag('媒体流', status.emby_media_status),
           h(NText, { depth: 3, style: 'font-size: 0.78em;' }, {
-            default: () => `总结: ${status.summary_status || 'unknown'}`
+            default: () => `当前状态: ${summaryStatusLabel(status.summary_status)}`
           }),
           status.active_job ? h(NText, { depth: 3, style: 'font-size: 0.78em;' }, {
             default: () => `任务: ${status.active_job.state}${status.active_job.reason_code ? ` / ${status.active_job.reason_code}` : ''}`
@@ -410,8 +459,27 @@ const columns = computed(() => [
     fixed: 'right',
     render(row) {
       const actionButtons = [];
-      
-      // ✅ [修改] 将“重新处理”按钮移出条件判断，使其在搜索结果中也显示
+      const mediaStatus = rowMediaStatus(row);
+      const historical = rowIsHistorical(row);
+
+      if (historical) {
+        if (!isShowingSearchResults.value) {
+          actionButtons.push(
+            h(NPopconfirm, { onPositiveClick: () => handleMarkAsProcessed(row) }, {
+              trigger: () => h(NButton, {
+                size: 'small',
+                type: 'success',
+                ghost: true,
+                loading: loadingAction.value[row.item_id] && currentRowId.value === row.item_id,
+                disabled: loadingAction.value[row.item_id] || props.taskStatus?.is_running
+              }, { default: () => '移出记录' }),
+              default: () => `确定要将失效历史记录 "${row.item_name}" 移出列表吗？`
+            })
+          );
+        }
+        return h(NSpace, { justify: 'center' }, { default: () => actionButtons });
+      }
+
       actionButtons.push(
         h(NButton, {
           size: 'small',
@@ -423,7 +491,6 @@ const columns = computed(() => [
         }, { default: () => '重新核对' })
       );
 
-      const mediaStatus = mediaInfoStatuses.value[row.item_id];
       actionButtons.push(
         h(NPopconfirm, { onPositiveClick: () => repairMediaInfo(row) }, {
           trigger: () => h(NButton, {
@@ -457,7 +524,7 @@ const columns = computed(() => [
                 type: 'warning',
                 ghost: true,
                 loading: loadingAction.value[row.item_id] && currentRowId.value === row.item_id,
-                disabled: loadingAction.value[row.item_id] || props.taskStatus?.is_running
+                disabled: !rowTargetId(row) || loadingAction.value[row.item_id] || props.taskStatus?.is_running
             }, {
                 icon: () => h(NIcon, { component: ReprocessIcon }),
                 default: () => '重新处理'
@@ -486,6 +553,7 @@ const columns = computed(() => [
               disabled: loadingAction.value[row.item_id] || props.taskStatus?.is_running
             }, {
               icon: () => h(NIcon, { component: MarkDoneIcon }),
+              default: () => mediaStatus?.summary_status === 'ready' ? '移出列表' : '移出记录',
             }),
             default: () => `确定要将 "${row.item_name}" 标记为已处理吗？`
           })
@@ -609,17 +677,6 @@ const handleReprocessItem = async (row) => {
   } finally {
     loadingAction.value[row.item_id] = false;
     currentRowId.value = null;
-  }
-};
-
-const reprocessAllReviewItems = async () => {
-  try {
-    const response = await axios.post('/api/actions/reprocess_all_review_items');
-    message.success(response.data.message || '重新处理所有待复核项的任务已成功提交！');
-  } catch (err)
- {
-    console.error("提交重新处理所有任务失败:", err);
-    message.error(`操作失败: ${err.response?.data?.error || err.message}`);
   }
 };
 

@@ -14,7 +14,7 @@ import re
 import stat
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import config_manager
 import constants
@@ -32,6 +32,9 @@ CONFIRMED_INCOMPLETE_MEDIA_STATES = {
     "video_stream_missing",
     "partial",
 }
+EPISODE_QUERY_PAGE_SIZE = 100
+MAX_EPISODE_QUERY_PAGES = 100
+MAX_EPISODE_QUERY_RESULTS = EPISODE_QUERY_PAGE_SIZE * MAX_EPISODE_QUERY_PAGES
 logger = logging.getLogger(__name__)
 
 _VOLATILE_FINGERPRINT_KEYS = {
@@ -276,7 +279,7 @@ class MediaInfoStateService:
             ]
             if not exact_items:
                 return _observation(
-                    "not_indexed",
+                    "historical_item_missing",
                     "emby_item_not_found",
                     {"candidate_count": 0},
                 ), None
@@ -417,51 +420,143 @@ class MediaInfoStateService:
             return result
         season_number, episode_number = next(iter(coordinates))
 
-        base_url, api_key, _ = self._emby_config()
+        base_url, api_key, user_id = self._emby_config()
         if not base_url or not api_key:
             result["target_reason_code"] = "emby_lookup_failed"
             return result
+
+        fields = (
+            "Id,Name,Type,Path,ParentId,SeriesId,"
+            "ParentIndexNumber,IndexNumber"
+        )
         try:
-            response = emby.emby_client.get(
+            source_response = emby.emby_client.get(
                 f"{base_url}/Items",
                 params={
-                    "SeriesId": source_id,
-                    "IncludeItemTypes": "Episode",
-                    "Recursive": "true",
-                    # Emby 4.9 accepts these coordinate parameters but does not
-                    # apply them on the global /Items route.  Read one bounded
-                    # Series page and enforce the coordinate locally instead.
-                    "Limit": 500,
-                    "Fields": (
-                        "Id,Name,Type,Path,ParentId,SeriesId,"
-                        "ParentIndexNumber,IndexNumber"
-                    ),
+                    "Ids": source_id,
+                    "Limit": 2,
+                    "Fields": "Id,Type",
                 },
                 headers={"X-Emby-Token": api_key},
             )
-            response.raise_for_status()
-            payload = response.json()
-            items = payload.get("Items") if isinstance(payload, dict) else None
-            if not isinstance(items, list):
-                raise ValueError("invalid Emby episode response")
-            total = payload.get("TotalRecordCount", len(items))
-            if not isinstance(total, int) or total > len(items):
-                result["target_reason_code"] = "episode_target_query_truncated"
+            source_response.raise_for_status()
+            source_payload = source_response.json()
+            source_items = (
+                source_payload.get("Items")
+                if isinstance(source_payload, dict)
+                else None
+            )
+            if not isinstance(source_items, list):
+                raise ValueError("invalid Emby Series identity response")
+            exact_sources = [
+                item
+                for item in source_items
+                if isinstance(item, dict)
+                and str(item.get("Id") or "").strip() == source_id
+            ]
+            if not exact_sources:
+                result["target_reason_code"] = "historical_item_missing"
+                return result
+            if len(exact_sources) != 1:
+                result["target_reason_code"] = "episode_target_source_ambiguous"
+                return result
+            if str(exact_sources[0].get("Type") or "") != "Series":
+                result["target_reason_code"] = "episode_target_source_type_mismatch"
                 return result
         except Exception:
             result["target_reason_code"] = "emby_lookup_failed"
             return result
 
-        exact = [
-            item
-            for item in items
-            if isinstance(item, dict)
-            and str(item.get("Id") or "").strip()
-            and str(item.get("Type") or "") == "Episode"
-            and str(item.get("SeriesId") or "").strip() == source_id
-            and item.get("ParentIndexNumber") == season_number
-            and item.get("IndexNumber") == episode_number
-        ]
+        exact: list[Dict[str, Any]] = []
+        seen_item_ids: set[str] = set()
+        start_index = 0
+        expected_total: Optional[int] = None
+        for _page_number in range(MAX_EPISODE_QUERY_PAGES):
+            params: Dict[str, Any] = {
+                "StartIndex": start_index,
+                "Limit": EPISODE_QUERY_PAGE_SIZE,
+                "Season": season_number,
+                "Fields": fields,
+                "EnableTotalRecordCount": "true",
+                "SortBy": "ParentIndexNumber,IndexNumber,SortName",
+                "SortOrder": "Ascending",
+            }
+            if user_id:
+                params["UserId"] = user_id
+            try:
+                response = emby.emby_client.get(
+                    f"{base_url}/Shows/{quote(source_id, safe='')}/Episodes",
+                    params=params,
+                    headers={"X-Emby-Token": api_key},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                items = payload.get("Items") if isinstance(payload, dict) else None
+                total = (
+                    payload.get("TotalRecordCount")
+                    if isinstance(payload, dict)
+                    else None
+                )
+                if (
+                    not isinstance(items, list)
+                    or isinstance(total, bool)
+                    or not isinstance(total, int)
+                    or total < 0
+                    or len(items) > EPISODE_QUERY_PAGE_SIZE
+                ):
+                    raise ValueError("invalid Emby Episode page")
+            except Exception:
+                result["target_reason_code"] = "emby_lookup_failed"
+                return result
+
+            if expected_total is None:
+                expected_total = total
+                if expected_total > MAX_EPISODE_QUERY_RESULTS:
+                    result["target_reason_code"] = "episode_target_query_too_large"
+                    return result
+            elif total != expected_total:
+                result["target_reason_code"] = "episode_target_query_unstable"
+                return result
+
+            if not items and start_index < expected_total:
+                result["target_reason_code"] = "episode_target_query_unstable"
+                return result
+
+            for item in items:
+                if not isinstance(item, dict):
+                    result["target_reason_code"] = "episode_target_query_unstable"
+                    return result
+                candidate_id = str(item.get("Id") or "").strip()
+                if (
+                    not candidate_id
+                    or str(item.get("Type") or "") != "Episode"
+                    or str(item.get("SeriesId") or "").strip() != source_id
+                ):
+                    result["target_reason_code"] = "episode_target_series_mismatch"
+                    return result
+                if candidate_id in seen_item_ids:
+                    result["target_reason_code"] = "episode_target_query_unstable"
+                    return result
+                seen_item_ids.add(candidate_id)
+                if (
+                    item.get("ParentIndexNumber") == season_number
+                    and item.get("IndexNumber") == episode_number
+                ):
+                    exact.append(item)
+                    if len(exact) > 1:
+                        result["target_reason_code"] = "episode_target_ambiguous"
+                        return result
+
+            start_index += len(items)
+            if start_index >= expected_total:
+                break
+        else:
+            result["target_reason_code"] = "episode_target_query_too_large"
+            return result
+
+        if start_index != expected_total:
+            result["target_reason_code"] = "episode_target_query_unstable"
+            return result
         if len(exact) != 1:
             result["target_reason_code"] = (
                 "episode_target_not_found" if not exact else "episode_target_ambiguous"
@@ -851,6 +946,43 @@ class MediaInfoStateService:
             raise ValueError("exact item ID is required")
 
         emby_index, item = self._read_exact_catalog_item(normalized_item_id)
+        if item is None and emby_index.get("status") in {
+            "historical_item_missing",
+            "lookup_failed",
+            "duplicate_match",
+        }:
+            upstream_status = str(emby_index.get("status") or "lookup_failed")
+            unavailable_reason = (
+                "historical_item_missing"
+                if upstream_status == "historical_item_missing"
+                else "emby_lookup_failed"
+            )
+            unavailable = _observation(
+                "not_observable",
+                unavailable_reason,
+                {"upstream": "emby_exact_item"},
+            )
+            snapshot = {
+                "identity": {
+                    "exact_item_id": normalized_item_id,
+                    "item_type": "Unknown",
+                    "root_series_key": normalized_item_id,
+                    "exact_strm_path_hash": _path_hash(normalized_item_id),
+                    "redacted_path_hint": "unmapped",
+                    "season_number": None,
+                    "episode_number": None,
+                },
+                "strm_status": dict(unavailable),
+                "emby_index_status": emby_index,
+                "shenyi_persist_status": dict(unavailable),
+                "emby_media_status": dict(unavailable),
+                "last_checked_at": _utc_now(),
+            }
+            snapshot["summary_status"] = self.derive_summary(snapshot)
+            snapshot["suggested_action"] = self.suggest_action(snapshot)
+            snapshot["snapshot_fingerprint"] = _semantic_fingerprint(snapshot)
+            return snapshot
+
         item_path = str((item or {}).get("Path") or "").strip()
         item_type = str((item or {}).get("Type") or "Unknown")
         root_series_key = (
@@ -909,13 +1041,17 @@ class MediaInfoStateService:
 
     @staticmethod
     def derive_summary(snapshot: Dict[str, Any]) -> str:
+        index_status = (snapshot.get("emby_index_status") or {}).get("status")
+        if index_status == "historical_item_missing":
+            return "historical_item_missing"
+        if index_status == "lookup_failed":
+            return "emby_lookup_failed"
         media = (snapshot.get("emby_media_status") or {}).get("status")
         if media == "ready":
             return "ready"
         strm_status = (snapshot.get("strm_status") or {}).get("status")
         if strm_status != "present":
             return f"strm_{strm_status or 'unknown'}"
-        index_status = (snapshot.get("emby_index_status") or {}).get("status")
         if index_status != "indexed":
             return f"emby_{index_status or 'unknown'}"
         if media in {
@@ -934,6 +1070,10 @@ class MediaInfoStateService:
         summary = MediaInfoStateService.derive_summary(snapshot)
         if summary == "ready":
             return "none"
+        if summary == "historical_item_missing":
+            return "remove_review_record"
+        if summary == "emby_lookup_failed":
+            return "manual_recheck"
         if summary == "emby_not_indexed":
             return "use_precise_strm_ingest"
         if summary.startswith("strm_"):

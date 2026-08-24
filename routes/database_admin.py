@@ -352,22 +352,14 @@ def api_mark_item_processed(item_id):
     except Exception as e:
         return jsonify({"error": "服务器内部错误"}), 500
 
-# ✨✨✨ 清空待复核列表 ✨✨✨
+# 旧版无条件清空入口保留为 fail-closed 兼容响应。
 @db_admin_bp.route('/actions/clear_review_items', methods=['POST'])
 @admin_required
 def api_clear_review_items():
-    try:
-        count = log_db.clear_all_review_items()
-
-        if count > 0:
-            message = f"操作成功！已从待复核列表移除 {count} 个项目。"
-        else:
-            message = "操作完成，待复核列表本就是空的。"
-            
-        return jsonify({"message": message}), 200
-    except Exception as e:
-        logger.error("API调用api_clear_review_items时发生错误", exc_info=True)
-        return jsonify({"error": "服务器在处理时发生内部错误"}), 500
+    return jsonify({
+        "error": "无条件清空待复核列表已禁用，请使用重新核验后的分类清理。",
+        "reason_code": "unsafe_bulk_clear_disabled",
+    }), 409
 
 # --- 清空指定表列表的接口 ---
 @db_admin_bp.route('/actions/clear_tables', methods=['POST'])

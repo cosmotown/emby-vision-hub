@@ -8,6 +8,7 @@ from extensions import admin_required
 from database import log_db
 from services.mediainfo_repair_queue import get_media_info_coordinator
 from services.mediainfo_state import MediaInfoStateService
+from services.review_cleanup import ReviewCleanupService
 
 
 media_info_bp = Blueprint("media_info", __name__, url_prefix="/api/media-info")
@@ -15,6 +16,10 @@ media_info_bp = Blueprint("media_info", __name__, url_prefix="/api/media-info")
 
 def _coordinator():
     return get_media_info_coordinator()
+
+
+def _cleanup_service():
+    return ReviewCleanupService()
 
 
 @media_info_bp.route("/review-targets", methods=["GET"])
@@ -124,6 +129,41 @@ def repair_batch():
     except Exception:
         return jsonify(
             {"error": "批量任务提交失败", "reason_code": "unknown_failure"}
+        ), 503
+
+
+def _cleanup_category_from_request():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        raise ValueError("请求正文必须是 JSON 对象")
+    return payload.get("category")
+
+
+@media_info_bp.route("/review-cleanup/preview", methods=["POST"])
+@admin_required
+def preview_review_cleanup():
+    try:
+        result = _cleanup_service().preview(_cleanup_category_from_request())
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify({"error": str(exc), "reason_code": "invalid_cleanup_category"}), 400
+    except Exception:
+        return jsonify(
+            {"error": "重新核验待复核记录失败", "reason_code": "emby_lookup_failed"}
+        ), 503
+
+
+@media_info_bp.route("/review-cleanup/execute", methods=["POST"])
+@admin_required
+def execute_review_cleanup():
+    try:
+        result = _cleanup_service().execute(_cleanup_category_from_request())
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify({"error": str(exc), "reason_code": "invalid_cleanup_category"}), 400
+    except Exception:
+        return jsonify(
+            {"error": "清理待复核记录失败", "reason_code": "emby_lookup_failed"}
         ), 503
 
 

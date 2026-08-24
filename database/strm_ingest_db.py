@@ -941,17 +941,42 @@ def record_inventory_audit_batch(
                     ) VALUES %s
                     ON CONFLICT (root_path, directory_path) DO UPDATE
                     SET parent_path = EXCLUDED.parent_path, active = TRUE,
-                        dirty = strm_ingest_inventory_directories.dirty
-                                OR NOT strm_ingest_inventory_directories.active,
+                        dirty = CASE
+                            WHEN NOT strm_ingest_inventory_directories.active THEN TRUE
+                            WHEN EXCLUDED.manual_audit_id IS NOT NULL
+                                 AND strm_ingest_inventory_directories.manual_audit_id
+                                     = EXCLUDED.manual_audit_id
+                                THEN TRUE
+                            ELSE strm_ingest_inventory_directories.dirty
+                        END,
+                        dirty_since = CASE
+                            WHEN NOT strm_ingest_inventory_directories.active
+                                 OR (
+                                     EXCLUDED.manual_audit_id IS NOT NULL
+                                     AND strm_ingest_inventory_directories.manual_audit_id
+                                         = EXCLUDED.manual_audit_id
+                                 )
+                                THEN COALESCE(
+                                    strm_ingest_inventory_directories.dirty_since,
+                                    NOW()
+                                )
+                            ELSE strm_ingest_inventory_directories.dirty_since
+                        END,
                         next_audit_at = CASE
-                            WHEN NOT strm_ingest_inventory_directories.active THEN NOW()
+                            WHEN NOT strm_ingest_inventory_directories.active
+                                 OR (
+                                     EXCLUDED.manual_audit_id IS NOT NULL
+                                     AND strm_ingest_inventory_directories.manual_audit_id
+                                         = EXCLUDED.manual_audit_id
+                                 ) THEN NOW()
                             ELSE strm_ingest_inventory_directories.next_audit_at
                         END,
                         seen_generation = EXCLUDED.seen_generation,
-                        manual_audit_id = COALESCE(
-                            EXCLUDED.manual_audit_id,
-                            strm_ingest_inventory_directories.manual_audit_id
-                        ),
+                        manual_audit_id = CASE
+                            WHEN NOT strm_ingest_inventory_directories.active
+                                THEN EXCLUDED.manual_audit_id
+                            ELSE strm_ingest_inventory_directories.manual_audit_id
+                        END,
                         updated_at = NOW()
                     """,
                     child_rows[offset : offset + safe_batch_size],
@@ -988,6 +1013,7 @@ def record_inventory_audit_batch(
                     (root, directory, generation),
                 )
                 missing_children = [row['directory_path'] for row in cursor.fetchall()]
+                manual_terminalized = 0
                 for child in missing_children:
                     child_like = child.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '/%'
                     cursor.execute(
@@ -1002,15 +1028,38 @@ def record_inventory_audit_batch(
                         (root, child, child_like),
                     )
                     removed.extend(row['file_path'] for row in cursor.fetchall())
+                    if manual_audit_id:
+                        cursor.execute(
+                            """
+                            SELECT COUNT(*) AS count
+                            FROM strm_ingest_inventory_directories
+                            WHERE root_path = %s
+                              AND active = TRUE
+                              AND manual_audit_id = %s
+                              AND (
+                                  directory_path = %s
+                                  OR directory_path LIKE %s ESCAPE '\\'
+                              )
+                            """,
+                            (root, manual_audit_id, child, child_like),
+                        )
+                        manual_terminalized += int(
+                            (cursor.fetchone() or {}).get('count') or 0
+                        )
                     cursor.execute(
                         """
                         UPDATE strm_ingest_inventory_directories
                         SET active = FALSE, dirty = FALSE, claim_owner = NULL,
-                            claim_expires_at = NULL, updated_at = NOW()
+                            claim_expires_at = NULL,
+                            manual_audit_id = CASE
+                                WHEN manual_audit_id = %s THEN NULL
+                                ELSE manual_audit_id
+                            END,
+                            last_error = NULL, updated_at = NOW()
                         WHERE root_path = %s
                           AND (directory_path = %s OR directory_path LIKE %s ESCAPE '\\')
                         """,
-                        (root, child, child_like),
+                        (manual_audit_id, root, child, child_like),
                     )
                 removed = sorted(set(removed))
                 if removed:
@@ -1050,8 +1099,8 @@ def record_inventory_audit_batch(
                         UPDATE strm_ingest_inventory_manual_audits
                         SET state = 'running',
                             started_at = COALESCE(started_at, NOW()),
-                            completed_directories = completed_directories + 1,
-                            total_directories = completed_directories + 1 + (
+                            completed_directories = completed_directories + 1 + %s,
+                            total_directories = completed_directories + 1 + %s + (
                                 SELECT COUNT(*)
                                 FROM strm_ingest_inventory_directories
                                 WHERE active = TRUE AND manual_audit_id = %s
@@ -1059,7 +1108,12 @@ def record_inventory_audit_batch(
                             updated_at = NOW()
                         WHERE audit_id = %s AND state IN ('queued', 'running')
                         """,
-                        (manual_audit_id, manual_audit_id),
+                        (
+                            manual_terminalized,
+                            manual_terminalized,
+                            manual_audit_id,
+                            manual_audit_id,
+                        ),
                     )
             else:
                 cursor.execute(
@@ -1234,6 +1288,30 @@ def get_manual_inventory_audit(audit_id: str) -> Optional[Dict[str, object]]:
             audit = cursor.fetchone()
             if not audit:
                 return None
+            if str(audit.get('state') or '') in {'queued', 'running'}:
+                # v7.2.13 could persist active generation ownership on a clean
+                # row. Such a row was counted as pending but could never be
+                # claimed. Repair the invalid state itself instead of hiding it
+                # in progress SQL: every active generation row is claimable.
+                cursor.execute(
+                    """
+                    UPDATE strm_ingest_inventory_directories
+                    SET dirty = TRUE,
+                        dirty_since = COALESCE(dirty_since, NOW()),
+                        next_audit_at = NOW(),
+                        claim_owner = NULL,
+                        claim_expires_at = NULL,
+                        last_error = COALESCE(
+                            last_error,
+                            'manual generation pending ownership repaired'
+                        ),
+                        updated_at = NOW()
+                    WHERE manual_audit_id = %s
+                      AND active = TRUE
+                      AND dirty = FALSE
+                    """,
+                    (safe_id,),
+                )
             cursor.execute(
                 """
                 SELECT

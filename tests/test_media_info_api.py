@@ -66,6 +66,29 @@ class FakeCoordinator:
         return {"id": job_id, "state": "cancelled"}
 
 
+class FakeCleanupService:
+    def __init__(self):
+        self.calls = []
+
+    def preview(self, category):
+        self.calls.append(("preview", category))
+        if category not in {"ready", "historical_item_missing"}:
+            raise ValueError("unsupported review cleanup category")
+        return {"category": category, "scanned": 5, "candidate_count": 2}
+
+    def execute(self, category):
+        self.calls.append(("execute", category))
+        if category not in {"ready", "historical_item_missing"}:
+            raise ValueError("unsupported review cleanup category")
+        return {
+            "category": category,
+            "scanned": 5,
+            "candidate_count": 2,
+            "removed_count": 2,
+            "skipped_count": 3,
+        }
+
+
 class MediaInfoApiTests(unittest.TestCase):
     def setUp(self):
         self.app = Flask(__name__)
@@ -73,6 +96,7 @@ class MediaInfoApiTests(unittest.TestCase):
         self.app.register_blueprint(media_info_bp)
         self.client = self.app.test_client()
         self.coordinator = FakeCoordinator()
+        self.cleanup_service = FakeCleanupService()
         self.old_config = dict(config_manager.APP_CONFIG)
         config_manager.APP_CONFIG.clear()
         config_manager.APP_CONFIG["auth_enabled"] = False
@@ -81,8 +105,14 @@ class MediaInfoApiTests(unittest.TestCase):
             return_value=self.coordinator,
         )
         self.patch.start()
+        self.cleanup_patch = mock.patch(
+            "routes.media_info.ReviewCleanupService",
+            return_value=self.cleanup_service,
+        )
+        self.cleanup_patch.start()
 
     def tearDown(self):
+        self.cleanup_patch.stop()
         self.patch.stop()
         config_manager.APP_CONFIG.clear()
         config_manager.APP_CONFIG.update(self.old_config)
@@ -154,6 +184,35 @@ class MediaInfoApiTests(unittest.TestCase):
         self.assertNotIn("https://", body)
         self.assertNotIn("/STRM/", body)
         self.assertIn("E01.strm", body)
+
+    def test_review_cleanup_preview_and_execute_are_explicit_categories(self):
+        preview = self.client.post(
+            "/api/media-info/review-cleanup/preview",
+            json={"category": "ready"},
+        )
+        execute = self.client.post(
+            "/api/media-info/review-cleanup/execute",
+            json={"category": "historical_item_missing"},
+        )
+        self.assertEqual(200, preview.status_code)
+        self.assertEqual(2, preview.get_json()["candidate_count"])
+        self.assertEqual(200, execute.status_code)
+        self.assertEqual(2, execute.get_json()["removed_count"])
+        self.assertEqual(
+            [
+                ("preview", "ready"),
+                ("execute", "historical_item_missing"),
+            ],
+            self.cleanup_service.calls,
+        )
+
+    def test_review_cleanup_rejects_lookup_failed_category(self):
+        response = self.client.post(
+            "/api/media-info/review-cleanup/execute",
+            json={"category": "lookup_failed"},
+        )
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("invalid_cleanup_category", response.get_json()["reason_code"])
 
     @mock.patch("routes.media_info.MediaInfoStateService.resolve_review_target")
     @mock.patch("routes.media_info.log_db.get_review_items_paginated")

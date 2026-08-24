@@ -1,12 +1,12 @@
 {
   "name": "emby-actor-ui",
   "private": true,
-  "version": "7.2.13",
+  "version": "7.2.14",
   "type": "module",
   "scripts": {
     "dev": "vite --force",
     "build": "vite build",
-    "test:mediainfo": "node --test tests/latestRequestGate.test.mjs tests/boundedMediaInfoRecheck.test.mjs tests/v7213IntegrationContracts.test.mjs",
+    "test:mediainfo": "node --test tests/latestRequestGate.test.mjs tests/boundedMediaInfoRecheck.test.mjs tests/v7213IntegrationContracts.test.mjs tests/v7214ReviewCleanupContracts.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -11,10 +11,17 @@ CUSTOM_RELEASES = [
 - “重新处理”继续调用现有 `/api/actions/reprocess_item/{source_item_id}`，不依赖或猜测 MediaInfo Episode target。
 - MediaInfo“重新核对”和“神医修复”仍要求已解析的精确目标；`historical_item_missing` 仍只允许安全移出记录。
 
+## STRM Inventory orphan 后代收敛修复
+
+- 修复人工“STRM 查漏”中旧父目录行已 inactive 或不存在、但深层后代仍 active 时永久停在 `inaccessible` 的问题。
+- 直接 `ENOENT` 仍不作为删除证明；仅在最近安全祖先完成一次完整 `scandir`，且目标 first-hop 分支明确不在快照中时，才终结该分支及其持久后代。
+- first-hop 仍存在、祖先不可访问、挂载异常、权限或 I/O 错误、symlink、并发 event version 变化时继续失败关闭，不推断删除。
+- 当前 generation 的 orphan 后代可在同一次人工任务内收敛，不再依赖 300 秒无限重试；删除仍进入现有 STRM 安全 delete/readback 链。
+
 ### 明确不包含
 
 - 不修改后端重新处理语义、MediaInfo resolver、历史清理或神医逻辑。
-- 不修改 STRM Inventory，不实现 Fast Audit，也不改变自动 Inventory 扫描行为。
+- 不实现 Fast Audit，不引入 `os.walk`、递归 watcher、目录并发或自动 Inventory 扫描。
 
 """,
     },

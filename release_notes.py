@@ -2,6 +2,24 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.16",
+        "published_at": "2026-08-25T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.16",
+        "changelog": """## ReviewList 普通历史记录重新处理修复
+
+- 普通历史 Series 即使没有 MediaInfo Episode 坐标，也可按原始 source ItemID 使用“重新处理”。
+- “重新处理”继续调用现有 `/api/actions/reprocess_item/{source_item_id}`，不依赖或猜测 MediaInfo Episode target。
+- MediaInfo“重新核对”和“神医修复”仍要求已解析的精确目标；`historical_item_missing` 仍只允许安全移出记录。
+
+### 明确不包含
+
+- 不修改后端重新处理语义、MediaInfo resolver、历史清理或神医逻辑。
+- 不修改 STRM Inventory，不实现 Fast Audit，也不改变自动 Inventory 扫描行为。
+
+""",
+    },
+
+    {
         "version": "v7.2.15",
         "published_at": "2026-08-25T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.15",

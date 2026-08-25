@@ -39,6 +39,8 @@ test('historical reason and current status are rendered separately', () => {
   assert.match(reviewList, /当前状态: \$\{summaryStatusLabel\(status\.summary_status\)\}/);
   assert.match(reviewList, /ready: '已恢复'/);
   assert.match(reviewList, /default: \(\) => mediaStatus\?\.summary_status === 'ready' \? '移出列表' : '移出记录'/);
+  assert.match(reviewList, /历史复核记录；未提供 MediaInfo Episode 修复目标/);
+  assert.match(reviewList, /MediaInfo 修复目标不可用/);
 });
 
 
@@ -46,4 +48,11 @@ test('unresolved Episode target cannot invoke exact recheck, repair, or legacy r
   assert.match(reviewList, /disabled: !rowTargetId\(row\) \|\| globalRecheck/);
   assert.match(reviewList, /disabled: !repairFeatureEnabled\.value \|\| !mediaStatus\?\.repair_eligible/);
   assert.match(reviewList, /disabled: !rowTargetId\(row\) \|\| loadingAction\.value\[row\.item_id\]/);
+});
+
+
+test('media editor is not presented as a MediaInfo target editor', () => {
+  assert.match(reviewList, /default: \(\) => '编辑媒体'/);
+  assert.match(reviewList, /编辑当前媒体资料；不会修改 MediaInfo Episode 目标/);
+  assert.doesNotMatch(reviewList, /default: \(\) => '手动编辑'/);
 });

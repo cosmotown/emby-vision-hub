@@ -2,14 +2,28 @@ import os
 import logging
 import unittest
 import uuid
+from unittest import mock
 
 import config_manager
 import constants
 from database import log_db
 from database.connection import get_db_connection, init_db
+from services.mediainfo_state import MediaInfoStateService
+from services.review_cleanup import ReviewCleanupService
 
 
 POSTGRES_HOST = os.environ.get("EVH_TEST_POSTGRES_HOST")
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
 
 
 @unittest.skipUnless(POSTGRES_HOST, "isolated PostgreSQL is not configured")
@@ -35,6 +49,8 @@ class ReviewCleanupPostgresTests(unittest.TestCase):
                 constants.CONFIG_OPTION_DB_NAME: os.environ.get(
                     "EVH_TEST_POSTGRES_DB", os.environ.get("EVH_DB_NAME", "evh_test")
                 ),
+                constants.CONFIG_OPTION_EMBY_SERVER_URL: "http://emby.invalid",
+                constants.CONFIG_OPTION_EMBY_API_KEY: "secret-token",
             }
         )
         init_db()
@@ -45,7 +61,7 @@ class ReviewCleanupPostgresTests(unittest.TestCase):
         config_manager.APP_CONFIG.update(cls.old_config)
 
     def setUp(self):
-        self.prefix = f"v7214-{uuid.uuid4().hex}-"
+        self.prefix = f"v7215-{uuid.uuid4().hex}-"
         self.item_ids = [f"{self.prefix}{suffix}" for suffix in ("ready", "gone", "keep")]
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
@@ -81,6 +97,61 @@ class ReviewCleanupPostgresTests(unittest.TestCase):
                 )
                 remaining = [row["item_id"] for row in cursor.fetchall()]
         self.assertEqual([self.item_ids[2]], remaining)
+
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_stale_series_without_coordinate_is_removed_but_lookup_failure_is_preserved(
+        self, emby_get
+    ):
+        gone_id = self.item_ids[1]
+        unavailable_id = self.item_ids[2]
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE failed_log
+                    SET item_type = 'Series', reason = '处理评分 (4.00) 低于阈值'
+                    WHERE item_id = ANY(%s)
+                    """,
+                    ([gone_id, unavailable_id],),
+                )
+                cursor.execute(
+                    """
+                    SELECT item_id, item_name, failed_at, reason, item_type, score
+                    FROM failed_log
+                    WHERE item_id = ANY(%s)
+                    ORDER BY item_id
+                    """,
+                    ([gone_id, unavailable_id],),
+                )
+                rows = [dict(row) for row in cursor.fetchall()]
+            conn.commit()
+
+        def exact_lookup(_url, *, params, headers):
+            self.assertEqual("secret-token", headers["X-Emby-Token"])
+            if params["Ids"] == gone_id:
+                return FakeResponse({"Items": []})
+            raise RuntimeError("temporary Emby outage")
+
+        emby_get.side_effect = exact_lookup
+        service = ReviewCleanupService(MediaInfoStateService())
+        with mock.patch(
+            "services.review_cleanup.log_db.get_all_review_items",
+            return_value=rows,
+        ):
+            preview = service.preview("historical_item_missing")
+            result = service.execute("historical_item_missing")
+
+        self.assertEqual(1, preview["candidate_count"])
+        self.assertEqual(1, result["candidate_count"])
+        self.assertEqual(1, result["removed_count"])
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT item_id FROM failed_log WHERE item_id = ANY(%s) ORDER BY item_id",
+                    ([gone_id, unavailable_id],),
+                )
+                remaining = [row["item_id"] for row in cursor.fetchall()]
+        self.assertEqual([unavailable_id], remaining)
 
 
 if __name__ == "__main__":

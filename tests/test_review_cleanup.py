@@ -1,7 +1,20 @@
 import unittest
 from unittest import mock
 
+import constants
+from services.mediainfo_state import MediaInfoStateService
 from services.review_cleanup import ReviewCleanupService
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
 
 
 class FakeStateService:
@@ -85,6 +98,63 @@ class ReviewCleanupTests(unittest.TestCase):
     def test_unknown_cleanup_category_is_rejected_before_any_write(self):
         with self.assertRaises(ValueError):
             self.service.execute("lookup_failed")
+
+    @staticmethod
+    def _real_resolver_service():
+        state = MediaInfoStateService(
+            lambda: {
+                constants.CONFIG_OPTION_EMBY_SERVER_URL: "http://emby.invalid",
+                constants.CONFIG_OPTION_EMBY_API_KEY: "secret-token",
+            }
+        )
+        return ReviewCleanupService(state)
+
+    @mock.patch("services.review_cleanup.log_db.remove_review_items")
+    @mock.patch("services.review_cleanup.log_db.get_all_review_items")
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_stale_series_without_coordinate_is_previewed_and_removed(
+        self, emby_get, get_rows, remove
+    ):
+        get_rows.return_value = [
+            {
+                "item_id": "series-gone",
+                "item_type": "Series",
+                "reason": "处理评分 (4.00) 低于阈值",
+            }
+        ]
+        emby_get.return_value = FakeResponse({"Items": []})
+        remove.return_value = 1
+        service = self._real_resolver_service()
+
+        preview = service.preview("historical_item_missing")
+        executed = service.execute("historical_item_missing")
+
+        self.assertEqual(1, preview["candidate_count"])
+        self.assertEqual(1, executed["candidate_count"])
+        self.assertEqual(1, executed["removed_count"])
+        remove.assert_called_once_with(["series-gone"])
+
+    @mock.patch("services.review_cleanup.log_db.remove_review_items")
+    @mock.patch("services.review_cleanup.log_db.get_all_review_items")
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_series_lookup_failure_never_enters_historical_cleanup(
+        self, emby_get, get_rows, remove
+    ):
+        get_rows.return_value = [
+            {
+                "item_id": "series-unavailable",
+                "item_type": "Series",
+                "reason": "处理评分 (4.00) 低于阈值",
+            }
+        ]
+        emby_get.side_effect = RuntimeError("temporary Emby outage")
+        remove.return_value = 0
+
+        result = self._real_resolver_service().execute("historical_item_missing")
+
+        self.assertEqual(0, result["candidate_count"])
+        self.assertEqual(0, result["removed_count"])
+        remove.assert_called_once_with([])
 
 
 if __name__ == "__main__":

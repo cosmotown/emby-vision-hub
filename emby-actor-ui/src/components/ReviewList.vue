@@ -4,7 +4,7 @@
     
     <n-alert title="手动处理操作提示" type="info" style="margin-top: 24px;">
           可在下方搜索框输入片名直接搜索处理，也可以搜索存量剧集点击 <n-icon :component="AddToWatchlistIcon" /> 加入智能追剧 <br />
-          可点击待复核列表媒体项进入手动编辑页面、可一键清空待复核列表转到已处理记录。
+          可点击待复核列表媒体项进入媒体资料编辑页面；该页面不会修改 MediaInfo Episode 目标。
     </n-alert>
     <!-- ✅ [修正] Access prop via `props.taskStatus` -->
     <n-alert 
@@ -134,7 +134,7 @@ import { ref, onMounted, onBeforeUnmount, computed, h } from 'vue';
 import axios from 'axios';
 import {
     NCard, NSpin, NAlert, NText, NDataTable, NButton, NSpace, NPopconfirm, NEmpty, NInput, NIcon,
-    NTag, useDialog, useMessage
+    NTag, NTooltip, useDialog, useMessage
 } from 'naive-ui';
 import { HeartOutline as AddToWatchlistIcon } from '@vicons/ionicons5';
 import { SearchOutline as SearchIcon, PlayForwardOutline as ReprocessIcon, CheckmarkCircleOutline as MarkDoneIcon } from '@vicons/ionicons5';
@@ -255,6 +255,21 @@ const rowMediaStatus = (row) => {
 };
 
 const rowIsHistorical = (row) => rowMediaStatus(row)?.summary_status === 'historical_item_missing';
+
+const rowHasMediaInfoReviewReason = (row) => /mediainfo|媒体信息/i.test(String(row?.reason || ''));
+
+const unresolvedTargetLabel = (row) => {
+  const reason = row?.media_info_target?.target_reason_code;
+  if (!reason) return '尚未读取';
+  if (
+    row?.item_type === 'Series'
+    && reason === 'episode_coordinate_missing'
+    && !rowHasMediaInfoReviewReason(row)
+  ) {
+    return `历史复核记录；未提供 MediaInfo Episode 修复目标（${reason}）`;
+  }
+  return `MediaInfo 修复目标不可用: ${reason}`;
+};
 
 const summaryStatusLabel = (status) => ({
   ready: '已恢复',
@@ -429,8 +444,7 @@ const columns = computed(() => [
     render(row) {
       const status = rowMediaStatus(row);
       if (!status) {
-        const reason = row.media_info_target?.target_reason_code;
-        return h(NText, { depth: 3 }, { default: () => reason ? `目标不可确定: ${reason}` : '尚未读取' });
+        return h(NText, { depth: 3 }, { default: () => unresolvedTargetLabel(row) });
       }
       return h(NSpace, { vertical: true, size: 4 }, {
         default: () => [
@@ -534,11 +548,14 @@ const columns = computed(() => [
       );
 
       actionButtons.push(
-        h(NButton, {
-          size: 'small',
-          type: 'primary',
-          onClick: () => goToEditPage(row)
-        }, { default: () => '手动编辑' })
+        h(NTooltip, null, {
+          trigger: () => h(NButton, {
+            size: 'small',
+            type: 'primary',
+            onClick: () => goToEditPage(row)
+          }, { default: () => '编辑媒体' }),
+          default: () => '编辑当前媒体资料；不会修改 MediaInfo Episode 目标'
+        })
       );
 
       // “标记为已处理”按钮仅在待复核列表视图中显示

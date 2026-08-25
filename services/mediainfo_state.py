@@ -404,31 +404,11 @@ class MediaInfoStateService:
         if source_type != "Series":
             return result
 
-        coordinates = {
-            (int(season), int(episode))
-            for season, episode in re.findall(
-                r"(?i)(?<![A-Z0-9])S(\d{1,4})E(\d{1,4})(?![A-Z0-9])",
-                str(reason or ""),
-            )
-        }
-        if len(coordinates) != 1:
-            result["target_reason_code"] = (
-                "episode_coordinate_missing"
-                if not coordinates
-                else "episode_coordinate_ambiguous"
-            )
-            return result
-        season_number, episode_number = next(iter(coordinates))
-
         base_url, api_key, user_id = self._emby_config()
         if not base_url or not api_key:
             result["target_reason_code"] = "emby_lookup_failed"
             return result
 
-        fields = (
-            "Id,Name,Type,Path,ParentId,SeriesId,"
-            "ParentIndexNumber,IndexNumber"
-        )
         try:
             source_response = emby.emby_client.get(
                 f"{base_url}/Items",
@@ -466,6 +446,27 @@ class MediaInfoStateService:
         except Exception:
             result["target_reason_code"] = "emby_lookup_failed"
             return result
+
+        coordinates = {
+            (int(season), int(episode))
+            for season, episode in re.findall(
+                r"(?i)(?<![A-Z0-9])S(\d{1,4})E(\d{1,4})(?![A-Z0-9])",
+                str(reason or ""),
+            )
+        }
+        if len(coordinates) != 1:
+            result["target_reason_code"] = (
+                "episode_coordinate_missing"
+                if not coordinates
+                else "episode_coordinate_ambiguous"
+            )
+            return result
+        season_number, episode_number = next(iter(coordinates))
+
+        fields = (
+            "Id,Name,Type,Path,ParentId,SeriesId,"
+            "ParentIndexNumber,IndexNumber"
+        )
 
         exact: list[Dict[str, Any]] = []
         seen_item_ids: set[str] = set()

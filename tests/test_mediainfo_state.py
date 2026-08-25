@@ -244,6 +244,45 @@ class MediaInfoStateTests(unittest.TestCase):
         self.assertEqual(1, get.call_count)
 
     @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_missing_series_without_coordinate_is_historical_before_coordinate_parsing(self, get):
+        get.return_value = FakeResponse({"Items": []})
+
+        resolved = self._service().resolve_review_target(
+            "series-gone", "Series", "处理评分 (4.00) 低于阈值"
+        )
+
+        self.assertIsNone(resolved["target_item_id"])
+        self.assertEqual("historical_item_missing", resolved["target_reason_code"])
+        self.assertEqual(1, get.call_count)
+
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_existing_non_series_source_fails_closed_before_coordinate_parsing(self, get):
+        get.return_value = FakeResponse({"Items": [{"Id": "series-1", "Type": "Movie"}]})
+
+        resolved = self._service().resolve_review_target(
+            "series-1", "Series", "处理评分 (4.00) 低于阈值"
+        )
+
+        self.assertIsNone(resolved["target_item_id"])
+        self.assertEqual(
+            "episode_target_source_type_mismatch",
+            resolved["target_reason_code"],
+        )
+        self.assertEqual(1, get.call_count)
+
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_series_source_lookup_failure_is_not_historical_without_coordinate(self, get):
+        get.side_effect = RuntimeError("temporary Emby outage")
+
+        resolved = self._service().resolve_review_target(
+            "series-1", "Series", "处理评分 (4.00) 低于阈值"
+        )
+
+        self.assertIsNone(resolved["target_item_id"])
+        self.assertEqual("emby_lookup_failed", resolved["target_reason_code"])
+        self.assertEqual(1, get.call_count)
+
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
     def test_exact_series_endpoint_mixing_another_series_is_fail_closed(self, get):
         get.side_effect = [
             self._series_identity(),
@@ -258,14 +297,20 @@ class MediaInfoStateTests(unittest.TestCase):
         self.assertEqual("episode_target_series_mismatch", resolved["target_reason_code"])
 
     @mock.patch("services.mediainfo_state.emby.emby_client.get")
-    def test_series_review_without_unique_coordinate_never_queries_emby(self, get):
-        for reason in ("MediaInfo incomplete", "S01E08 and S01E09"):
+    def test_existing_series_without_unique_coordinate_stops_after_identity_read(self, get):
+        for reason, expected in (
+            ("MediaInfo incomplete", "episode_coordinate_missing"),
+            ("S01E08 and S01E09", "episode_coordinate_ambiguous"),
+        ):
             with self.subTest(reason=reason):
+                get.reset_mock()
+                get.return_value = self._series_identity()
                 resolved = self._service().resolve_review_target(
                     "series-1", "Series", reason
                 )
                 self.assertIsNone(resolved["target_item_id"])
-        get.assert_not_called()
+                self.assertEqual(expected, resolved["target_reason_code"])
+                self.assertEqual(1, get.call_count)
 
     @mock.patch("services.mediainfo_state.emby.emby_client.get")
     def test_confirmed_missing_item_stops_all_downstream_observation(self, get):

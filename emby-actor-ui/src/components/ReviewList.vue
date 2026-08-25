@@ -256,6 +256,8 @@ const rowMediaStatus = (row) => {
 
 const rowIsHistorical = (row) => rowMediaStatus(row)?.summary_status === 'historical_item_missing';
 
+const rowCanReprocess = (row) => Boolean(String(row?.item_id || '').trim()) && !rowIsHistorical(row);
+
 const rowHasMediaInfoReviewReason = (row) => /mediainfo|媒体信息/i.test(String(row?.reason || ''));
 
 const unresolvedTargetLabel = (row) => {
@@ -538,7 +540,7 @@ const columns = computed(() => [
                 type: 'warning',
                 ghost: true,
                 loading: loadingAction.value[row.item_id] && currentRowId.value === row.item_id,
-                disabled: !rowTargetId(row) || loadingAction.value[row.item_id] || props.taskStatus?.is_running
+                disabled: !rowCanReprocess(row) || loadingAction.value[row.item_id] || props.taskStatus?.is_running
             }, {
                 icon: () => h(NIcon, { component: ReprocessIcon }),
                 default: () => '重新处理'

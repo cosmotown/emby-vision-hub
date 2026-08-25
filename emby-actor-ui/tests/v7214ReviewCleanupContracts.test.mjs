@@ -44,10 +44,17 @@ test('historical reason and current status are rendered separately', () => {
 });
 
 
-test('unresolved Episode target cannot invoke exact recheck, repair, or legacy reprocess', () => {
+test('unresolved Episode target disables exact MediaInfo recheck and repair', () => {
   assert.match(reviewList, /disabled: !rowTargetId\(row\) \|\| globalRecheck/);
   assert.match(reviewList, /disabled: !repairFeatureEnabled\.value \|\| !mediaStatus\?\.repair_eligible/);
-  assert.match(reviewList, /disabled: !rowTargetId\(row\) \|\| loadingAction\.value\[row\.item_id\]/);
+});
+
+
+test('ordinary source-item reprocess does not depend on a MediaInfo Episode target', () => {
+  assert.match(reviewList, /const rowCanReprocess = \(row\) => Boolean\(String\(row\?\.item_id \|\| ''\)\.trim\(\)\) && !rowIsHistorical\(row\)/);
+  assert.match(reviewList, /disabled: !rowCanReprocess\(row\) \|\| loadingAction\.value\[row\.item_id\]/);
+  assert.doesNotMatch(reviewList, /disabled: !rowTargetId\(row\) \|\| loadingAction\.value\[row\.item_id\]/);
+  assert.match(reviewList, /reprocess_item\/\$\{row\.item_id\}/);
 });
 
 

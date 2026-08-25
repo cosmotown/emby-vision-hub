@@ -13,7 +13,7 @@ import constants
 import monitor_service
 from tasks import core as task_core
 from tasks import media as media_tasks
-from services.strm_inventory import IncrementalStrmInventory
+from services.strm_inventory import IncrementalStrmInventory, InventoryAuditError
 
 if not hasattr(logging.Logger, 'trace'):
     logging.Logger.trace = logging.Logger.debug
@@ -496,6 +496,130 @@ class StrmInventoryV2Tests(unittest.TestCase):
         self.assertEqual(0, result['delete'])
         record.assert_not_called()
         failed.assert_called_once_with(claim, 'mount_unavailable')
+
+    def test_missing_manual_claim_uses_ancestor_snapshot_proof_once(self):
+        claim = {
+            'root_path': '/STRM',
+            'directory_path': '/STRM/Shows/Old/Season 1',
+            'audit_generation': 1,
+            'event_version': 0,
+            'claim_owner': 'owner',
+            'manual_audit_id': 'audit',
+        }
+        inventory = IncrementalStrmInventory(owner='owner')
+        recovered = {
+            'accepted': True, 'proven': True, 'complete': True,
+            'removed': ['/STRM/Shows/Old/Season 1/E01.strm'],
+            'physical_enumerations': 1, 'entries_seen': 3,
+            'db_batches': 0, 'watch_set_changed': True,
+        }
+        deleted = mock.Mock()
+        with mock.patch(
+            'services.strm_inventory.strm_ingest_db.claim_inventory_directories',
+            return_value=[claim],
+        ), mock.patch.object(
+            inventory, 'scan_claim', side_effect=InventoryAuditError('inaccessible'),
+        ), mock.patch.object(
+            inventory, '_recover_missing_claim_from_ancestor', return_value=recovered,
+        ) as recover, mock.patch(
+            'services.strm_inventory.strm_ingest_db.fail_inventory_directory_claim',
+        ) as failed:
+            result = inventory.run_once(
+                manual_audit_id='audit', claim_limit=1, on_delete=deleted,
+            )
+        recover.assert_called_once_with(claim)
+        failed.assert_not_called()
+        deleted.assert_called_once_with(recovered['removed'])
+        self.assertEqual(1, result['completed'])
+        self.assertEqual(0, result['failed'])
+        self.assertEqual(1, result['physical_enumerations'])
+        self.assertTrue(result['watch_set_changed'])
+
+    def test_ancestor_permission_failure_remains_fail_closed(self):
+        claim = {
+            'root_path': '/STRM',
+            'directory_path': '/STRM/Shows/Old/Season 1',
+            'audit_generation': 1,
+            'event_version': 0,
+            'claim_owner': 'owner',
+            'manual_audit_id': 'audit',
+        }
+        inventory = IncrementalStrmInventory(owner='owner')
+        with mock.patch(
+            'services.strm_inventory.strm_ingest_db.claim_inventory_directories',
+            return_value=[claim],
+        ), mock.patch.object(
+            inventory, 'scan_claim', side_effect=InventoryAuditError('inaccessible'),
+        ), mock.patch.object(
+            inventory, '_recover_missing_claim_from_ancestor',
+            side_effect=InventoryAuditError('permission_denied'),
+        ), mock.patch(
+            'services.strm_inventory.strm_ingest_db.fail_inventory_directory_claim',
+        ) as failed, mock.patch(
+            'services.strm_inventory.strm_ingest_db.record_inventory_ancestor_proof',
+        ) as proof:
+            result = inventory.run_once(
+                manual_audit_id='audit', claim_limit=1, on_delete=mock.Mock(),
+            )
+        self.assertEqual(1, result['failed'])
+        self.assertEqual(0, result['delete'])
+        failed.assert_called_once_with(claim, 'permission_denied')
+        proof.assert_not_called()
+
+    def test_unavailable_configured_root_blocks_ancestor_proof(self):
+        claim = {
+            'root_path': '/STRM',
+            'directory_path': '/STRM/Shows/Old/Season 1',
+            'claim_owner': 'owner',
+            'manual_audit_id': 'audit',
+        }
+        inventory = IncrementalStrmInventory(owner='owner')
+        candidates = [
+            {'directory_path': '/STRM/Shows/Old', 'manual_audit_id': None, 'claim_owner': None},
+            {'directory_path': '/STRM', 'manual_audit_id': None, 'claim_owner': None},
+        ]
+        with mock.patch(
+            'services.strm_inventory.strm_ingest_db.get_inventory_ancestor_candidates',
+            return_value=candidates,
+        ), mock.patch.object(
+            inventory,
+            '_snapshot_directory',
+            side_effect=[
+                InventoryAuditError('inaccessible'),
+                InventoryAuditError('mount_unavailable'),
+            ],
+        ), mock.patch(
+            'services.strm_inventory.strm_ingest_db.record_inventory_ancestor_proof',
+        ) as proof:
+            with self.assertRaisesRegex(InventoryAuditError, 'mount_unavailable'):
+                inventory._recover_missing_claim_from_ancestor(claim)
+        proof.assert_not_called()
+
+    def test_symlink_ancestor_blocks_proof(self):
+        claim = {
+            'root_path': '/STRM',
+            'directory_path': '/STRM/Shows/Old/Season 1',
+            'claim_owner': 'owner',
+            'manual_audit_id': 'audit',
+        }
+        inventory = IncrementalStrmInventory(owner='owner')
+        with mock.patch(
+            'services.strm_inventory.strm_ingest_db.get_inventory_ancestor_candidates',
+            return_value=[{
+                'directory_path': '/STRM/Shows/Old',
+                'manual_audit_id': None,
+                'claim_owner': None,
+            }],
+        ), mock.patch.object(
+            inventory,
+            '_snapshot_directory',
+            side_effect=InventoryAuditError('symlink_blocked'),
+        ), mock.patch(
+            'services.strm_inventory.strm_ingest_db.record_inventory_ancestor_proof',
+        ) as proof:
+            with self.assertRaisesRegex(InventoryAuditError, 'symlink_blocked'):
+                inventory._recover_missing_claim_from_ancestor(claim)
+        proof.assert_not_called()
 
     def test_manual_full_audit_is_persisted_bounded_work_not_recursive_scan(self):
         source = Path('routes/tasks.py').read_text(encoding='utf-8')

@@ -801,6 +801,389 @@ class StrmInventoryV2PostgresTests(unittest.TestCase):
             self.assertEqual(audit_id, child_row['manual_audit_id'])
             self.assertNotEqual('delete', file_row['operation'])
 
+    def _seed_orphan_generation(
+        self,
+        *,
+        root,
+        category,
+        missing_parent,
+        descendant_count,
+        include_parent_row,
+        completed_directories,
+    ):
+        strm_ingest_db.register_inventory_roots([root])
+        audit_id = f'orphan-{time.time_ns()}'
+        descendants = [
+            os.path.join(missing_parent, f'Season {index + 1}')
+            for index in range(descendant_count)
+        ]
+        files = [os.path.join(path, 'E01.strm') for path in descendants]
+        with connection.get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "INSERT INTO strm_ingest_inventory_manual_audits "
+                    "(audit_id, state, total_directories, completed_directories, started_at) "
+                    "VALUES (%s, 'running', %s, %s, NOW())",
+                    (
+                        audit_id,
+                        completed_directories + descendant_count,
+                        completed_directories,
+                    ),
+                )
+                cursor.execute(
+                    "INSERT INTO strm_ingest_inventory_directories "
+                    "(root_path, directory_path, parent_path, active, dirty, "
+                    "next_audit_at, last_verified_at) "
+                    "VALUES (%s, %s, %s, TRUE, FALSE, "
+                    "NOW() + INTERVAL '1 day', NOW()) "
+                    "ON CONFLICT (root_path, directory_path) DO UPDATE "
+                    "SET active = TRUE, dirty = FALSE, manual_audit_id = NULL, "
+                    "last_verified_at = NOW()",
+                    (root, category, root),
+                )
+                if include_parent_row:
+                    cursor.execute(
+                        "INSERT INTO strm_ingest_inventory_directories "
+                        "(root_path, directory_path, parent_path, active, dirty, "
+                        "next_audit_at) VALUES (%s, %s, %s, FALSE, FALSE, NOW())",
+                        (root, missing_parent, category),
+                    )
+                execute_values(
+                    cursor,
+                    """
+                    INSERT INTO strm_ingest_inventory_directories (
+                        root_path, directory_path, parent_path, active, dirty,
+                        next_audit_at, manual_audit_id, last_error
+                    ) VALUES %s
+                    """,
+                    [
+                        (
+                            root, path, missing_parent, True, True,
+                            audit_id, 'inaccessible',
+                        )
+                        for path in descendants
+                    ],
+                    template="(%s, %s, %s, %s, %s, NOW(), %s, %s)",
+                    page_size=500,
+                )
+                execute_values(
+                    cursor,
+                    """
+                    INSERT INTO strm_ingest_retry_queue (
+                        file_path, operation, source, status, next_attempt_at,
+                        inventory_root_path, inventory_directory_path
+                    ) VALUES %s
+                    """,
+                    [
+                        (path, 'ingest', 'test', 'observed', root, directory)
+                        for path, directory in zip(files, descendants)
+                    ],
+                    template="(%s, %s, %s, %s, NOW(), %s, %s)",
+                    page_size=500,
+                )
+        return audit_id, descendants, files
+
+    def test_successful_ancestor_snapshot_terminalizes_inactive_parent_orphan_subtree(self):
+        with tempfile.TemporaryDirectory() as root:
+            category = os.path.join(root, '动漫')
+            os.mkdir(category)
+            missing_parent = os.path.join(category, 'OLD_SHOW')
+            audit_id, descendants, files = self._seed_orphan_generation(
+                root=root,
+                category=category,
+                missing_parent=missing_parent,
+                descendant_count=2,
+                include_parent_row=True,
+                completed_directories=2,
+            )
+            deleted = []
+            result = IncrementalStrmInventory(
+                owner='inactive-orphan-proof', directory_batch_limit=1,
+            ).run_once(
+                manual_audit_id=audit_id,
+                claim_limit=1,
+                on_delete=lambda paths: deleted.extend(paths),
+            )
+            self.assertEqual(1, result['completed'])
+            self.assertEqual(sorted(files), sorted(deleted))
+            final = strm_ingest_db.get_manual_inventory_audit(audit_id)
+            self.assertEqual('completed', final['state'])
+            self.assertEqual(4, final['total_directories'])
+            self.assertEqual(4, final['completed_directories'])
+            self.assertEqual(0, final['pending_directories'])
+            self.assertEqual(0, final['claimed_directories'])
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT COUNT(*) AS count "
+                        "FROM strm_ingest_inventory_directories "
+                        "WHERE root_path = %s AND active = TRUE "
+                        "AND directory_path = ANY(%s)",
+                        (root, descendants),
+                    )
+                    self.assertEqual(0, cursor.fetchone()['count'])
+
+    def test_successful_ancestor_snapshot_terminalizes_orphans_without_parent_row(self):
+        with tempfile.TemporaryDirectory() as root:
+            category = os.path.join(root, '电视剧')
+            os.mkdir(category)
+            missing_parent = os.path.join(category, 'OLD_SHOW')
+            audit_id, _descendants, _files = self._seed_orphan_generation(
+                root=root,
+                category=category,
+                missing_parent=missing_parent,
+                descendant_count=2,
+                include_parent_row=False,
+                completed_directories=7,
+            )
+            result = IncrementalStrmInventory(
+                owner='missing-parent-row-proof', directory_batch_limit=1,
+            ).run_once(manual_audit_id=audit_id, claim_limit=1)
+            self.assertEqual(1, result['completed'])
+            final = strm_ingest_db.get_manual_inventory_audit(audit_id)
+            self.assertEqual('completed', final['state'])
+            self.assertEqual(9, final['total_directories'])
+            self.assertEqual(9, final['completed_directories'])
+            self.assertEqual(0, final['pending_directories'])
+
+    def test_observed_first_hop_reactivates_parent_without_terminalizing_descendants(self):
+        with tempfile.TemporaryDirectory() as root:
+            category = os.path.join(root, '动漫')
+            parent = os.path.join(category, 'OLD_SHOW')
+            os.makedirs(parent)
+            season = os.path.join(parent, 'Season 1')
+            strm_ingest_db.register_inventory_roots([root])
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "INSERT INTO strm_ingest_inventory_directories "
+                        "(root_path, directory_path, parent_path, active, dirty) "
+                        "VALUES (%s, %s, %s, TRUE, TRUE)",
+                        (root, category, root),
+                    )
+                    cursor.execute(
+                        "INSERT INTO strm_ingest_inventory_directories "
+                        "(root_path, directory_path, parent_path, active, dirty) "
+                        "VALUES (%s, %s, %s, FALSE, FALSE)",
+                        (root, parent, category),
+                    )
+                    cursor.execute(
+                        "INSERT INTO strm_ingest_inventory_directories "
+                        "(root_path, directory_path, parent_path, active, dirty) "
+                        "VALUES (%s, %s, %s, TRUE, TRUE)",
+                        (root, season, parent),
+                    )
+            claims = strm_ingest_db.claim_inventory_directories(
+                'observed-first-hop', limit=1,
+            )
+            self.assertEqual([category], [row['directory_path'] for row in claims])
+            result = IncrementalStrmInventory(
+                owner='observed-first-hop', directory_batch_limit=1,
+            ).scan_claim(claims[0])
+            self.assertTrue(result['accepted'])
+            self.assertEqual([], result['removed'])
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT directory_path, active FROM "
+                        "strm_ingest_inventory_directories "
+                        "WHERE root_path = %s AND directory_path = ANY(%s) "
+                        "ORDER BY directory_path",
+                        (root, [parent, season]),
+                    )
+                    rows = cursor.fetchall()
+            self.assertEqual(2, len(rows))
+            self.assertTrue(all(row['active'] for row in rows))
+
+    def test_ancestor_snapshot_does_not_skip_present_first_hop_for_deeper_missing_child(self):
+        with tempfile.TemporaryDirectory() as root:
+            category = os.path.join(root, '动漫')
+            parent = os.path.join(category, 'OLD_SHOW')
+            os.makedirs(parent)
+            missing_season = os.path.join(parent, 'Season 1')
+            strm_ingest_db.register_inventory_roots([root])
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "INSERT INTO strm_ingest_inventory_directories "
+                        "(root_path, directory_path, parent_path, active, dirty) "
+                        "VALUES (%s, %s, %s, TRUE, TRUE)",
+                        (root, category, root),
+                    )
+                    cursor.execute(
+                        "INSERT INTO strm_ingest_inventory_directories "
+                        "(root_path, directory_path, parent_path, active, dirty) "
+                        "VALUES (%s, %s, %s, TRUE, FALSE)",
+                        (root, parent, category),
+                    )
+                    cursor.execute(
+                        "INSERT INTO strm_ingest_inventory_directories "
+                        "(root_path, directory_path, parent_path, active, dirty) "
+                        "VALUES (%s, %s, %s, TRUE, TRUE)",
+                        (root, missing_season, parent),
+                    )
+            category_claim = strm_ingest_db.claim_inventory_directories(
+                'category-proof', limit=1,
+            )[0]
+            IncrementalStrmInventory(owner='category-proof').scan_claim(category_claim)
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT active FROM strm_ingest_inventory_directories "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, missing_season),
+                    )
+                    self.assertTrue(cursor.fetchone()['active'])
+
+            strm_ingest_db.mark_directory_dirty(root, parent, event_kind='parent-proof')
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE strm_ingest_inventory_directories "
+                        "SET next_audit_at = NOW() + INTERVAL '1 hour' "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, missing_season),
+                    )
+            parent_claim = strm_ingest_db.claim_inventory_directories(
+                'parent-proof', limit=1,
+            )[0]
+            IncrementalStrmInventory(owner='parent-proof').scan_claim(parent_claim)
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT active FROM strm_ingest_inventory_directories "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, missing_season),
+                    )
+                    self.assertFalse(cursor.fetchone()['active'])
+
+    def test_observed_symlink_first_hop_never_becomes_deletion_proof(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as target:
+            category = os.path.join(root, '动漫')
+            os.mkdir(category)
+            symlink_parent = os.path.join(category, 'OLD_SHOW')
+            os.symlink(target, symlink_parent)
+            descendant = os.path.join(symlink_parent, 'Season 1')
+            strm_ingest_db.register_inventory_roots([root])
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "INSERT INTO strm_ingest_inventory_directories "
+                        "(root_path, directory_path, parent_path, active, dirty) "
+                        "VALUES (%s, %s, %s, TRUE, TRUE)",
+                        (root, category, root),
+                    )
+                    cursor.execute(
+                        "INSERT INTO strm_ingest_inventory_directories "
+                        "(root_path, directory_path, parent_path, active, dirty) "
+                        "VALUES (%s, %s, %s, TRUE, TRUE)",
+                        (root, descendant, symlink_parent),
+                    )
+            claim = strm_ingest_db.claim_inventory_directories(
+                'symlink-first-hop', limit=1,
+            )[0]
+            result = IncrementalStrmInventory(
+                owner='symlink-first-hop', directory_batch_limit=1,
+            ).scan_claim(claim)
+            self.assertEqual([], result['removed'])
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT active FROM strm_ingest_inventory_directories "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, descendant),
+                    )
+                    self.assertTrue(cursor.fetchone()['active'])
+
+    def test_ancestor_event_change_makes_proof_stale_without_terminalization(self):
+        with tempfile.TemporaryDirectory() as root:
+            category = os.path.join(root, '动漫')
+            os.mkdir(category)
+            missing_parent = os.path.join(category, 'OLD_SHOW')
+            audit_id, descendants, _files = self._seed_orphan_generation(
+                root=root,
+                category=category,
+                missing_parent=missing_parent,
+                descendant_count=1,
+                include_parent_row=False,
+                completed_directories=1,
+            )
+            claim = strm_ingest_db.claim_inventory_directories(
+                'stale-ancestor-proof', limit=1, manual_audit_id=audit_id,
+            )[0]
+            ancestor = strm_ingest_db.get_inventory_ancestor_candidates(
+                root, descendants[0],
+            )[0]
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "UPDATE strm_ingest_inventory_directories "
+                        "SET event_version = event_version + 1 "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, ancestor['directory_path']),
+                    )
+            result = strm_ingest_db.record_inventory_ancestor_proof(
+                claim,
+                ancestor=ancestor,
+                observed_entry_paths=[],
+            )
+            self.assertFalse(result['accepted'])
+            self.assertTrue(result['stale'])
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT active, manual_audit_id "
+                        "FROM strm_ingest_inventory_directories "
+                        "WHERE root_path = %s AND directory_path = %s",
+                        (root, descendants[0]),
+                    )
+                    row = cursor.fetchone()
+            self.assertTrue(row['active'])
+            self.assertEqual(audit_id, row['manual_audit_id'])
+
+    def test_production_4012_3970_42_orphan_fixture_converges_without_retry_delay(self):
+        with tempfile.TemporaryDirectory() as root:
+            category = os.path.join(root, '动漫')
+            os.mkdir(category)
+            missing_parent = os.path.join(category, 'OLD_SHOW')
+            audit_id, descendants, _files = self._seed_orphan_generation(
+                root=root,
+                category=category,
+                missing_parent=missing_parent,
+                descendant_count=42,
+                include_parent_row=False,
+                completed_directories=3970,
+            )
+            before = strm_ingest_db.get_manual_inventory_audit(audit_id)
+            self.assertEqual(4012, before['total_directories'])
+            self.assertEqual(3970, before['completed_directories'])
+            self.assertEqual(42, before['pending_directories'])
+
+            started = time.monotonic()
+            result = IncrementalStrmInventory(
+                owner='production-orphan-fixture', directory_batch_limit=1,
+            ).run_once(manual_audit_id=audit_id, claim_limit=1)
+            elapsed = time.monotonic() - started
+            self.assertEqual(1, result['claimed'])
+            self.assertEqual(1, result['completed'])
+            self.assertLess(elapsed, 10)
+            final = strm_ingest_db.get_manual_inventory_audit(audit_id)
+            self.assertEqual('completed', final['state'])
+            self.assertEqual(4012, final['total_directories'])
+            self.assertEqual(4012, final['completed_directories'])
+            self.assertEqual(0, final['pending_directories'])
+            self.assertEqual(0, final['claimed_directories'])
+            with connection.get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT COUNT(*) AS count "
+                        "FROM strm_ingest_inventory_directories "
+                        "WHERE root_path = %s AND active = TRUE "
+                        "AND directory_path = ANY(%s)",
+                        (root, descendants),
+                    )
+                    self.assertEqual(0, cursor.fetchone()['count'])
+
     def test_manual_generation_converges_with_five_thousand_persisted_directories(self):
         with tempfile.TemporaryDirectory() as root:
             strm_ingest_db.register_inventory_roots([root])

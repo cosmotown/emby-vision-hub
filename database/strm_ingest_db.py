@@ -10,6 +10,37 @@ from .connection import get_db_connection
 RETRY_DELAYS_SECONDS = (10 * 60, 20 * 60, 30 * 60)
 
 
+def _escape_like_path(path: str) -> str:
+    return str(path).replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
+
+def _first_hop_below(root_path: str, directory_path: str, descendant_path: str) -> Optional[str]:
+    """Return the lexical first-hop branch without allowing root escape."""
+    root = os.path.normpath(str(root_path))
+    directory = os.path.normpath(str(directory_path))
+    descendant = os.path.normpath(str(descendant_path))
+    if not all(os.path.isabs(value) for value in (root, directory, descendant)):
+        return None
+    try:
+        if os.path.commonpath((root, directory)) != root:
+            return None
+        if descendant == directory or os.path.commonpath((directory, descendant)) != directory:
+            return None
+    except ValueError:
+        return None
+    relative = os.path.relpath(descendant, directory)
+    first_name = relative.split(os.sep, 1)[0]
+    if first_name in {'', '.', '..'}:
+        return None
+    first_hop = os.path.normpath(os.path.join(directory, first_name))
+    try:
+        if os.path.commonpath((root, first_hop)) != root:
+            return None
+    except ValueError:
+        return None
+    return first_hop
+
+
 def _fingerprint(file_path: str) -> Tuple[Optional[int], Optional[float]]:
     try:
         stat = os.stat(file_path)
@@ -815,11 +846,193 @@ def get_inventory_files_for_directory(root_path: str, directory_path: str) -> Di
             return {row['file_path']: dict(row) for row in cursor.fetchall()}
 
 
+def get_inventory_ancestor_candidates(root_path: str, directory_path: str) -> List[Dict]:
+    """Return persisted lexical ancestors, deepest first, for proof-only recovery."""
+    root = os.path.normpath(str(root_path))
+    directory = os.path.normpath(str(directory_path))
+    if _first_hop_below(root, root, directory) is None:
+        return []
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT root_path, directory_path, parent_path, active,
+                       event_version, manual_audit_id, last_verified_at,
+                       last_error, dirty, claim_owner, claim_expires_at
+                FROM strm_ingest_inventory_directories
+                WHERE root_path = %s
+                  AND directory_path != %s
+                  AND (
+                      directory_path = %s
+                      OR LEFT(%s, LENGTH(directory_path) + 1)
+                          = directory_path || '/'
+                  )
+                ORDER BY LENGTH(directory_path) DESC, directory_path
+                """,
+                (root, directory, root, directory),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
+def _queue_inventory_removed_files(cursor, removed: Iterable[str]) -> List[str]:
+    paths = sorted(set(removed or []))
+    if paths:
+        cursor.execute(
+            """
+            UPDATE strm_ingest_retry_queue
+            SET operation = 'delete', source = 'inventory_v2', status = 'pending',
+                attempt_count = 0,
+                next_attempt_at = NOW() + (600 * INTERVAL '1 second'),
+                updated_at = NOW(), completed_at = NULL,
+                last_error = '增量目录库存发现 STRM 已消失'
+            WHERE file_path = ANY(%s)
+            """,
+            (paths,),
+        )
+    return paths
+
+
+def _terminalize_missing_first_hop_branches(
+    cursor,
+    *,
+    root: str,
+    directory: str,
+    observed_entry_paths: Iterable[str],
+    manual_audit_id: Optional[str],
+    include_generation_descendants: bool = False,
+) -> Dict[str, object]:
+    """Apply deletion proof from one successful, complete directory snapshot.
+
+    A descendant is terminal only when the first-hop branch below the scanned
+    directory is absent from the complete snapshot.  All entry names, including
+    symlinks and non-directories, block proof for that branch.
+    """
+    directory_like = _escape_like_path(directory) + '/%'
+    cursor.execute(
+        """
+        SELECT directory_path
+        FROM strm_ingest_inventory_directories
+        WHERE root_path = %s
+          AND active = TRUE
+          AND parent_path = %s
+        """,
+        (root, directory),
+    )
+    active_descendants = {row['directory_path'] for row in cursor.fetchall()}
+    if manual_audit_id and include_generation_descendants:
+        cursor.execute(
+            """
+            SELECT directory_path
+            FROM strm_ingest_inventory_directories
+            WHERE root_path = %s
+              AND active = TRUE
+              AND manual_audit_id = %s
+              AND directory_path LIKE %s ESCAPE '\\'
+            """,
+            (root, manual_audit_id, directory_like),
+        )
+        active_descendants.update(row['directory_path'] for row in cursor.fetchall())
+    descendant_branches = {
+        branch
+        for path in active_descendants
+        for branch in [_first_hop_below(root, directory, path)]
+        if branch
+    }
+    observed_branches = {
+        branch
+        for path in observed_entry_paths or []
+        for branch in [_first_hop_below(root, directory, path)]
+        if branch
+    }
+    missing_branches = sorted(descendant_branches - observed_branches)
+    removed = []
+    manual_terminalized = 0
+    for branch in missing_branches:
+        branch_like = _escape_like_path(branch) + '/%'
+        cursor.execute(
+            """
+            SELECT file_path FROM strm_ingest_retry_queue
+            WHERE inventory_root_path = %s
+              AND (
+                  inventory_directory_path = %s
+                  OR inventory_directory_path LIKE %s ESCAPE '\\'
+              )
+              AND LOWER(file_path) LIKE '%%.strm'
+              AND operation != 'delete'
+              AND status NOT IN ('deleted', 'cancelled')
+            """,
+            (root, branch, branch_like),
+        )
+        removed.extend(row['file_path'] for row in cursor.fetchall())
+        if manual_audit_id:
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM strm_ingest_inventory_directories
+                WHERE root_path = %s
+                  AND active = TRUE
+                  AND manual_audit_id = %s
+                  AND (
+                      directory_path = %s
+                      OR directory_path LIKE %s ESCAPE '\\'
+                  )
+                """,
+                (root, manual_audit_id, branch, branch_like),
+            )
+            manual_terminalized += int((cursor.fetchone() or {}).get('count') or 0)
+        cursor.execute(
+            """
+            UPDATE strm_ingest_inventory_directories
+            SET active = FALSE, dirty = FALSE, dirty_since = NULL,
+                claim_owner = NULL, claim_expires_at = NULL,
+                manual_audit_id = CASE
+                    WHEN manual_audit_id = %s THEN NULL
+                    ELSE manual_audit_id
+                END,
+                last_error = NULL, updated_at = NOW()
+            WHERE root_path = %s
+              AND (
+                  directory_path = %s
+                  OR directory_path LIKE %s ESCAPE '\\'
+              )
+            """,
+            (manual_audit_id, root, branch, branch_like),
+        )
+    return {
+        'missing_branches': missing_branches,
+        'removed': sorted(set(removed)),
+        'manual_terminalized': manual_terminalized,
+        'watch_set_changed': bool(missing_branches),
+    }
+
+
+def _advance_manual_inventory_progress(cursor, audit_id: Optional[str], delta: int) -> None:
+    if not audit_id or int(delta or 0) <= 0:
+        return
+    cursor.execute(
+        """
+        UPDATE strm_ingest_inventory_manual_audits
+        SET state = 'running',
+            started_at = COALESCE(started_at, NOW()),
+            completed_directories = completed_directories + %s,
+            total_directories = completed_directories + %s + (
+                SELECT COUNT(*)
+                FROM strm_ingest_inventory_directories
+                WHERE active = TRUE AND manual_audit_id = %s
+            ),
+            updated_at = NOW()
+        WHERE audit_id = %s AND state IN ('queued', 'running')
+        """,
+        (int(delta), int(delta), audit_id, audit_id),
+    )
+
+
 def record_inventory_audit_batch(
     claim: Dict,
     *,
     files: Dict[str, Tuple[int, float]],
     child_directories: Iterable[str],
+    observed_entry_paths: Optional[Iterable[str]] = None,
     next_cursor: Optional[str],
     complete: bool,
     db_batch_size: int = 500,
@@ -857,6 +1070,14 @@ def record_inventory_audit_batch(
             )
         )
     children = sorted({os.path.normpath(path) for path in child_directories})
+    observed_entries = sorted({
+        os.path.normpath(path)
+        for path in (
+            observed_entry_paths
+            if observed_entry_paths is not None
+            else list(children) + list(files)
+        )
+    })
     db_batches = 0
     watch_set_changed = False
 
@@ -1023,79 +1244,21 @@ def record_inventory_audit_batch(
                     (root, directory, generation),
                 )
                 removed.extend(row['file_path'] for row in cursor.fetchall())
-                cursor.execute(
-                    """
-                    SELECT directory_path
-                    FROM strm_ingest_inventory_directories
-                    WHERE root_path = %s AND parent_path = %s AND active = TRUE
-                      AND seen_generation != %s
-                    """,
-                    (root, directory, generation),
+                terminalized = _terminalize_missing_first_hop_branches(
+                    cursor,
+                    root=root,
+                    directory=directory,
+                observed_entry_paths=observed_entries,
+                manual_audit_id=manual_audit_id,
+                include_generation_descendants=False,
                 )
-                missing_children = [row['directory_path'] for row in cursor.fetchall()]
-                watch_set_changed = watch_set_changed or bool(missing_children)
-                manual_terminalized = 0
-                for child in missing_children:
-                    child_like = child.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '/%'
-                    cursor.execute(
-                        """
-                        SELECT file_path FROM strm_ingest_retry_queue
-                        WHERE inventory_root_path = %s
-                          AND (inventory_directory_path = %s OR inventory_directory_path LIKE %s ESCAPE '\\')
-                          AND LOWER(file_path) LIKE '%%.strm'
-                          AND operation != 'delete'
-                          AND status NOT IN ('deleted', 'cancelled')
-                        """,
-                        (root, child, child_like),
-                    )
-                    removed.extend(row['file_path'] for row in cursor.fetchall())
-                    if manual_audit_id:
-                        cursor.execute(
-                            """
-                            SELECT COUNT(*) AS count
-                            FROM strm_ingest_inventory_directories
-                            WHERE root_path = %s
-                              AND active = TRUE
-                              AND manual_audit_id = %s
-                              AND (
-                                  directory_path = %s
-                                  OR directory_path LIKE %s ESCAPE '\\'
-                              )
-                            """,
-                            (root, manual_audit_id, child, child_like),
-                        )
-                        manual_terminalized += int(
-                            (cursor.fetchone() or {}).get('count') or 0
-                        )
-                    cursor.execute(
-                        """
-                        UPDATE strm_ingest_inventory_directories
-                        SET active = FALSE, dirty = FALSE, claim_owner = NULL,
-                            claim_expires_at = NULL,
-                            manual_audit_id = CASE
-                                WHEN manual_audit_id = %s THEN NULL
-                                ELSE manual_audit_id
-                            END,
-                            last_error = NULL, updated_at = NOW()
-                        WHERE root_path = %s
-                          AND (directory_path = %s OR directory_path LIKE %s ESCAPE '\\')
-                        """,
-                        (manual_audit_id, root, child, child_like),
-                    )
+                removed.extend(terminalized['removed'])
                 removed = sorted(set(removed))
-                if removed:
-                    cursor.execute(
-                        """
-                        UPDATE strm_ingest_retry_queue
-                        SET operation = 'delete', source = 'inventory_v2', status = 'pending',
-                            attempt_count = 0,
-                            next_attempt_at = NOW() + (600 * INTERVAL '1 second'),
-                            updated_at = NOW(), completed_at = NULL,
-                            last_error = '增量目录库存发现 STRM 已消失'
-                        WHERE file_path = ANY(%s)
-                        """,
-                        (removed,),
-                    )
+                _queue_inventory_removed_files(cursor, removed)
+                watch_set_changed = bool(
+                    watch_set_changed or terminalized['watch_set_changed']
+                )
+                manual_terminalized = int(terminalized['manual_terminalized'])
                 cursor.execute(
                     """
                     UPDATE strm_ingest_inventory_directories
@@ -1114,27 +1277,11 @@ def record_inventory_audit_batch(
                         root, directory, owner,
                     ),
                 )
-                if manual_audit_id and cursor.rowcount == 1:
-                    cursor.execute(
-                        """
-                        UPDATE strm_ingest_inventory_manual_audits
-                        SET state = 'running',
-                            started_at = COALESCE(started_at, NOW()),
-                            completed_directories = completed_directories + 1 + %s,
-                            total_directories = completed_directories + 1 + %s + (
-                                SELECT COUNT(*)
-                                FROM strm_ingest_inventory_directories
-                                WHERE active = TRUE AND manual_audit_id = %s
-                            ),
-                            updated_at = NOW()
-                        WHERE audit_id = %s AND state IN ('queued', 'running')
-                        """,
-                        (
-                            manual_terminalized,
-                            manual_terminalized,
-                            manual_audit_id,
-                            manual_audit_id,
-                        ),
+                if cursor.rowcount == 1:
+                    _advance_manual_inventory_progress(
+                        cursor,
+                        manual_audit_id,
+                        1 + manual_terminalized,
                     )
             else:
                 cursor.execute(
@@ -1156,6 +1303,121 @@ def record_inventory_audit_batch(
                 'db_batches': db_batches,
                 'directories_discovered': len(children),
                 'watch_set_changed': watch_set_changed,
+            }
+
+
+def record_inventory_ancestor_proof(
+    claim: Dict,
+    *,
+    ancestor: Dict,
+    observed_entry_paths: Iterable[str],
+) -> Dict[str, object]:
+    """Terminalize a missing branch proven by a fresh ancestor snapshot.
+
+    The missing claim remains the ownership fence.  The ancestor row's event
+    version is also compared after scandir so a concurrent watcher event makes
+    the proof stale instead of permitting deletion.
+    """
+    root = os.path.normpath(str(claim.get('root_path') or ''))
+    missing_directory = os.path.normpath(str(claim.get('directory_path') or ''))
+    ancestor_directory = os.path.normpath(str(ancestor.get('directory_path') or ''))
+    manual_audit_id = claim.get('manual_audit_id')
+    if (
+        not manual_audit_id
+        or _first_hop_below(root, ancestor_directory, missing_directory) is None
+    ):
+        return {'accepted': False, 'stale': True, 'proven': False, 'removed': []}
+    claim_branch = _first_hop_below(root, ancestor_directory, missing_directory)
+    observed_branches = {
+        branch
+        for path in observed_entry_paths or []
+        for branch in [_first_hop_below(root, ancestor_directory, path)]
+        if branch
+    }
+    if claim_branch in observed_branches:
+        return {'accepted': False, 'stale': False, 'proven': False, 'removed': []}
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT event_version, manual_audit_id
+                FROM strm_ingest_inventory_directories
+                WHERE root_path = %s AND directory_path = %s
+                  AND claim_owner = %s
+                FOR UPDATE
+                """,
+                (root, missing_directory, claim.get('claim_owner')),
+            )
+            current_claim = cursor.fetchone()
+            if (
+                not current_claim
+                or int(current_claim.get('event_version') or 0)
+                    != int(claim.get('event_version') or 0)
+                or current_claim.get('manual_audit_id') != manual_audit_id
+            ):
+                return {'accepted': False, 'stale': True, 'proven': False, 'removed': []}
+
+            cursor.execute(
+                """
+                SELECT event_version
+                FROM strm_ingest_inventory_directories
+                WHERE root_path = %s AND directory_path = %s
+                FOR UPDATE
+                """,
+                (root, ancestor_directory),
+            )
+            current_ancestor = cursor.fetchone()
+            if (
+                not current_ancestor
+                or int(current_ancestor.get('event_version') or 0)
+                    != int(ancestor.get('event_version') or 0)
+            ):
+                return {'accepted': False, 'stale': True, 'proven': False, 'removed': []}
+
+            terminalized = _terminalize_missing_first_hop_branches(
+                cursor,
+                root=root,
+                directory=ancestor_directory,
+                observed_entry_paths=observed_entry_paths,
+                manual_audit_id=manual_audit_id,
+                include_generation_descendants=True,
+            )
+            missing_branches = terminalized['missing_branches']
+            proven = claim_branch in missing_branches
+            if not proven:
+                return {
+                    'accepted': False,
+                    'stale': False,
+                    'proven': False,
+                    'removed': [],
+                }
+
+            removed = _queue_inventory_removed_files(cursor, terminalized['removed'])
+            cursor.execute(
+                """
+                UPDATE strm_ingest_inventory_directories
+                SET active = TRUE, dirty = FALSE, dirty_since = NULL,
+                    last_verified_at = NOW(), last_error = NULL,
+                    updated_at = NOW()
+                WHERE root_path = %s AND directory_path = %s
+                """,
+                (root, ancestor_directory),
+            )
+            _advance_manual_inventory_progress(
+                cursor,
+                manual_audit_id,
+                int(terminalized['manual_terminalized']),
+            )
+            return {
+                'accepted': True,
+                'stale': False,
+                'proven': True,
+                'complete': True,
+                'removed': removed,
+                'missing_branches': missing_branches,
+                'manual_terminalized': int(terminalized['manual_terminalized']),
+                'watch_set_changed': True,
             }
 
 

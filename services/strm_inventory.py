@@ -73,14 +73,16 @@ class IncrementalStrmInventory:
 
         files = {}
         child_directories = []
+        observed_entry_paths = []
         entries_seen = 0
         try:
             with os.scandir(directory) as entries:
                 for entry in entries:
                     entries_seen += 1
+                    path = os.path.normpath(os.path.join(directory, entry.name))
+                    observed_entry_paths.append(path)
                     if entry.name.startswith('.'):
                         continue
-                    path = os.path.normpath(os.path.join(directory, entry.name))
                     if entry.is_symlink():
                         continue
                     if entry.is_dir(follow_symlinks=False):
@@ -95,17 +97,20 @@ class IncrementalStrmInventory:
                         files[path] = (int(file_stat.st_size), float(file_stat.st_mtime))
         except OSError as exc:
             raise InventoryAuditError(self._classify_error(exc, is_root=is_root)) from exc
-        return files, child_directories, entries_seen
+        return files, child_directories, observed_entry_paths, entries_seen
 
     def scan_claim(self, claim: Dict) -> Dict[str, object]:
         root = os.path.normpath(claim['root_path'])
         directory = os.path.normpath(claim['directory_path'])
-        files, child_directories, entries_seen = self._snapshot_directory(root, directory)
+        files, child_directories, observed_entry_paths, entries_seen = (
+            self._snapshot_directory(root, directory)
+        )
 
         result = strm_ingest_db.record_inventory_audit_batch(
             claim,
             files=files,
             child_directories=child_directories,
+            observed_entry_paths=observed_entry_paths,
             next_cursor=None,
             complete=True,
             db_batch_size=self.db_batch_size,
@@ -114,6 +119,34 @@ class IncrementalStrmInventory:
         result['physical_enumerations'] = 1
         result['entries_seen'] = entries_seen
         return result
+
+    def _recover_missing_claim_from_ancestor(self, claim: Dict) -> Optional[Dict[str, object]]:
+        """Seek a fresh first-hop absence proof without treating ENOENT as proof."""
+        root = os.path.normpath(claim['root_path'])
+        directory = os.path.normpath(claim['directory_path'])
+        for ancestor in strm_ingest_db.get_inventory_ancestor_candidates(root, directory):
+            if ancestor.get('manual_audit_id') or ancestor.get('claim_owner'):
+                continue
+            ancestor_directory = os.path.normpath(ancestor['directory_path'])
+            try:
+                _files, _children, observed_entries, entries_seen = (
+                    self._snapshot_directory(root, ancestor_directory)
+                )
+            except InventoryAuditError as exc:
+                if exc.code == 'inaccessible':
+                    continue
+                raise
+            result = strm_ingest_db.record_inventory_ancestor_proof(
+                claim,
+                ancestor=ancestor,
+                observed_entry_paths=observed_entries,
+            )
+            result['physical_enumerations'] = 1
+            result['entries_seen'] = entries_seen
+            result['db_batches'] = 0
+            if result.get('proven') or result.get('stale'):
+                return result
+        return None
 
     def run_once(
         self,
@@ -166,8 +199,34 @@ class IncrementalStrmInventory:
                 )
                 summary['completed' if result.get('complete') else 'partial'] += 1
             except Exception as exc:
-                summary['failed'] += 1
                 error_code = exc.code if isinstance(exc, InventoryAuditError) else 'other_read_error'
+                recovered = None
+                if (
+                    isinstance(exc, InventoryAuditError)
+                    and exc.code == 'inaccessible'
+                    and claim.get('manual_audit_id')
+                ):
+                    try:
+                        recovered = self._recover_missing_claim_from_ancestor(claim)
+                    except InventoryAuditError as proof_exc:
+                        error_code = proof_exc.code
+                if recovered and recovered.get('accepted'):
+                    removed = recovered.get('removed') or []
+                    if removed and on_delete:
+                        on_delete(removed)
+                    summary['delete'] += len(removed)
+                    summary['physical_enumerations'] += int(
+                        recovered.get('physical_enumerations') or 0
+                    )
+                    summary['entries_seen'] += int(recovered.get('entries_seen') or 0)
+                    summary['db_batches'] += int(recovered.get('db_batches') or 0)
+                    summary['watch_set_changed'] = bool(
+                        summary['watch_set_changed']
+                        or recovered.get('watch_set_changed')
+                    )
+                    summary['completed'] += 1
+                    continue
+                summary['failed'] += 1
                 strm_ingest_db.fail_inventory_directory_claim(claim, error_code)
                 logger.error(
                     "STRM 增量目录核对失败 directory=%s status=%s error=%s",

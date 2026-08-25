@@ -528,25 +528,44 @@ class MediaInfoStateService:
                     result["target_reason_code"] = "episode_target_query_unstable"
                     return result
                 candidate_id = str(item.get("Id") or "").strip()
-                if (
-                    not candidate_id
-                    or str(item.get("Type") or "") != "Episode"
-                    or str(item.get("SeriesId") or "").strip() != source_id
-                ):
-                    result["target_reason_code"] = "episode_target_series_mismatch"
+                if not candidate_id:
+                    result["target_reason_code"] = "episode_target_query_unstable"
                     return result
                 if candidate_id in seen_item_ids:
                     result["target_reason_code"] = "episode_target_query_unstable"
                     return result
                 seen_item_ids.add(candidate_id)
-                if (
+                is_target_coordinate = (
                     item.get("ParentIndexNumber") == season_number
                     and item.get("IndexNumber") == episode_number
+                )
+                if not is_target_coordinate:
+                    if (
+                        str(item.get("Type") or "") != "Episode"
+                        or str(item.get("SeriesId") or "").strip() != source_id
+                    ):
+                        logger.warning(
+                            "Emby Series Episode 查询返回非目标身份异常项；"
+                            "source_item_id=%s candidate_item_id=%s candidate_type=%s "
+                            "candidate_series_id=%s parent_index=%s index=%s",
+                            source_id,
+                            candidate_id,
+                            str(item.get("Type") or ""),
+                            str(item.get("SeriesId") or "").strip(),
+                            item.get("ParentIndexNumber"),
+                            item.get("IndexNumber"),
+                        )
+                    continue
+                if (
+                    str(item.get("Type") or "") != "Episode"
+                    or str(item.get("SeriesId") or "").strip() != source_id
                 ):
-                    exact.append(item)
-                    if len(exact) > 1:
-                        result["target_reason_code"] = "episode_target_ambiguous"
-                        return result
+                    result["target_reason_code"] = "episode_target_series_mismatch"
+                    return result
+                exact.append(item)
+                if len(exact) > 1:
+                    result["target_reason_code"] = "episode_target_ambiguous"
+                    return result
 
             start_index += len(items)
             if start_index >= expected_total:

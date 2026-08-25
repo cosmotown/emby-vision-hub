@@ -10,7 +10,8 @@ CUSTOM_RELEASES = [
 - Series 历史记录先按精确 source ItemID 核验当前 Emby 身份，再解析历史原因中的 Episode 坐标；不按标题或 TMDb 猜测目标。
 - 已从 Emby 删除的历史 Series 统一归类为 `historical_item_missing`，即使历史原因没有 `SxxExx`，也可以由“清理失效历史记录”安全移出。
 - Emby 临时查询失败继续返回 `emby_lookup_failed`，source 类型不匹配继续失败关闭；两类记录均不会误入历史清理候选。
-- 当前仍存在的 Series 继续使用唯一 `SxxExx` 与 `/Shows/{SeriesId}/Episodes` 精确解析 Episode；分页、重复候选和 Series 身份保护保持不变。
+- 当前仍存在的 Series 继续使用唯一 `SxxExx` 与 `/Shows/{SeriesId}/Episodes` 精确解析 Episode；分页、重复候选和目标 Episode 身份保护保持不变。
+- `/Shows/{SeriesId}/Episodes` 返回中的非目标坐标异常项只记录脱敏诊断，不再污染合法目标；目标坐标本身的 Type 或 SeriesId 不一致仍返回 `episode_target_series_mismatch`。
 - ReviewList 将“手动编辑”明确为“编辑媒体”，并区分普通历史复核原因与 MediaInfo Episode 修复目标不可用，避免把媒体资料编辑页误解为目标修复入口。
 
 ### 明确不包含

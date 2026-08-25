@@ -297,6 +297,98 @@ class MediaInfoStateTests(unittest.TestCase):
         self.assertEqual("episode_target_series_mismatch", resolved["target_reason_code"])
 
     @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_non_target_series_mismatch_does_not_pollute_valid_target(self, get):
+        get.side_effect = [
+            self._series_identity(),
+            FakeResponse(
+                {
+                    "Items": [
+                        self._episode(1),
+                        self._episode(2, series_id="series-other"),
+                    ],
+                    "TotalRecordCount": 2,
+                }
+            ),
+        ]
+
+        resolved = self._service().resolve_review_target(
+            "series-1", "Series", "MediaInfo incomplete S01E01"
+        )
+
+        self.assertEqual("episode-1", resolved["target_item_id"])
+        self.assertEqual("series-1", resolved["target_series_id"])
+        self.assertIsNone(resolved["target_reason_code"])
+
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_target_non_episode_type_is_fail_closed(self, get):
+        target = self._episode(1)
+        target["Type"] = "Movie"
+        get.side_effect = [
+            self._series_identity(),
+            FakeResponse({"Items": [target], "TotalRecordCount": 1}),
+        ]
+
+        resolved = self._service().resolve_review_target(
+            "series-1", "Series", "MediaInfo incomplete S01E01"
+        )
+
+        self.assertIsNone(resolved["target_item_id"])
+        self.assertEqual("episode_target_series_mismatch", resolved["target_reason_code"])
+
+    @mock.patch("services.mediainfo_state.EPISODE_QUERY_PAGE_SIZE", 2)
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_duplicate_item_id_across_pages_remains_fail_closed(self, get):
+        duplicate = self._episode(2, item_id="episode-duplicate")
+        get.side_effect = [
+            self._series_identity(),
+            FakeResponse(
+                {
+                    "Items": [self._episode(1), duplicate],
+                    "TotalRecordCount": 4,
+                }
+            ),
+            FakeResponse(
+                {
+                    "Items": [duplicate, self._episode(3)],
+                    "TotalRecordCount": 4,
+                }
+            ),
+        ]
+
+        resolved = self._service().resolve_review_target(
+            "series-1", "Series", "MediaInfo incomplete S01E01"
+        )
+
+        self.assertIsNone(resolved["target_item_id"])
+        self.assertEqual("episode_target_query_unstable", resolved["target_reason_code"])
+
+    @mock.patch("services.mediainfo_state.EPISODE_QUERY_PAGE_SIZE", 2)
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
+    def test_total_record_count_change_remains_fail_closed(self, get):
+        get.side_effect = [
+            self._series_identity(),
+            FakeResponse(
+                {
+                    "Items": [self._episode(1), self._episode(2)],
+                    "TotalRecordCount": 4,
+                }
+            ),
+            FakeResponse(
+                {
+                    "Items": [self._episode(3)],
+                    "TotalRecordCount": 3,
+                }
+            ),
+        ]
+
+        resolved = self._service().resolve_review_target(
+            "series-1", "Series", "MediaInfo incomplete S01E01"
+        )
+
+        self.assertIsNone(resolved["target_item_id"])
+        self.assertEqual("episode_target_query_unstable", resolved["target_reason_code"])
+
+    @mock.patch("services.mediainfo_state.emby.emby_client.get")
     def test_existing_series_without_unique_coordinate_stops_after_identity_read(self, get):
         for reason, expected in (
             ("MediaInfo incomplete", "episode_coordinate_missing"),

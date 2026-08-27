@@ -2,6 +2,44 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.17",
+        "published_at": "2026-08-27T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.17",
+        "changelog": """## 人物清理保护媒体库安全闭环
+
+- 保护媒体库正式与人物清理域隔离；保护快照明确区分 `pending`、`building`、`ready` 和 `failed`。
+- 快照非 `ready` 时，候选列表、清理预览和删除全部失败关闭。
+- 保护库中任一媒体项的 People 字段、Person detail、分页或媒体库读取异常，都会使整个保护快照保持非就绪。
+
+## 人物身份保护与显式核验状态
+
+- 保护合同同时保护实时 Person ID、保守姓名键和精确 TMDb、IMDb、Douban 身份。
+- Provider identity 只能扩大保护集合，绝不能作为删除依据。
+- 候选记录新增 `verification_status`、`verification_snapshot_generation` 和 `verification_fingerprint`，不再根据 `last_checked_at + last_error` 推断 orphan。
+- `identity_alias_only` 明确为失败关闭：不可选择、不进入可删除预览、不允许删除。
+
+## 持久化一键安全清理
+
+- 一键清理先生成持久化 preview job，再由管理员通过明确确认短语和一次性 token 确认；预览与保护快照 generation 绑定。
+- 人物串行删除，每位人物在提交前都会重做完整实时保护和关联核验。
+- 向神医 Pro 发送不可重放的 `DeletePerson` 之前，先原子持久化 `deleting/submitting + post_attempts=1`。
+- timeout、连接中断和 5xx 都进入 ambiguous，不会自动再次提交 `DeletePerson`。
+- 进程重启后未完成清理任务进入 `interrupted_requires_repreview`，必须重新预览和确认。
+
+## 任务入口与升级安全
+
+- 任务中心移除 `scan-ghost-actors`；人物清理页继续保留不删除人物的“只读扫描”。
+- legacy direct-delete / merge 入口均为纯 fail-closed 兼容桩，不再保留可执行的危险删除主体。
+- v7.2.16 历史 candidate 升级后默认为 `verification_status=unverified`；不会因历史 `last_checked_at/last_error` 获得删除资格。
+
+### 明确不包含
+
+- 不包含 Fast Audit、STRM Inventory、MediaInfo、ReviewList 评分、演员数量评分或神医 MediaInfo 逻辑变更。
+
+""",
+    },
+
+    {
         "version": "v7.2.16",
         "published_at": "2026-08-25T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.16",

@@ -1,5 +1,6 @@
 import json
 import re
+import hashlib
 from typing import Any, Dict, Iterable, List, Optional
 
 
@@ -38,16 +39,33 @@ def find_ghost_candidates(
     all_people: Iterable[Dict[str, Any]],
     referenced_person_ids: Iterable[str],
     protected_person_names: Iterable[str] = (),
+    protected_provider_identities: Iterable[tuple[str, str]] = (),
 ) -> List[Dict[str, Any]]:
     referenced = {str(person_id) for person_id in referenced_person_ids if person_id}
     protected_names = build_person_name_protection_keys(protected_person_names)
-    return [
-        person
-        for person in all_people
-        if person.get('Id')
-        and str(person['Id']) not in referenced
-        and person_name_protection_keys(person.get('Name')).isdisjoint(protected_names)
-    ]
+    protected_identities = {
+        (str(provider).strip().lower(), str(provider_id).strip())
+        for provider, provider_id in protected_provider_identities
+        if str(provider).strip() and str(provider_id).strip()
+    }
+    candidates = []
+    for person in all_people:
+        if not person.get('Id') or str(person['Id']) in referenced:
+            continue
+        if not person_name_protection_keys(person.get('Name')).isdisjoint(protected_names):
+            continue
+        try:
+            person_identities = canonical_person_provider_identities(
+                person.get('ProviderIds'),
+                strict=True,
+            )
+        except ValueError:
+            # Malformed identity data cannot make a Person eligible for deletion.
+            continue
+        if not person_identities.isdisjoint(protected_identities):
+            continue
+        candidates.append(person)
+    return candidates
 
 
 def media_item_has_exact_person_reference(
@@ -142,20 +160,94 @@ def reference_check_failure_message(status: str, context: str = '人物关联核
     return f'Emby 返回异常，无法完成{context}；该人物已受保护，不允许删除'
 
 
-def build_identity_provider_pairs(provider_ids: Any) -> List[str]:
-    """Build Emby's exact provider filter for person identity comparison."""
+def canonical_person_provider_identities(
+    provider_ids: Any,
+    *,
+    strict: bool = False,
+) -> set[tuple[str, str]]:
+    """Return exact canonical TMDb/IMDb/Douban identities for a Person."""
     if isinstance(provider_ids, str):
         try:
             provider_ids = json.loads(provider_ids)
         except (TypeError, ValueError):
-            return []
+            if strict:
+                raise ValueError('ProviderIds JSON 格式无效')
+            return set()
     if not isinstance(provider_ids, dict):
-        return []
-    supported = {'tmdb': 'tmdb', 'imdb': 'imdb', 'douban': 'douban'}
-    pairs = []
+        if strict and provider_ids is not None:
+            raise ValueError('ProviderIds 必须为对象')
+        return set()
+
+    supported = {'tmdb', 'imdb', 'douban'}
+    collected: Dict[str, set[str]] = {}
     for key, value in provider_ids.items():
-        provider = supported.get(str(key).strip().lower())
+        provider = str(key).strip().lower()
+        if provider not in supported:
+            continue
+        if isinstance(value, (dict, list, tuple, set)):
+            if strict:
+                raise ValueError(f'{provider} 身份为多值或复合结构')
+            continue
         normalized_value = str(value or '').strip()
-        if provider and normalized_value and ',' not in normalized_value:
-            pairs.append(f'{provider}.{normalized_value}')
-    return sorted(set(pairs))
+        if not normalized_value:
+            continue
+        if ',' in normalized_value or ';' in normalized_value:
+            if strict:
+                raise ValueError(f'{provider} 身份包含多值分隔符')
+            continue
+        if provider in {'tmdb', 'douban'}:
+            if not normalized_value.isdigit() or int(normalized_value) <= 0:
+                if strict:
+                    raise ValueError(f'{provider} 身份格式无效')
+                continue
+            normalized_value = str(int(normalized_value))
+        else:
+            normalized_value = normalized_value.lower()
+            if not re.fullmatch(r'nm\d+', normalized_value):
+                if strict:
+                    raise ValueError('imdb 身份格式无效')
+                continue
+        collected.setdefault(provider, set()).add(normalized_value)
+
+    identities = set()
+    for provider, values in collected.items():
+        if len(values) != 1:
+            if strict:
+                raise ValueError(f'{provider} 身份冲突')
+            continue
+        identities.add((provider, next(iter(values))))
+    return identities
+
+
+def build_identity_provider_pairs(provider_ids: Any) -> List[str]:
+    """Build Emby's exact provider filter for person identity comparison."""
+    return sorted(
+        f'{provider}.{provider_id}'
+        for provider, provider_id in canonical_person_provider_identities(provider_ids)
+    )
+
+
+def candidate_fingerprint(candidate: Dict[str, Any]) -> str:
+    """Bind a verification/preview result to the candidate identity that was checked."""
+    payload = {
+        'person_id': str(candidate.get('person_id') or candidate.get('Id') or '').strip(),
+        'person_name': str(candidate.get('person_name') or candidate.get('Name') or '').strip(),
+        'provider_ids': candidate.get('provider_ids_json') or candidate.get('ProviderIds') or {},
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    ).hexdigest()
+
+
+def is_explicit_verified_orphan(candidate: Dict[str, Any], snapshot_generation: int) -> bool:
+    """Only an explicit orphan result from the current protection snapshot is selectable."""
+    try:
+        checked_generation = int(candidate.get('verification_snapshot_generation'))
+    except (TypeError, ValueError):
+        return False
+    return (
+        candidate.get('verification_status') == 'orphan'
+        and checked_generation == int(snapshot_generation)
+        and not candidate.get('last_error')
+        and candidate.get('verification_fingerprint') == candidate_fingerprint(candidate)
+    )

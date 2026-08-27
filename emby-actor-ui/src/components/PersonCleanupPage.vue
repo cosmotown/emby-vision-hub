@@ -21,6 +21,14 @@
             只读扫描
           </n-button>
           <n-button
+            type="warning"
+            :loading="safeCleanupJob?.state === 'previewing'"
+            :disabled="isBackgroundBusy || protectionSnapshot.state !== 'ready'"
+            @click="startSafeCleanupPreview"
+          >
+            一键安全清理
+          </n-button>
+          <n-button
             type="error"
             :loading="isDeleteRunning"
             :disabled="selectedIds.length === 0 || isBackgroundBusy"
@@ -33,7 +41,16 @@
     </n-page-header>
 
     <n-alert type="warning" title="安全说明" style="margin: 20px 0;">
-      扫描只生成候选，不会删除人物。候选必须先通过“核对详情”，确认当前 Person ID 精确关联为 0 后才能勾选。删除前还会再次查询 Emby；发现关联作品、连接失败、响应异常或 People 仍不可用都会跳过。删除接口需要神医 Pro 支持。
+      扫描只生成候选，不会删除人物。只有当前保护快照下显式核验为 orphan 的人物才能勾选；identity_alias_only 始终受保护。删除前还会再次查询 Emby；发现关联作品、连接失败、响应异常或 People 仍不可用都会跳过。删除接口需要神医 Pro 支持。
+    </n-alert>
+
+    <n-alert
+      v-if="protectionSnapshot.state !== 'ready'"
+      type="error"
+      title="保护快照尚未就绪，人物清理已锁定"
+      style="margin-bottom: 16px;"
+    >
+      当前状态：{{ protectionSnapshot.state || 'unknown' }}。必须先完成一次严格只读扫描，且所有受保护媒体库的分页、People 与人物详情均完整，才允许核对或删除。
     </n-alert>
 
     <section class="protected-libraries-panel">
@@ -75,6 +92,9 @@
                 </n-tag>
                 <n-tag v-if="library.protected_name_count" size="small" :bordered="false" type="info">
                   姓名键 {{ library.protected_name_count }} 个
+                </n-tag>
+                <n-tag v-if="library.protected_identity_count" size="small" :bordered="false" type="success">
+                  外部身份 {{ library.protected_identity_count }} 个
                 </n-tag>
               </n-space>
             </n-checkbox>
@@ -206,7 +226,7 @@
             </n-list>
           </div>
 
-          <div v-if="['orphan', 'identity_alias_only'].includes(verificationResult.status)">
+          <div v-if="verificationResult.status === 'orphan'">
             <n-divider>TMDb / IMDb / 豆瓣同身份对照</n-divider>
             <n-alert
               v-if="verificationResult.identity_comparison === 'unavailable'"
@@ -285,11 +305,50 @@
         </template>
       </n-card>
     </n-modal>
+
+    <n-modal v-model:show="safeCleanupModalVisible" :mask-closable="false">
+      <n-card class="person-verify-card" title="一键安全清理" closable @close="safeCleanupModalVisible = false">
+        <n-alert type="warning" title="持久化安全任务" style="margin-bottom: 16px;">
+          预览不会删除人物。确认后将串行执行；每位人物删除前都会刷新完整保护快照并实时核验，且删除尝试必须先持久化后才发送一次 POST。
+        </n-alert>
+        <n-descriptions v-if="safeCleanupJob" bordered :column="1" label-placement="left">
+          <n-descriptions-item label="状态">{{ safeCleanupJob.state }}</n-descriptions-item>
+          <n-descriptions-item label="候选">{{ safeCleanupJob.candidate_total || 0 }}</n-descriptions-item>
+          <n-descriptions-item label="显式 orphan">{{ safeCleanupJob.verified_orphan_count || 0 }}</n-descriptions-item>
+          <n-descriptions-item label="受保护/跳过">{{ safeCleanupJob.protected_count || 0 }} / {{ safeCleanupJob.skipped_count || 0 }}</n-descriptions-item>
+          <n-descriptions-item label="核验失败/删除失败">{{ safeCleanupJob.verification_failed_count || 0 }} / {{ safeCleanupJob.failed_count || 0 }}</n-descriptions-item>
+          <n-descriptions-item v-if="safeCleanupJob.last_error" label="错误">{{ safeCleanupJob.last_error }}</n-descriptions-item>
+        </n-descriptions>
+        <template v-if="safeCleanupJob?.state === 'preview_ready'">
+          <n-divider>显式确认</n-divider>
+          <n-text depth="3">输入“确认删除已核验孤儿人物”后才允许开始。</n-text>
+          <n-input v-model:value="safeCleanupConfirmation" style="margin-top: 8px;" />
+        </template>
+        <n-space justify="end" style="margin-top: 16px;">
+          <n-button
+            v-if="['previewing', 'running', 'stop_requested'].includes(safeCleanupJob?.state)"
+            type="warning"
+            @click="stopSafeCleanup"
+          >
+            安全停止
+          </n-button>
+          <n-button
+            v-if="safeCleanupJob?.state === 'preview_ready'"
+            type="error"
+            :disabled="safeCleanupConfirmation !== '确认删除已核验孤儿人物' || safeCleanupConfirming"
+            :loading="safeCleanupConfirming"
+            @click="confirmSafeCleanup"
+          >
+            确认串行删除
+          </n-button>
+        </n-space>
+      </n-card>
+    </n-modal>
   </n-layout>
 </template>
 
 <script setup>
-import { computed, h, onMounted, ref, watch } from 'vue';
+import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import axios from 'axios';
 import {
   NAlert,
@@ -303,6 +362,7 @@ import {
   NDivider,
   NEmpty,
   NImage,
+  NInput,
   NLayout,
   NList,
   NListItem,
@@ -335,6 +395,13 @@ const protectedLibraries = ref([]);
 const selectedProtectedIds = ref([]);
 const protectedLoading = ref(false);
 const protectedSaving = ref(false);
+const protectionSnapshot = ref({ state: 'unknown', generation: null });
+const snapshotGeneration = ref(null);
+const safeCleanupModalVisible = ref(false);
+const safeCleanupJob = ref(null);
+const safeCleanupConfirmation = ref('');
+const safeCleanupConfirming = ref(false);
+let safeCleanupPollTimer = null;
 const pagination = { pageSize: 30, showSizePicker: true, pageSizes: [20, 30, 50, 100] };
 
 const currentAction = computed(() => props.taskStatus?.current_action || '');
@@ -373,7 +440,11 @@ const verificationSummary = computed(() => {
 });
 
 const imageUrl = (personId) => `/image_proxy/Items/${personId}/Images/Primary?maxWidth=160&quality=85`;
-const isVerifiedOrphan = (row) => Boolean(row.last_checked_at && !row.last_error);
+const isVerifiedOrphan = (row) => Boolean(
+  row.verification_status === 'orphan'
+  && row.verification_snapshot_generation === snapshotGeneration.value
+  && !row.last_error,
+);
 const formatDate = (value) => {
   if (!value) return '-';
   const date = new Date(value);
@@ -433,6 +504,9 @@ const columns = [
     key: 'last_error',
     minWidth: 220,
     render: (row) => {
+      if (row.verification_status === 'identity_alias_only') {
+        return h(NTag, { type: 'warning', bordered: false }, () => '同身份别名：受保护');
+      }
       if (row.last_error) {
         return h(NText, { type: 'error', style: 'white-space:normal;overflow-wrap:anywhere;' }, () => row.last_error);
       }
@@ -520,7 +594,7 @@ const verifyCandidate = async (row) => {
       const index = candidates.value.findIndex((item) => item.person_id === row.person_id);
       if (index >= 0) candidates.value[index] = response.data.candidate;
       if (response.data.status === 'identity_alias_only') {
-        message.info(response.data.message || '仅命中同身份的其他 Person，当前人物已可勾选');
+        message.warning(response.data.message || '仅命中同身份的其他 Person，该人物保持受保护且不可删除');
       } else {
         message.success(response.data.message || '核对完成，可以人工勾选');
       }
@@ -547,6 +621,11 @@ const fetchCandidates = async () => {
   try {
     const response = await axios.get('/api/person-cleanup/candidates');
     candidates.value = response.data.candidates || [];
+    snapshotGeneration.value = response.data.snapshot_generation;
+    protectionSnapshot.value = {
+      state: response.data.snapshot_state || 'ready',
+      generation: response.data.snapshot_generation,
+    };
     const validIds = new Set(
       candidates.value
         .filter(isVerifiedOrphan)
@@ -556,6 +635,13 @@ const fetchCandidates = async () => {
     loadError.value = '';
   } catch (error) {
     loadError.value = error.response?.data?.error || '无法读取人物候选';
+    const snapshot = error.response?.data?.snapshot_state;
+    if (snapshot && typeof snapshot === 'object') {
+      protectionSnapshot.value = {
+        ...snapshot,
+        state: snapshot.snapshot_state || snapshot.state || 'unknown',
+      };
+    }
   } finally {
     loading.value = false;
   }
@@ -566,6 +652,11 @@ const fetchProtectedLibraries = async () => {
   try {
     const response = await axios.get('/api/person-cleanup/protected-libraries');
     protectedLibraries.value = response.data.libraries || [];
+    const snapshot = response.data.snapshot || {};
+    protectionSnapshot.value = {
+      ...snapshot,
+      state: snapshot.snapshot_state || snapshot.state || 'unknown',
+    };
     selectedProtectedIds.value = protectedLibraries.value
       .filter((library) => library.selected)
       .map((library) => library.library_id);
@@ -628,6 +719,65 @@ const deleteSelected = async () => {
   }
 };
 
+const scheduleSafeCleanupPoll = () => {
+  if (safeCleanupPollTimer) window.clearTimeout(safeCleanupPollTimer);
+  const terminalStates = new Set(['preview_ready', 'completed', 'stopped', 'failed', 'superseded', 'interrupted_requires_repreview']);
+  if (!safeCleanupJob.value || terminalStates.has(safeCleanupJob.value.state)) return;
+  safeCleanupPollTimer = window.setTimeout(pollSafeCleanupJob, 1000);
+};
+
+const pollSafeCleanupJob = async () => {
+  if (!safeCleanupJob.value?.job_id) return;
+  try {
+    const response = await axios.get(`/api/person-cleanup/cleanup-jobs/${encodeURIComponent(safeCleanupJob.value.job_id)}`);
+    safeCleanupJob.value = response.data.job;
+    scheduleSafeCleanupPoll();
+    if (['completed', 'stopped'].includes(safeCleanupJob.value.state)) await fetchCandidates();
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法读取安全清理任务状态');
+  }
+};
+
+const startSafeCleanupPreview = async () => {
+  try {
+    const response = await axios.post('/api/person-cleanup/cleanup-jobs/preview');
+    safeCleanupJob.value = { job_id: response.data.job_id, state: response.data.state };
+    safeCleanupConfirmation.value = '';
+    safeCleanupModalVisible.value = true;
+    scheduleSafeCleanupPoll();
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法创建安全清理预览');
+  }
+};
+
+const confirmSafeCleanup = async () => {
+  safeCleanupConfirming.value = true;
+  try {
+    const jobId = safeCleanupJob.value.job_id;
+    const tokenResponse = await axios.post(`/api/person-cleanup/cleanup-jobs/${encodeURIComponent(jobId)}/confirmation-token`);
+    await axios.post(`/api/person-cleanup/cleanup-jobs/${encodeURIComponent(jobId)}/confirm`, {
+      confirmation: safeCleanupConfirmation.value,
+      confirmation_token: tokenResponse.data.confirmation_token,
+    });
+    safeCleanupJob.value = { ...safeCleanupJob.value, state: 'confirmed' };
+    scheduleSafeCleanupPoll();
+  } catch (error) {
+    message.error(error.response?.data?.error || '安全清理确认失败');
+  } finally {
+    safeCleanupConfirming.value = false;
+  }
+};
+
+const stopSafeCleanup = async () => {
+  try {
+    await axios.post(`/api/person-cleanup/cleanup-jobs/${encodeURIComponent(safeCleanupJob.value.job_id)}/stop`);
+    safeCleanupJob.value = { ...safeCleanupJob.value, state: 'stop_requested' };
+    scheduleSafeCleanupPoll();
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法停止安全清理任务');
+  }
+};
+
 watch(
   () => props.taskStatus?.is_running,
   (isRunning, wasRunning) => {
@@ -641,6 +791,10 @@ watch(
 onMounted(() => {
   fetchCandidates();
   fetchProtectedLibraries();
+});
+
+onBeforeUnmount(() => {
+  if (safeCleanupPollTimer) window.clearTimeout(safeCleanupPollTimer);
 });
 </script>
 

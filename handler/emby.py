@@ -764,24 +764,37 @@ def get_referenced_person_ids_strict(
             else None
         )
         start_index = 0
+        expected_total = None
+        seen_item_ids = set()
         while True:
             params = {
-                'api_key': api_key,
                 'ParentId': library_id,
                 'Recursive': 'true',
                 'IncludeItemTypes': 'Movie,Series,Episode,Video,MusicVideo',
                 'Fields': 'People',
                 'StartIndex': start_index,
                 'Limit': max(1, int(batch_size)),
-                'EnableTotalRecordCount': 'false',
+                'EnableTotalRecordCount': 'true',
             }
             try:
-                response = emby_client.get(api_url, params=params, timeout=60)
+                response = emby_client.get(
+                    api_url,
+                    headers={'X-Emby-Token': api_key},
+                    params=params,
+                    timeout=60,
+                )
                 response.raise_for_status()
                 payload = response.json()
-                if not isinstance(payload, dict) or 'Items' not in payload:
-                    raise ValueError("Emby 响应缺少 Items")
-                items = payload.get('Items') or []
+                if not isinstance(payload, dict) or not isinstance(payload.get('Items'), list):
+                    raise ValueError("Emby 响应缺少有效 Items")
+                total = payload.get('TotalRecordCount')
+                if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+                    raise ValueError('Emby 响应缺少有效 TotalRecordCount')
+                if expected_total is None:
+                    expected_total = total
+                elif total != expected_total:
+                    raise ValueError('Emby 分页期间 TotalRecordCount 发生变化')
+                items = payload['Items']
             except Exception as exc:
                 logger.error(
                     f"严格扫描媒体库 {library_id} 失败 (StartIndex={start_index}): {exc}",
@@ -790,25 +803,111 @@ def get_referenced_person_ids_strict(
                 return None
 
             if not items:
+                if start_index < int(expected_total or 0):
+                    logger.error('严格扫描媒体库 %s 分页提前结束', library_id)
+                    return None
                 break
             media_count += len(items)
             for item in items:
-                for person in item.get('People') or []:
-                    if person.get('Id'):
-                        person_id = str(person['Id'])
-                        referenced_person_ids.add(person_id)
-                        if library_people is not None:
-                            library_people[person_id] = person.get('Name') or ''
+                if not isinstance(item, dict):
+                    return None
+                item_id = str(item.get('Id') or '').strip()
+                if not item_id or item_id in seen_item_ids:
+                    return None
+                seen_item_ids.add(item_id)
+                if 'People' not in item or not isinstance(item.get('People'), list):
+                    logger.error('严格扫描媒体库 %s 时项目 %s 的 People 不可核验', library_id, item_id)
+                    return None
+                for person in item['People']:
+                    if not isinstance(person, dict):
+                        return None
+                    person_id = str(person.get('Id') or '').strip()
+                    if not person_id:
+                        logger.error(
+                            '严格扫描媒体库 %s 时项目 %s 含无法识别的人物 ID',
+                            library_id,
+                            item_id,
+                        )
+                        return None
+                    referenced_person_ids.add(person_id)
+                    if library_people is not None:
+                        library_people[person_id] = person.get('Name') or ''
 
             start_index += len(items)
-            if len(items) < max(1, int(batch_size)):
+            if start_index >= int(expected_total or 0):
                 break
+            if len(items) < max(1, int(batch_size)):
+                logger.error('严格扫描媒体库 %s 分页长度不足', library_id)
+                return None
+
+        if len(seen_item_ids) != int(expected_total or 0):
+            return None
 
     return {
         'person_ids': referenced_person_ids,
         'people_by_library': people_by_library,
         'media_count': media_count,
     }
+
+
+def get_person_details_strict(
+    base_url: str,
+    api_key: str,
+    person_ids: Iterable[str],
+    batch_size: int = 100,
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Read exact global Person rows with complete Name/Type/ProviderIds."""
+    normalized_ids = sorted({
+        str(person_id).strip()
+        for person_id in person_ids
+        if str(person_id).strip()
+    })
+    if not base_url or not api_key:
+        return None
+    if not normalized_ids:
+        return {}
+
+    api_url = f"{base_url.rstrip('/')}/Items"
+    details = {}
+    safe_batch_size = max(1, min(int(batch_size), 100))
+    for start in range(0, len(normalized_ids), safe_batch_size):
+        batch_ids = normalized_ids[start:start + safe_batch_size]
+        try:
+            response = emby_client.get(
+                api_url,
+                headers={'X-Emby-Token': api_key},
+                params={
+                    'Ids': ','.join(batch_ids),
+                    'Fields': 'ProviderIds,Name,Type',
+                    'EnableTotalRecordCount': 'false',
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get('Items'), list):
+                raise ValueError('Person detail 响应格式异常')
+            batch_details = {}
+            for item in payload['Items']:
+                if not isinstance(item, dict):
+                    raise ValueError('Person detail 包含非法项目')
+                person_id = str(item.get('Id') or '').strip()
+                if person_id not in batch_ids or person_id in batch_details:
+                    raise ValueError('Person detail ID 不匹配或重复')
+                if item.get('Type') != 'Person':
+                    raise ValueError('Person detail Type 不匹配')
+                if not str(item.get('Name') or '').strip():
+                    raise ValueError('Person detail 缺少 Name')
+                if 'ProviderIds' not in item or not isinstance(item.get('ProviderIds'), dict):
+                    raise ValueError('Person detail 缺少有效 ProviderIds')
+                batch_details[person_id] = item
+            if set(batch_details) != set(batch_ids):
+                raise ValueError('Person detail 未完整返回 exact IDs')
+            details.update(batch_details)
+        except Exception as exc:
+            logger.error('严格读取保护人物详情失败: %s', type(exc).__name__)
+            return None
+    return details
 
 # ✨✨✨ 刷新Emby元数据 ✨✨✨
 def refresh_emby_item_metadata(item_emby_id: str,
@@ -2643,7 +2742,7 @@ def upload_item_primary_image_from_url(
         return False
 
 
-def delete_person_custom_api(base_url: str, api_key: str, person_id: str) -> bool:
+def delete_person_custom_api_outcome(base_url: str, api_key: str, person_id: str) -> str:
     """
     【V-Final Frontier 终极版 - 同样使用账密获取令牌】
     通过模拟管理员登录获取临时 AccessToken 来删除演员。
@@ -2657,7 +2756,7 @@ def delete_person_custom_api(base_url: str, api_key: str, person_id: str) -> boo
     
     if not access_token:
         logger.error("  🚫 无法获取临时 AccessToken，删除演员操作中止。请检查管理员账号密码是否正确。")
-        return False
+        return 'failed'
 
     # 2. 使用临时令牌执行删除
     # 调用非标准的 /Items/{Id}/DeletePerson POST 接口
@@ -2675,28 +2774,63 @@ def delete_person_custom_api(base_url: str, api_key: str, person_id: str) -> boo
     
     try:
         # 这个接口是 POST 请求
-        response = emby_client.post_once(api_url, headers=headers, params=params)
-        response.raise_for_status()
-        logger.info(f"  ✅ 成功删除演员 ID: {person_id}。")
-        return True
+        response = emby_client.post_once(
+            api_url,
+            headers=headers,
+            params=params,
+            timeout=60,
+        )
+        status_code = int(response.status_code)
+        if 200 <= status_code < 300:
+            logger.info(f"  ✅ 成功提交删除演员 ID: {person_id}。")
+            return 'confirmed'
+        if 300 <= status_code < 500:
+            if status_code == 404:
+                logger.error(f"删除演员 {person_id} 失败：需神医Pro版本才支持此功能。")
+            else:
+                logger.error("删除演员 %s 明确失败: HTTP %s", person_id, status_code)
+            return 'failed'
+        logger.error("删除演员 %s 返回 HTTP %s，结果不确定且不会自动重放", person_id, status_code)
+        return 'ambiguous'
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+        logger.error(
+            "删除演员 %s 时连接中断或超时，结果不确定且不会自动重放: %s",
+            person_id,
+            type(exc).__name__,
+        )
+        return 'ambiguous'
     except requests.exceptions.HTTPError as e:
-        # 404 Not Found 意味着这个专用接口在您的服务器上不存在
-        if e.response.status_code == 404:
+        status_code = int(e.response.status_code) if e.response is not None else 0
+        if status_code == 404:
             logger.error(f"删除演员 {person_id} 失败：需神医Pro版本才支持此功能。")
-        else:
+            return 'failed'
+        if 400 <= status_code < 500:
             logger.error(
                 "使用临时令牌删除演员 %s 时发生 HTTP 错误: %s",
                 person_id,
-                e.response.status_code,
+                status_code,
             )
-        return False
-    except Exception as e:
+            return 'failed'
+        return 'ambiguous'
+    except requests.exceptions.RequestException as e:
         logger.error(
-            "使用临时令牌删除演员 %s 时发生未知错误: %s",
+            "使用临时令牌删除演员 %s 时发生传输错误，结果不确定且不会自动重放: %s",
             person_id,
             type(e).__name__,
         )
-        return False
+        return 'ambiguous'
+    except Exception as e:
+        logger.error(
+            "使用临时令牌删除演员 %s 时发生未知错误，结果不确定且不会自动重放: %s",
+            person_id,
+            type(e).__name__,
+        )
+        return 'ambiguous'
+
+
+def delete_person_custom_api(base_url: str, api_key: str, person_id: str) -> bool:
+    """Backward-compatible boolean wrapper around the non-replaying outcome API."""
+    return delete_person_custom_api_outcome(base_url, api_key, person_id) == 'confirmed'
 
 # --- 获取所有 Emby 用户列表 ---
 def get_all_emby_users_from_server(base_url: str, api_key: str) -> Optional[List[Dict[str, Any]]]:

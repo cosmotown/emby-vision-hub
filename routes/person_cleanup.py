@@ -14,7 +14,12 @@ from services.person_cleanup_safety import (
     classify_reference_check,
     reference_check_failure_message,
 )
-from tasks.actors import task_delete_selected_ghost_actors, task_scan_ghost_actor_candidates
+from tasks.actors import (
+    task_delete_selected_ghost_actors,
+    task_execute_safe_person_cleanup,
+    task_preview_safe_person_cleanup,
+    task_scan_ghost_actor_candidates,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -44,8 +49,19 @@ def _refreshed_candidate(person_id, fallback):
 @admin_required
 def get_person_cleanup_candidates():
     try:
+        generation = person_cleanup_db.require_ready_protection_snapshot()
         candidates = person_cleanup_db.list_candidates()
-        return jsonify({'candidates': candidates, 'total': len(candidates)})
+        return jsonify({
+            'candidates': candidates,
+            'total': len(candidates),
+            'snapshot_generation': generation,
+            'snapshot_state': 'ready',
+        })
+    except RuntimeError as exc:
+        return jsonify({
+            'error': str(exc),
+            'snapshot_state': person_cleanup_db.get_protection_state(),
+        }), 409
     except Exception as exc:
         logger.error(f"读取人物清理候选失败: {exc}", exc_info=True)
         return jsonify({'error': '无法读取人物清理候选'}), 500
@@ -96,6 +112,7 @@ def get_person_cleanup_protected_libraries():
             'selected': library_id in protected,
             'protected_person_count': int(protected_info.get('protected_person_count') or 0),
             'protected_name_count': int(protected_info.get('protected_name_count') or 0),
+            'protected_identity_count': int(protected_info.get('protected_identity_count') or 0),
             'missing': False,
         })
     for library_id, protected_info in protected.items():
@@ -108,9 +125,13 @@ def get_person_cleanup_protected_libraries():
             'selected': True,
             'protected_person_count': int(protected_info.get('protected_person_count') or 0),
             'protected_name_count': int(protected_info.get('protected_name_count') or 0),
+            'protected_identity_count': int(protected_info.get('protected_identity_count') or 0),
             'missing': True,
         })
-    return jsonify({'libraries': result})
+    return jsonify({
+        'libraries': result,
+        'snapshot': person_cleanup_db.get_protection_state(),
+    })
 
 
 @person_cleanup_bp.route('/protected-libraries', methods=['POST'])
@@ -153,8 +174,9 @@ def save_person_cleanup_protected_libraries():
         for library_id in sorted(normalized_ids)
     ])
     return jsonify({
-        'message': f'已保存 {saved_count} 个受保护媒体库；请执行一次只读扫描以更新人物快照',
+        'message': f'已保存 {saved_count} 个受保护媒体库；保护快照重新就绪前人物清理保持禁用',
         'count': saved_count,
+        'snapshot': person_cleanup_db.get_protection_state(),
     })
 
 
@@ -162,12 +184,26 @@ def save_person_cleanup_protected_libraries():
 @admin_required
 @processor_ready_required
 def verify_person_cleanup_candidate(person_id):
+    try:
+        snapshot_generation = person_cleanup_db.require_ready_protection_snapshot()
+        contract = person_cleanup_db.get_protection_contract()
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 409
     normalized_id = str(person_id or '').strip()
     candidates = person_cleanup_db.get_candidates_by_ids([normalized_id])
     if not candidates:
         return jsonify({'error': '该人物已不在候选列表中，请刷新页面'}), 404
 
     candidate = candidates[0]
+    protection_reason = person_cleanup_db.candidate_protection_reason(candidate, contract)
+    if protection_reason:
+        person_cleanup_db.remove_candidate(normalized_id)
+        return jsonify({
+            'status': protection_reason,
+            'message': '该人物命中受保护媒体库合同，已撤销候选',
+            'candidate_removed': True,
+            'verification_complete': False,
+        }), 409
     references = emby.get_person_media_references(
         extensions.media_processor_instance.emby_url,
         extensions.media_processor_instance.emby_api_key,
@@ -204,7 +240,12 @@ def verify_person_cleanup_candidate(person_id):
 
     if reference_status in {'connection_failed', 'invalid_response', 'people_unavailable'}:
         error = reference_check_failure_message(reference_status)
-        person_cleanup_db.mark_candidate_checked(normalized_id, error)
+        person_cleanup_db.mark_candidate_checked(
+            normalized_id,
+            reference_status,
+            snapshot_generation,
+            error,
+        )
         response.update({
             'error': error,
             'message': error,
@@ -222,6 +263,23 @@ def verify_person_cleanup_candidate(person_id):
         response['message'] = '发现当前关联作品，已从清理候选中撤销'
         return jsonify(response)
 
+    if reference_status == 'identity_alias_only':
+        error = '仅命中同身份其他 Person 的作品；不是显式 orphan，禁止删除'
+        person_cleanup_db.mark_candidate_checked(
+            normalized_id,
+            'identity_alias_only',
+            snapshot_generation,
+            error,
+        )
+        response.update({
+            'error': error,
+            'message': error,
+            'candidate': _refreshed_candidate(normalized_id, candidate),
+            'candidate_removed': False,
+            'verification_complete': True,
+        })
+        return jsonify(response), 409
+
     provider_pairs = build_identity_provider_pairs(response['provider_ids'])
     identity_matches = []
     if provider_pairs:
@@ -235,7 +293,12 @@ def verify_person_cleanup_candidate(person_id):
                 'invalid_response',
                 context='TMDb/IMDb/豆瓣同身份人物对照',
             )
-            person_cleanup_db.mark_candidate_checked(normalized_id, error)
+            person_cleanup_db.mark_candidate_checked(
+                normalized_id,
+                'invalid_response',
+                snapshot_generation,
+                error,
+            )
             response.update({
                 'status': 'invalid_response',
                 'candidate_reference_status': reference_status,
@@ -261,7 +324,12 @@ def verify_person_cleanup_candidate(person_id):
             if matching_status in {'connection_failed', 'invalid_response', 'people_unavailable'}:
                 context = f'同身份人物 {matching_person.get("Name") or matching_id} 的关联作品核对'
                 error = reference_check_failure_message(matching_status, context=context)
-                person_cleanup_db.mark_candidate_checked(normalized_id, error)
+                person_cleanup_db.mark_candidate_checked(
+                    normalized_id,
+                    matching_status,
+                    snapshot_generation,
+                    error,
+                )
                 response.update({
                     'status': matching_status,
                     'candidate_reference_status': reference_status,
@@ -280,7 +348,11 @@ def verify_person_cleanup_candidate(person_id):
                 'items': _serialize_reference_items(matching_references.get('items')),
             })
 
-    person_cleanup_db.mark_candidate_checked(normalized_id)
+    person_cleanup_db.mark_candidate_checked(
+        normalized_id,
+        'orphan',
+        snapshot_generation,
+    )
     refreshed = person_cleanup_db.get_candidates_by_ids([normalized_id])
     response['candidate'] = refreshed[0] if refreshed else candidate
     response['candidate_removed'] = False
@@ -307,6 +379,10 @@ def verify_person_cleanup_candidate(person_id):
 @task_lock_required
 @processor_ready_required
 def delete_person_cleanup_candidates():
+    try:
+        person_cleanup_db.require_ready_protection_snapshot()
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 409
     payload = request.get_json(silent=True) or {}
     person_ids = payload.get('person_ids')
     if not isinstance(person_ids, list) or not person_ids:
@@ -318,9 +394,11 @@ def delete_person_cleanup_candidates():
     if len(normalized_ids) > 500:
         return jsonify({'error': '单次最多删除 500 位人物'}), 400
 
-    candidates = person_cleanup_db.get_candidates_by_ids(normalized_ids)
+    candidates = person_cleanup_db.list_explicit_verified_orphans(normalized_ids)
     if len(candidates) != len(normalized_ids):
-        return jsonify({'error': '选择中包含已失效或不在候选列表的人物，请刷新后重试'}), 409
+        return jsonify({
+            'error': '只有当前保护快照下显式核验为 orphan 的人物可以删除'
+        }), 409
 
     submitted = task_manager.submit_task(
         task_delete_selected_ghost_actors,
@@ -334,3 +412,97 @@ def delete_person_cleanup_candidates():
         'message': '删除任务已提交，每位人物都会在删除前重新核验媒体关联',
         'count': len(normalized_ids),
     }), 202
+
+
+@person_cleanup_bp.route('/cleanup-jobs/preview', methods=['POST'])
+@admin_required
+@task_lock_required
+@processor_ready_required
+def create_safe_cleanup_preview():
+    try:
+        person_cleanup_db.require_ready_protection_snapshot()
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 409
+    try:
+        job_id = person_cleanup_db.create_cleanup_job()
+    except Exception as exc:
+        return jsonify({'error': f'无法创建安全清理预览: {exc}'}), 409
+    submitted = task_manager.submit_task(
+        task_preview_safe_person_cleanup,
+        '人物一键安全清理预览',
+        processor_type='media',
+        job_id=job_id,
+    )
+    if not submitted:
+        person_cleanup_db.fail_cleanup_job(job_id, '后台任务繁忙，预览未启动')
+        return jsonify({'error': '预览任务提交失败，可能已有后台任务运行'}), 409
+    return jsonify({
+        'job_id': job_id,
+        'state': 'previewing',
+        'message': '安全清理预览已提交；此阶段不会删除人物',
+    }), 202
+
+
+@person_cleanup_bp.route('/cleanup-jobs/<job_id>', methods=['GET'])
+@admin_required
+def get_safe_cleanup_job(job_id):
+    include_items = request.args.get('include_items', 'false').lower() == 'true'
+    job = person_cleanup_db.get_cleanup_job(job_id, include_items=include_items)
+    if not job:
+        return jsonify({'error': '未找到清理任务'}), 404
+    return jsonify({'job': job})
+
+
+@person_cleanup_bp.route('/cleanup-jobs/<job_id>/confirmation-token', methods=['POST'])
+@admin_required
+@processor_ready_required
+def issue_safe_cleanup_confirmation_token(job_id):
+    try:
+        token = person_cleanup_db.issue_cleanup_confirmation_token(job_id)
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 409
+    return jsonify({
+        'job_id': job_id,
+        'confirmation_token': token,
+        'message': '确认令牌仅适用于当前预览',
+    })
+
+
+@person_cleanup_bp.route('/cleanup-jobs/<job_id>/confirm', methods=['POST'])
+@admin_required
+@task_lock_required
+@processor_ready_required
+def confirm_safe_cleanup_job(job_id):
+    payload = request.get_json(silent=True) or {}
+    if payload.get('confirmation') != '确认删除已核验孤儿人物':
+        return jsonify({'error': '缺少明确的安全清理确认文本'}), 400
+    token = str(payload.get('confirmation_token') or '')
+    if not token:
+        return jsonify({'error': '缺少当前预览确认令牌'}), 400
+    try:
+        person_cleanup_db.confirm_cleanup_job(job_id, token)
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 409
+    submitted = task_manager.submit_task(
+        task_execute_safe_person_cleanup,
+        '人物一键安全清理',
+        processor_type='media',
+        job_id=job_id,
+    )
+    if not submitted:
+        person_cleanup_db.revert_confirmed_cleanup_job(
+            job_id,
+            '后台任务繁忙，尚未开始删除',
+        )
+        return jsonify({'error': '清理任务提交失败，未执行删除'}), 409
+    return jsonify({'job_id': job_id, 'state': 'confirmed'}), 202
+
+
+@person_cleanup_bp.route('/cleanup-jobs/<job_id>/stop', methods=['POST'])
+@admin_required
+@processor_ready_required
+def stop_safe_cleanup_job(job_id):
+    if not person_cleanup_db.request_cleanup_job_stop(job_id):
+        return jsonify({'error': '任务不存在或当前状态不可中止'}), 409
+    extensions.media_processor_instance.signal_stop()
+    return jsonify({'job_id': job_id, 'state': 'stop_requested'}), 202

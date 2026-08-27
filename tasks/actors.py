@@ -17,8 +17,11 @@ from actor_utils import enrich_all_actor_aliases_task
 from handler.actor_sync import UnifiedSyncHandler
 from services.person_cleanup_safety import (
     build_person_name_protection_keys,
+    candidate_fingerprint,
+    canonical_person_provider_identities,
     classify_reference_check,
     find_ghost_candidates,
+    is_explicit_verified_orphan,
     person_name_protection_keys,
     reference_check_failure_message,
 )
@@ -26,10 +29,11 @@ from services.person_cleanup_safety import (
 logger = logging.getLogger(__name__)
 
 def _scan_protected_library_people(processor, protected_libraries, batch_size: int = 500):
-    """Read every protected library page and preserve people even when Emby omits Person IDs."""
+    """Build a complete protected snapshot or raise without marking it ready."""
     snapshots = {}
     api_url = f"{processor.emby_url.rstrip('/')}/Items"
     safe_batch_size = max(1, int(batch_size))
+    all_person_ids = set()
 
     for protected_library in protected_libraries:
         library_id = str(protected_library.get('library_id') or '').strip()
@@ -41,50 +45,88 @@ def _scan_protected_library_people(processor, protected_libraries, batch_size: i
         all_person_names = set()
         media_count = 0
         start_index = 0
+        expected_total = None
+        seen_item_ids = set()
 
         while True:
             params = {
-                'api_key': processor.emby_api_key,
                 'ParentId': library_id,
                 'Recursive': 'true',
                 'IncludeItemTypes': 'Movie,Series,Episode,Video,MusicVideo',
                 'Fields': 'People',
                 'StartIndex': start_index,
                 'Limit': safe_batch_size,
-                'EnableTotalRecordCount': 'false',
+                'EnableTotalRecordCount': 'true',
             }
             try:
-                response = emby.emby_client.get(api_url, params=params, timeout=60)
+                response = emby.emby_client.get(
+                    api_url,
+                    headers={'X-Emby-Token': processor.emby_api_key},
+                    params=params,
+                    timeout=60,
+                )
                 response.raise_for_status()
                 payload = response.json()
-                if not isinstance(payload, dict) or 'Items' not in payload:
-                    raise ValueError('Emby 响应缺少 Items')
-                items = payload.get('Items') or []
+                if not isinstance(payload, dict) or not isinstance(payload.get('Items'), list):
+                    raise ValueError('Emby 响应缺少有效 Items')
+                total = payload.get('TotalRecordCount')
+                if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+                    raise ValueError('Emby 响应缺少有效 TotalRecordCount')
+                if expected_total is None:
+                    expected_total = total
+                elif total != expected_total:
+                    raise ValueError('分页期间 TotalRecordCount 发生变化')
+                items = payload['Items']
             except Exception as exc:
                 raise RuntimeError(
                     f"受保护媒体库 '{library_name}' 读取失败，已拒绝继续人物清理: {exc}"
                 ) from exc
 
             if not items:
+                if start_index < int(expected_total or 0):
+                    raise RuntimeError(
+                        f"受保护媒体库 '{library_name}' 分页提前结束"
+                    )
                 break
 
             media_count += len(items)
             for item in items:
-                for person in item.get('People') or []:
+                if not isinstance(item, dict):
+                    raise RuntimeError(f"受保护媒体库 '{library_name}' 返回非法媒体项")
+                item_id = str(item.get('Id') or '').strip()
+                if not item_id or item_id in seen_item_ids:
+                    raise RuntimeError(
+                        f"受保护媒体库 '{library_name}' 返回缺失或重复媒体 ID"
+                    )
+                seen_item_ids.add(item_id)
+                if 'People' not in item or not isinstance(item.get('People'), list):
+                    raise RuntimeError(
+                        f"受保护媒体库 '{library_name}' 项目 {item_id} 的 People 不可核验"
+                    )
+                for person in item['People']:
+                    if not isinstance(person, dict):
+                        raise RuntimeError(
+                            f"受保护媒体库 '{library_name}' 项目 {item_id} 含非法人物项"
+                        )
                     person_id = str(person.get('Id') or '').strip()
                     person_name = str(person.get('Name') or '').strip()
-                    if person_name:
-                        all_person_names.add(person_name)
-                    if person_id:
-                        people_by_id[person_id] = person_name
+                    if not person_id or not person_name:
+                        raise RuntimeError(
+                            f"受保护媒体库 '{library_name}' 项目 {item_id} 的人物身份不完整"
+                        )
+                    all_person_names.add(person_name)
+                    people_by_id[person_id] = person_name
+                    all_person_ids.add(person_id)
 
             start_index += len(items)
-            if len(items) < safe_batch_size:
+            if start_index >= int(expected_total or 0):
                 break
+            if len(items) < safe_batch_size:
+                raise RuntimeError(f"受保护媒体库 '{library_name}' 分页长度不足")
 
-        if media_count > 0 and not people_by_id and not all_person_names:
+        if len(seen_item_ids) != int(expected_total or 0):
             raise RuntimeError(
-                f"受保护媒体库 '{library_name}' 包含媒体但未返回任何人物，已拒绝生成或删除候选"
+                f"受保护媒体库 '{library_name}' 分页数量不一致"
             )
 
         snapshots[library_id] = {
@@ -93,7 +135,60 @@ def _scan_protected_library_people(processor, protected_libraries, batch_size: i
             'media_count': media_count,
         }
 
+    person_details = emby.get_person_details_strict(
+        processor.emby_url,
+        processor.emby_api_key,
+        all_person_ids,
+    )
+    if person_details is None or set(person_details) != all_person_ids:
+        raise RuntimeError('受保护人物 exact detail 读取不完整')
+
+    for snapshot in snapshots.values():
+        protected_people = []
+        for person_id, people_name in snapshot['people_by_id'].items():
+            detail = person_details.get(person_id)
+            if not detail:
+                raise RuntimeError(f'受保护人物 {person_id} detail 缺失')
+            provider_ids = detail.get('ProviderIds')
+            if not isinstance(provider_ids, dict):
+                raise RuntimeError(f'受保护人物 {person_id} ProviderIds 不可核验')
+            canonical_person_provider_identities(provider_ids, strict=True)
+            detail_name = str(detail.get('Name') or '').strip()
+            if not detail_name:
+                raise RuntimeError(f'受保护人物 {person_id} Name 不可核验')
+            snapshot['all_person_names'].add(detail_name)
+            protected_people.append({
+                'person_id': person_id,
+                'person_name': people_name or detail_name,
+                'provider_ids': provider_ids,
+            })
+        snapshot['people'] = protected_people
+
     return snapshots
+
+
+def _refresh_protected_snapshot(processor):
+    generation = person_cleanup_db.begin_protection_snapshot()
+    try:
+        protected_libraries = person_cleanup_db.list_protected_libraries()
+        snapshots = _scan_protected_library_people(processor, protected_libraries)
+        for protected_library in protected_libraries:
+            library_id = str(protected_library.get('library_id') or '')
+            snapshot = snapshots.get(library_id)
+            if snapshot is None:
+                raise RuntimeError(f'保护库 {library_id} 未生成快照')
+            people = snapshot.get('people') or []
+            person_cleanup_db.merge_protected_people_for_library(library_id, people)
+            person_cleanup_db.merge_protected_names_for_library(
+                library_id,
+                snapshot.get('all_person_names') or set(),
+            )
+            person_cleanup_db.merge_protected_identities_for_library(library_id, people)
+        person_cleanup_db.complete_protection_snapshot(generation)
+        return generation, snapshots
+    except Exception as exc:
+        person_cleanup_db.fail_protection_snapshot(generation, str(exc))
+        raise
 
 
 def task_scan_ghost_actor_candidates(processor):
@@ -106,8 +201,11 @@ def task_scan_ghost_actor_candidates(processor):
             processor.emby_url,
             processor.emby_api_key,
         )
-        library_ids = [lib.get('info', {}).get('Id') for lib in libraries or []]
-        library_ids = [library_id for library_id in library_ids if library_id]
+        library_ids = {
+            str(lib.get('info', {}).get('Id'))
+            for lib in libraries or []
+            if lib.get('info', {}).get('Id')
+        }
         if not library_ids:
             raise RuntimeError("无法获取任何有效媒体库，已终止扫描")
 
@@ -117,11 +215,16 @@ def task_scan_ghost_actor_candidates(processor):
             for item in protected_libraries
             if item.get('library_id')
         }
+        missing_protected_ids = protected_library_ids - library_ids
+        if missing_protected_ids:
+            raise RuntimeError('至少一个受保护媒体库已无法从 Emby 精确读取')
+
+        generation, _ = _refresh_protected_snapshot(processor)
+        normal_library_ids = sorted(library_ids - protected_library_ids)
         reference_scan = emby.get_referenced_person_ids_strict(
             processor.emby_url,
             processor.emby_api_key,
-            library_ids,
-            capture_library_ids=protected_library_ids,
+            normal_library_ids,
         )
         if reference_scan is None:
             raise RuntimeError("至少一个媒体库读取失败，候选列表保持不变")
@@ -131,29 +234,12 @@ def task_scan_ghost_actor_candidates(processor):
         referenced_person_ids = reference_scan['person_ids']
         logger.info(f"  ➜ 已建立 {len(referenced_person_ids)} 位在用人物的安全白名单。")
 
-        protected_snapshots = _scan_protected_library_people(
-            processor,
-            protected_libraries,
-        )
-        for protected_library in protected_libraries:
-            library_id = str(protected_library.get('library_id') or '')
-            snapshot = protected_snapshots.get(library_id) or {}
-            library_people = snapshot.get('people_by_id') or {}
-            names_without_id = snapshot.get('all_person_names') or set()
-            person_cleanup_db.merge_protected_people_for_library(
-                library_id,
-                [
-                    {'person_id': person_id, 'person_name': person_name}
-                    for person_id, person_name in library_people.items()
-                ],
-            )
-            person_cleanup_db.merge_protected_names_for_library(
-                library_id,
-                names_without_id,
-            )
-
-        protected_person_ids = person_cleanup_db.get_protected_person_ids()
+        contract = person_cleanup_db.get_protection_contract()
+        if contract['generation'] != generation:
+            raise RuntimeError('保护快照 generation 在候选生成前发生变化')
+        protected_person_ids = contract['person_ids']
         protected_person_names = person_cleanup_db.get_protected_person_names()
+        protected_provider_identities = contract['provider_identities']
         if protected_person_ids or protected_person_names:
             referenced_person_ids = referenced_person_ids | protected_person_ids
             logger.info(
@@ -183,12 +269,14 @@ def task_scan_ghost_actor_candidates(processor):
             all_people,
             referenced_person_ids,
             protected_person_names=protected_person_names,
+            protected_provider_identities=protected_provider_identities,
         )
         saved_count = person_cleanup_db.replace_candidates(candidates)
         message = (
             f"只读扫描完成：发现 {saved_count} 位待人工复核的幽灵人物候选；"
             f"保护库快照覆盖 {len(protected_person_ids)} 个 ID、"
-            f"{len(protected_person_names)} 个姓名。"
+            f"{len(protected_person_names)} 个姓名、"
+            f"{len(protected_provider_identities)} 个外部身份。"
         )
         logger.info(f"  ➜ {message}")
         task_manager.update_status_from_thread(100, message)
@@ -210,55 +298,53 @@ def task_delete_selected_ghost_actors(processor, person_ids):
     if not requested_ids or len(candidate_map) != len(requested_ids):
         task_manager.update_status_from_thread(-1, "删除已取消：包含不在候选列表中的人物")
         return
-
-    protected_libraries = person_cleanup_db.list_protected_libraries()
     try:
-        protected_snapshots = _scan_protected_library_people(
-            processor,
-            protected_libraries,
+        initial_generation = person_cleanup_db.require_ready_protection_snapshot()
+    except RuntimeError as exc:
+        task_manager.update_status_from_thread(-1, f"删除已取消：{exc}")
+        return
+    if any(
+        not is_explicit_verified_orphan(candidate_map[person_id], initial_generation)
+        for person_id in requested_ids
+    ):
+        task_manager.update_status_from_thread(
+            -1,
+            "删除已取消：只有当前保护快照下显式核验为 orphan 的人物可以删除",
         )
+        return
+    try:
+        generation, _ = _refresh_protected_snapshot(processor)
+        contract = person_cleanup_db.get_protection_contract()
+        if contract['generation'] != generation:
+            raise RuntimeError('删除前保护快照 generation 已变化')
     except Exception as exc:
         logger.error(f"删除前保护库复核失败: {exc}", exc_info=True)
         task_manager.update_status_from_thread(-1, f"删除已取消：{exc}")
         return
-
-    for protected_library in protected_libraries:
-        library_id = str(protected_library.get('library_id') or '')
-        snapshot = protected_snapshots.get(library_id) or {}
-        person_cleanup_db.merge_protected_people_for_library(
-            library_id,
-            [
-                {'person_id': person_id, 'person_name': person_name}
-                for person_id, person_name in (snapshot.get('people_by_id') or {}).items()
-            ],
-        )
-        person_cleanup_db.merge_protected_names_for_library(
-            library_id,
-            snapshot.get('all_person_names') or set(),
-        )
 
     deleted_count = 0
     linked_count = 0
     failed_count = 0
     protected_count = 0
     total = len(requested_ids)
-    protected_person_ids = person_cleanup_db.get_protected_person_ids()
-    protected_person_names = build_person_name_protection_keys(
-        person_cleanup_db.get_protected_person_names()
-    )
 
     for index, person_id in enumerate(requested_ids, start=1):
         if processor.is_stop_requested():
             break
         candidate = candidate_map[person_id]
         person_name = candidate.get('person_name') or person_id
-        if (
-            person_id in protected_person_ids
-            or not person_name_protection_keys(person_name).isdisjoint(protected_person_names)
-        ):
+        protection_reason = person_cleanup_db.candidate_protection_reason(
+            candidate,
+            contract,
+        )
+        if protection_reason:
             protected_count += 1
             person_cleanup_db.remove_candidate(person_id)
-            logger.warning(f"  ➜ 跳过 '{person_name}'：命中受保护媒体库人物快照。")
+            logger.warning(
+                "  ➜ 跳过 '%s'：命中保护合同 %s。",
+                person_name,
+                protection_reason,
+            )
             continue
         progress = int(((index - 1) / total) * 100)
         task_manager.update_status_from_thread(
@@ -277,7 +363,12 @@ def task_delete_selected_ghost_actors(processor, person_ids):
         if reference_status in {'connection_failed', 'invalid_response', 'people_unavailable'}:
             failed_count += 1
             error = reference_check_failure_message(reference_status, context='删除前复核')
-            person_cleanup_db.mark_candidate_checked(person_id, error)
+            person_cleanup_db.mark_candidate_checked(
+                person_id,
+                reference_status,
+                generation,
+                error,
+            )
             logger.warning(f"  ➜ 跳过 '{person_name}'：{error}")
             continue
         if reference_status == 'linked':
@@ -285,21 +376,61 @@ def task_delete_selected_ghost_actors(processor, person_ids):
             person_cleanup_db.remove_candidate(person_id)
             logger.warning(f"  ➜ 跳过 '{person_name}'：删除前发现新的媒体关联。")
             continue
-        if reference_status not in {'orphan', 'identity_alias_only'}:
+        if reference_status == 'identity_alias_only':
             failed_count += 1
-            error = reference_check_failure_message('invalid_response', context='删除前复核')
-            person_cleanup_db.mark_candidate_checked(person_id, error)
+            error = '仅命中同身份其他 Person 的作品；不是显式 orphan，禁止删除'
+            person_cleanup_db.mark_candidate_checked(
+                person_id,
+                'identity_alias_only',
+                generation,
+                error,
+            )
             logger.warning(f"  ➜ 跳过 '{person_name}'：{error}")
             continue
+        if reference_status != 'orphan':
+            failed_count += 1
+            error = reference_check_failure_message('invalid_response', context='删除前复核')
+            person_cleanup_db.mark_candidate_checked(
+                person_id,
+                'invalid_response',
+                generation,
+                error,
+            )
+            continue
 
-        if not emby.delete_person_custom_api(
+        if not person_cleanup_db.reserve_person_delete_attempt(person_id):
+            failed_count += 1
+            person_cleanup_db.mark_candidate_checked(
+                person_id,
+                'invalid_response',
+                generation,
+                '该人物已有删除 POST 尝试记录，禁止自动重放',
+            )
+            continue
+
+        outcome = emby.delete_person_custom_api_outcome(
             processor.emby_url,
             processor.emby_api_key,
             person_id,
-        ):
+        )
+        if outcome != 'confirmed':
+            person_cleanup_db.finish_person_delete_attempt(
+                person_id,
+                'ambiguous' if outcome == 'ambiguous' else 'failed',
+                '删除 POST 结果不确定' if outcome == 'ambiguous' else '删除 POST 明确失败',
+            )
             failed_count += 1
-            person_cleanup_db.mark_candidate_checked(person_id, "Emby 删除失败，请检查神医接口和管理员配置")
+            person_cleanup_db.mark_candidate_checked(
+                person_id,
+                'invalid_response',
+                generation,
+                'Emby 删除结果不确定，禁止自动重试'
+                if outcome == 'ambiguous'
+                else 'Emby 删除明确失败，请检查神医接口和管理员配置',
+            )
             continue
+
+        person_cleanup_db.finish_person_delete_attempt(person_id, 'confirmed')
 
         try:
             with get_db_connection() as conn:
@@ -314,6 +445,8 @@ def task_delete_selected_ghost_actors(processor, person_ids):
             failed_count += 1
             person_cleanup_db.mark_candidate_checked(
                 person_id,
+                'invalid_response',
+                generation,
                 f"Emby 已删除，但 Toolkit 映射清理失败: {exc}",
             )
         time.sleep(0.2)
@@ -325,6 +458,243 @@ def task_delete_selected_ghost_actors(processor, person_ids):
     )
     logger.info(f"  ➜ {message}")
     task_manager.update_status_from_thread(100, message)
+
+
+def task_preview_safe_person_cleanup(processor, job_id):
+    """Build a persistent preview; this task never calls the Person delete API."""
+    try:
+        generation, _ = _refresh_protected_snapshot(processor)
+        contract = person_cleanup_db.get_protection_contract()
+        if contract['generation'] != generation:
+            raise RuntimeError('预览保护快照 generation 已变化')
+
+        candidates = person_cleanup_db.list_candidates_raw()
+        total = len(candidates)
+        for index, candidate in enumerate(candidates, start=1):
+            if processor.is_stop_requested() or person_cleanup_db.cleanup_job_stop_requested(job_id):
+                person_cleanup_db.finish_cleanup_job(job_id, stopped=True)
+                task_manager.update_status_from_thread(100, '一键安全清理预览已中止')
+                return
+
+            person_id = str(candidate.get('person_id') or '')
+            person_name = candidate.get('person_name') or person_id
+            protection_reason = person_cleanup_db.candidate_protection_reason(
+                candidate,
+                contract,
+            )
+            if protection_reason:
+                person_cleanup_db.add_cleanup_job_item(
+                    job_id,
+                    candidate,
+                    protection_reason,
+                )
+                person_cleanup_db.remove_candidate(person_id)
+                continue
+
+            references = emby.get_person_media_references(
+                processor.emby_url,
+                processor.emby_api_key,
+                person_id,
+                limit=1,
+                person_name=person_name,
+            )
+            status = classify_reference_check(references)
+            if status == 'linked':
+                person_cleanup_db.add_cleanup_job_item(job_id, candidate, 'linked')
+                person_cleanup_db.remove_candidate(person_id)
+            elif status == 'orphan':
+                person_cleanup_db.mark_candidate_checked(
+                    person_id,
+                    'orphan',
+                    generation,
+                )
+                person_cleanup_db.add_cleanup_job_item(
+                    job_id,
+                    candidate,
+                    'verified_orphan',
+                )
+            elif status == 'identity_alias_only':
+                error = '仅命中同身份其他 Person；不属于 verified orphan'
+                person_cleanup_db.mark_candidate_checked(
+                    person_id,
+                    status,
+                    generation,
+                    error,
+                )
+                person_cleanup_db.add_cleanup_job_item(
+                    job_id,
+                    candidate,
+                    status,
+                    error,
+                )
+            else:
+                safe_status = status if status in {
+                    'people_unavailable', 'connection_failed', 'invalid_response'
+                } else 'invalid_response'
+                error = reference_check_failure_message(safe_status, context='安全清理预览')
+                person_cleanup_db.mark_candidate_checked(
+                    person_id,
+                    safe_status,
+                    generation,
+                    error,
+                )
+                person_cleanup_db.add_cleanup_job_item(
+                    job_id,
+                    candidate,
+                    safe_status,
+                    error,
+                )
+
+            progress = int((index / max(1, total)) * 100)
+            task_manager.update_status_from_thread(
+                progress,
+                f'一键安全清理预览 {index}/{total}',
+            )
+
+        person_cleanup_db.finish_cleanup_preview(job_id, generation)
+        task_manager.update_status_from_thread(100, '一键安全清理预览已完成，等待管理员确认')
+    except Exception as exc:
+        logger.error('一键安全清理预览失败: %s', exc, exc_info=True)
+        person_cleanup_db.fail_cleanup_job(job_id, str(exc))
+        raise
+
+
+def task_execute_safe_person_cleanup(processor, job_id):
+    """Serially delete only previewed orphans after a fresh full precheck."""
+    person_cleanup_db.start_cleanup_job(job_id)
+    try:
+        generation, _ = _refresh_protected_snapshot(processor)
+        contract = person_cleanup_db.get_protection_contract()
+        if contract['generation'] != generation:
+            raise RuntimeError('执行保护快照 generation 已变化')
+
+        items = person_cleanup_db.list_cleanup_job_orphans(job_id)
+        total = len(items)
+        for index, item in enumerate(items, start=1):
+            if processor.is_stop_requested() or person_cleanup_db.cleanup_job_stop_requested(job_id):
+                person_cleanup_db.finish_cleanup_job(job_id, stopped=True)
+                task_manager.update_status_from_thread(100, '一键安全清理已中止')
+                return
+
+            person_id = str(item.get('person_id') or '')
+            current_rows = person_cleanup_db.get_candidates_by_ids(
+                [person_id],
+                include_protected=True,
+            )
+            if not current_rows:
+                person_cleanup_db.mark_cleanup_job_item(
+                    job_id, person_id, 'skipped_candidate_changed',
+                    '候选已不存在', completed=True,
+                )
+                continue
+            candidate = current_rows[0]
+            if candidate_fingerprint(candidate) != item.get('candidate_fingerprint'):
+                person_cleanup_db.mark_cleanup_job_item(
+                    job_id, person_id, 'skipped_candidate_changed',
+                    '候选身份已变化', completed=True,
+                )
+                continue
+
+            protection_reason = person_cleanup_db.candidate_protection_reason(
+                candidate,
+                contract,
+            )
+            if protection_reason:
+                person_cleanup_db.remove_candidate(person_id)
+                person_cleanup_db.mark_cleanup_job_item(
+                    job_id, person_id, f'skipped_{protection_reason}',
+                    '删除前命中保护合同', completed=True,
+                )
+                continue
+
+            references = emby.get_person_media_references(
+                processor.emby_url,
+                processor.emby_api_key,
+                person_id,
+                limit=1,
+                person_name=candidate.get('person_name'),
+            )
+            status = classify_reference_check(references)
+            if status != 'orphan':
+                if status == 'linked':
+                    person_cleanup_db.remove_candidate(person_id)
+                person_cleanup_db.mark_cleanup_job_item(
+                    job_id, person_id, f'skipped_{status}',
+                    '删除前实时核验不再是显式 orphan', completed=True,
+                )
+                continue
+
+            if int(item.get('post_attempts') or 0) != 0:
+                person_cleanup_db.mark_cleanup_job_item(
+                    job_id, person_id, 'delete_ambiguous',
+                    '该 job item 已有 POST 尝试，禁止自动重放', completed=True,
+                )
+                continue
+
+            # Irreversible boundary: commit deleting + post_attempts=1 first.
+            submission_recorded = person_cleanup_db.mark_cleanup_job_item(
+                job_id,
+                person_id,
+                'deleting',
+                submitted=True,
+            )
+            if not submission_recorded:
+                logger.warning(
+                    '人物 %s 的删除提交边界未能原子持久化，禁止发送 POST',
+                    person_id,
+                )
+                person_cleanup_db.mark_cleanup_job_item(
+                    job_id, person_id, 'delete_ambiguous',
+                    '已存在全局删除尝试记录，禁止自动重放', completed=True,
+                )
+                continue
+            outcome = emby.delete_person_custom_api_outcome(
+                processor.emby_url,
+                processor.emby_api_key,
+                person_id,
+            )
+            if outcome == 'ambiguous':
+                person_cleanup_db.mark_cleanup_job_item(
+                    job_id, person_id, 'delete_ambiguous',
+                    '删除 POST 结果不确定，禁止自动重放', completed=True,
+                )
+                continue
+            if outcome != 'confirmed':
+                person_cleanup_db.mark_cleanup_job_item(
+                    job_id, person_id, 'delete_failed',
+                    '删除 POST 明确失败', completed=True,
+                )
+                continue
+
+            try:
+                with get_db_connection() as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute(
+                            'DELETE FROM person_identity_map WHERE emby_person_id = %s',
+                            (person_id,),
+                        )
+                person_cleanup_db.remove_candidate(person_id)
+                person_cleanup_db.mark_cleanup_job_item(
+                    job_id, person_id, 'deleted', completed=True,
+                )
+            except Exception as exc:
+                person_cleanup_db.mark_cleanup_job_item(
+                    job_id, person_id, 'delete_ambiguous',
+                    f'Emby 已确认提交，但本地清理失败: {exc}', completed=True,
+                )
+
+            task_manager.update_status_from_thread(
+                int((index / max(1, total)) * 100),
+                f'一键安全清理 {index}/{total}',
+            )
+            time.sleep(0.2)
+
+        person_cleanup_db.finish_cleanup_job(job_id)
+        task_manager.update_status_from_thread(100, '一键安全清理完成')
+    except Exception as exc:
+        logger.error('一键安全清理执行失败: %s', exc, exc_info=True)
+        person_cleanup_db.fail_cleanup_job(job_id, str(exc))
+        raise
 
 # --- 同步演员映射表 ---
 def task_sync_person_map(processor):
@@ -686,277 +1056,6 @@ def _disabled_legacy_task_merge_duplicate_actors(processor):
     )
 
 def _disabled_legacy_task_purge_ghost_actors(processor):
-    raise RuntimeError("旧版直接删除幽灵人物任务已停用，请使用人物清理页面")
-    """
-    【高危 V2 - 命名修正版】
-    - 精准打击在整个Emby服务器范围内，没有任何媒体项关联的“幽灵”演员。
-    - 此任务无视用户在设置中选择的媒体库，始终对整个服务器进行操作。
-    """
-    task_name = "删除幽灵演员" 
-    logger.warning(f"--- !!! 开始执行高危任务: '{task_name}' !!! ---")
-    logger.warning("  ➜ 此任务将扫描您整个服务器的媒体和演员，以找出并删除任何未被使用的演员条目。")
-    
-    task_manager.update_status_from_thread(0, "准备开始全局扫描...")
-
-    try:
-        # ======================================================================
-        # 阶段 1: 全局扫描所有媒体库，获取所有关联的人物ID (白名单)
-        # ======================================================================
-        task_manager.update_status_from_thread(0, "准备阶段: 正在扫描所有媒体库...")
-        
-        # 1.1 获取服务器上所有可见的媒体库ID
-        all_libraries = emby.get_emby_libraries(processor.emby_url, processor.emby_api_key, processor.emby_user_id)
-        if not all_libraries:
-            task_manager.update_status_from_thread(100, "任务中止：无法获取服务器媒体库列表。")
-            return
-        
-        all_library_ids = [lib['Id'] for lib in all_libraries if lib.get('CollectionType') in ['movies', 'tvshows', 'homevideos', 'musicvideos']]
-        logger.info(f"  ➜ 将扫描服务器上的 {len(all_library_ids)} 个媒体库...")
-
-        # 1.2 获取所有媒体项
-        all_media_items = emby.get_emby_library_items(
-            base_url=processor.emby_url, api_key=processor.emby_api_key, user_id=processor.emby_user_id,
-            library_ids=all_library_ids, media_type_filter="Movie,Series", fields="People"
-        )
-        if not all_media_items:
-            task_manager.update_status_from_thread(100, "任务完成：服务器中未找到任何媒体项。")
-            return
-
-        # 1.3 建立白名单
-        whitelist_person_ids = set()
-        for item in all_media_items:
-            if processor.is_stop_requested():
-                logger.info("任务在建立白名单阶段被用户中断。")
-                return
-            for person in item.get("People", []):
-                if person_id := person.get("Id"):
-                    whitelist_person_ids.add(person_id)
-        
-        logger.info(f"  ➜ 白名单建立完成，服务器中共有 {len(whitelist_person_ids)} 位被引用的演员/职员。")
-
-        # ======================================================================
-        # 阶段 2: 全局扫描所有 Person 条目，并找出孤儿
-        # ======================================================================
-        task_manager.update_status_from_thread(0, "准备阶段: 白名单建立完成，正在扫描演员...")
-        
-        all_person_items = []
-        person_generator = emby.get_all_persons_from_emby(
-            base_url=processor.emby_url, api_key=processor.emby_api_key, user_id=processor.emby_user_id,
-            stop_event=processor.get_stop_event(), force_full_scan=True
-        )
-
-        total_scanned = 0
-        for person_batch in person_generator:
-            if processor.is_stop_requested():
-                logger.info("任务在扫描演员阶段被用户中断。")
-                return
-            all_person_items.extend(person_batch)
-            total_scanned += len(person_batch)
-            task_manager.update_status_from_thread(0, f"准备阶段: 已扫描 {total_scanned} 名演员...")
-
-        all_person_ids = {p['Id'] for p in all_person_items}
-        orphan_person_ids = all_person_ids - whitelist_person_ids
-        
-        orphans_to_delete = [p for p in all_person_items if p['Id'] in orphan_person_ids]
-        total_to_delete = len(orphans_to_delete)
-
-        if total_to_delete == 0:
-            logger.info("  ➜ 扫描完成，未发现任何未被引用的“幽灵演员”。")
-            task_manager.update_status_from_thread(100, "扫描完成，服务器演员数据很干净！")
-            return
-
-        # ======================================================================
-        # 阶段 3: 执行删除
-        # ======================================================================
-        logger.warning(f"  ➜ 筛选完成：...发现 {total_to_delete} 个幽灵演员，即将开始删除...")
-        task_manager.update_status_from_thread(0, f"准备阶段: 识别完成，发现 {total_to_delete} 个幽灵演员。")
-        deleted_count = 0
-
-        for i, person in enumerate(orphans_to_delete):
-            if processor.is_stop_requested():
-                logger.warning("  🚫 删除操作被用户中止。")
-                break
-            
-            person_id = person.get("Id")
-            person_name = person.get("Name")
-            
-            progress = int(((i + 1) / total_to_delete) * 100)
-            task_manager.update_status_from_thread(progress, f"({i+1}/{total_to_delete}) 正在删除幽灵: {person.get('Name')}")
-
-            success = emby.delete_person_custom_api(
-                base_url=processor.emby_url, api_key=processor.emby_api_key, person_id=person_id
-            )
-            
-            if success:
-                deleted_count += 1
-                try:
-                    with get_db_connection() as conn:
-                        with conn.cursor() as cursor:
-                            cursor.execute("DELETE FROM person_identity_map WHERE emby_person_id = %s", (person_id,))
-                            if cursor.rowcount > 0:
-                                logger.info(f"  ➜ 同步成功: 已从本地数据库移除 ID '{person_id}'。")
-                except Exception as db_exc:
-                    logger.error(f"  ➜ 同步失败: 尝试从本地数据库删除 ID '{person_id}' 时出错: {db_exc}")
-            
-            time.sleep(0.2)
-
-        final_message = f"“幽灵演员”清理完成！共找到 {total_to_delete} 个目标，成功删除了 {deleted_count} 个。"
-        if processor.is_stop_requested():
-            final_message = f"任务已中止。本次运行成功删除了 {deleted_count} 个“幽灵演员”。"
-        
-        logger.info(final_message)
-        task_manager.update_status_from_thread(100, final_message)
-
-    except Exception as e:
-        logger.error(f"执行 '{task_name}' 任务时发生严重错误: {e}", exc_info=True)
-        task_manager.update_status_from_thread(-1, f"任务失败: {e}")
-
+    raise RuntimeError("旧版直接删除幽灵人物任务已永久停用，请使用人物清理页面")
 def _disabled_legacy_task_purge_unregistered_actors(processor):
     raise RuntimeError("删除黑户人物任务已永久停用")
-    """
-    【高危 V5 - 命名修正版】
-    - 清理那些有关联媒体，但没有TMDb ID的“黑户”演员。
-    - 此任务只在你选定的媒体库范围内生效。
-    """
-    task_name = "删除黑户演员" 
-    logger.warning(f"--- !!! 开始执行高危任务: '{task_name}' !!! ---")
-
-    try:
-        # 1. 读取并验证媒体库配置
-        config = processor.config
-        library_ids_to_process = config.get(constants.CONFIG_OPTION_EMBY_LIBRARIES_TO_PROCESS, [])
-
-        if not library_ids_to_process:
-            logger.error("  🚫 任务中止：未在设置中选择任何要处理的媒体库。")
-            task_manager.update_status_from_thread(-1, "任务失败：未选择媒体库")
-            return
-
-        logger.info(f"  ➜ 将只扫描 {len(library_ids_to_process)} 个选定媒体库中的演员...")
-        task_manager.update_status_from_thread(10, f"  ➜ 正在从 {len(library_ids_to_process)} 个媒体库中获取所有媒体...")
-
-        # 2. 获取指定媒体库中的所有电影和剧集
-        all_media_items = emby.get_emby_library_items(
-            base_url=processor.emby_url,
-            api_key=processor.emby_api_key,
-            user_id=processor.emby_user_id,
-            library_ids=library_ids_to_process,
-            media_type_filter="Movie,Series",
-            fields="People"
-        )
-        if not all_media_items:
-            task_manager.update_status_from_thread(100, "  ➜ 任务完成：在选定的媒体库中未找到任何媒体项。")
-            return
-
-        # 3. 从媒体项中提取所有唯一的演员ID
-        task_manager.update_status_from_thread(30, "  ➜ 正在从媒体项中提取唯一的演员ID...")
-        unique_person_ids = set()
-        for item in all_media_items:
-            for person in item.get("People", []):
-                if person_id := person.get("Id"):
-                    unique_person_ids.add(person_id)
-        
-        person_ids_to_fetch = list(unique_person_ids)
-        logger.info(f"  ➜ 在选定媒体库中，共识别出 {len(person_ids_to_fetch)} 位独立演员。")
-
-        if not person_ids_to_fetch:
-            task_manager.update_status_from_thread(100, "  ➜ 任务完成：未在媒体项中找到任何演员。")
-            return
-
-        # 4. 分批获取这些演员的完整详情
-        task_manager.update_status_from_thread(50, f"  ➜ 正在分批获取 {len(person_ids_to_fetch)} 位演员的完整详情...")
-        all_people_in_scope_details = []
-        batch_size = 500
-        for i in range(0, len(person_ids_to_fetch), batch_size):
-            if processor.is_stop_requested():
-                logger.info("  🚫 在分批获取演员详情阶段，任务被中止。")
-                break
-            
-            batch_ids = person_ids_to_fetch[i:i + batch_size]
-            logger.debug(f"  ➜ 正在获取批次 {i//batch_size + 1} 的演员详情 ({len(batch_ids)} 个)...")
-
-            person_details_batch = emby.get_emby_items_by_id(
-                base_url=processor.emby_url,
-                api_key=processor.emby_api_key,
-                user_id=processor.emby_user_id,
-                item_ids=batch_ids,
-                fields="ProviderIds,Name"
-            )
-            if person_details_batch:
-                all_people_in_scope_details.extend(person_details_batch)
-
-        if processor.is_stop_requested():
-            logger.warning("  🚫 任务已中止。")
-            task_manager.update_status_from_thread(100, "任务已中止。")
-            return
-        
-        # ★★★ 新增：详细的获取结果统计日志 ★★★
-        logger.info(f"  ➜ 详情获取完成：成功获取到 {len(all_people_in_scope_details)} 位演员的完整详情。")
-
-        # 5. 基于完整的详情，筛选出真正的“幽灵”演员
-        ghosts_to_delete = [
-            p for p in all_people_in_scope_details 
-            if not p.get("ProviderIds", {}).get("Tmdb")
-        ]
-        total_to_delete = len(ghosts_to_delete)
-
-        # ★★★ 新增：核心的筛选结果统计日志 ★★★
-        logger.info(f"  ➜ 筛选完成：在 {len(all_people_in_scope_details)} 位演员中，发现 {total_to_delete} 个没有TMDb ID的“黑户演员”。")
-
-        if total_to_delete == 0:
-            # ★★★ 优化：更清晰的完成日志 ★★★
-            logger.info("  ➜ 扫描完成，在选定媒体库中未发现需要清理的“黑户演员”。")
-            task_manager.update_status_from_thread(100, "  ➜ 扫描完成，未发现无TMDb ID的演员。")
-            return
-        
-        logger.warning(f"  ➜ 共发现 {total_to_delete} 个“黑户演员”，即将开始删除...")
-        deleted_count = 0
-
-        # 6. 执行删除
-        for i, person in enumerate(ghosts_to_delete):
-            if processor.is_stop_requested():
-                logger.warning("  🚫 任务被用户中止。")
-                break
-            
-            person_id = person.get("Id")
-            person_name = person.get("Name")
-            
-            progress = 60 + int((i / total_to_delete) * 40)
-            task_manager.update_status_from_thread(progress, f"({i+1}/{total_to_delete}) 正在删除: {person_name}")
-
-            success = emby.delete_person_custom_api(
-                base_url=processor.emby_url,
-                api_key=processor.emby_api_key,
-                person_id=person_id
-            )
-            
-            if success:
-                deleted_count += 1
-
-                #  如果 Emby 删除成功，则从本地数据库同步删除 
-                try:
-                    with get_db_connection() as conn:
-                        with conn.cursor() as cursor:
-                            cursor.execute(
-                                "DELETE FROM person_identity_map WHERE emby_person_id = %s",
-                                (person_id,)
-                            )
-                            # 记录数据库操作结果
-                            if cursor.rowcount > 0:
-                                logger.info(f"  ➜ 同步成功: 已从 person_identity_map 中移除 ID '{person_id}'。")
-                            else:
-                                logger.info(f"  ➜ 同步提醒: 在 person_identity_map 中未找到 ID '{person_id}'，无需删除。")
-                except Exception as db_exc:
-                    logger.error(f"      ➜ 同步失败: 尝试从 person_identity_map 删除 ID '{person_id}' 时出错: {db_exc}")
-            
-            time.sleep(0.2)
-
-        final_message = f"清理完成！共找到 {total_to_delete} 个目标，成功删除了 {deleted_count} 个。"
-        if processor.is_stop_requested():
-            final_message = f"任务已中止。共删除了 {deleted_count} 个“黑户演员”。"
-        
-        logger.info(final_message)
-        task_manager.update_status_from_thread(100, final_message)
-
-    except Exception as e:
-        logger.error(f"执行 '{task_name}' 任务时发生严重错误: {e}", exc_info=True)
-        task_manager.update_status_from_thread(-1, f"任务失败: {e}")

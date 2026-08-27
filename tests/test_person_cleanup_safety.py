@@ -419,7 +419,11 @@ class PersonCleanupSafetyTests(unittest.TestCase):
             emby_api_key='token',
             is_stop_requested=lambda: False,
         )
-        candidate = {'person_id': 'p1', 'person_name': '演员甲'}
+        candidate = {
+            'person_id': 'p1',
+            'person_name': '演员甲',
+            'verification_status': 'orphan',
+        }
         unavailable = {
             'status': 'people_unavailable',
             'count': None,
@@ -435,17 +439,23 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         )
         person_cleanup_db = MagicMock()
         person_cleanup_db.get_candidates_by_ids.return_value = [candidate]
-        person_cleanup_db.list_protected_libraries.return_value = []
-        person_cleanup_db.get_protected_person_ids.return_value = set()
-        person_cleanup_db.get_protected_person_names.return_value = set()
+        person_cleanup_db.require_ready_protection_snapshot.return_value = 6
+        person_cleanup_db.get_protection_contract.return_value = {
+            'generation': 7,
+            'person_ids': set(),
+            'name_keys': set(),
+            'provider_identities': set(),
+        }
+        person_cleanup_db.candidate_protection_reason.return_value = None
         emby = MagicMock()
         emby.get_person_media_references.return_value = unavailable
         namespace = {
             'person_cleanup_db': person_cleanup_db,
             'task_manager': MagicMock(),
-            '_scan_protected_library_people': MagicMock(return_value={}),
+            '_refresh_protected_snapshot': MagicMock(return_value=(7, {})),
             'build_person_name_protection_keys': lambda values: set(values),
             'person_name_protection_keys': person_name_protection_keys,
+            'is_explicit_verified_orphan': MagicMock(return_value=True),
             'classify_reference_check': classify_reference_check,
             'reference_check_failure_message': reference_check_failure_message,
             'emby': emby,
@@ -464,11 +474,15 @@ class PersonCleanupSafetyTests(unittest.TestCase):
 
         namespace['task_delete_selected_ghost_actors'](processor, ['p1'])
 
-        emby.delete_person_custom_api.assert_not_called()
+        emby.delete_person_custom_api_outcome.assert_not_called()
         person_cleanup_db.mark_candidate_checked.assert_called_once()
+        self.assertEqual(
+            person_cleanup_db.mark_candidate_checked.call_args.args[1],
+            'people_unavailable',
+        )
         self.assertIn(
             '人物明细不可核验',
-            person_cleanup_db.mark_candidate_checked.call_args.args[1],
+            person_cleanup_db.mark_candidate_checked.call_args.args[3],
         )
 
     def test_route_reports_people_unavailable_instead_of_connection_failure(self):
@@ -487,6 +501,14 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         }
         refreshed_candidate = {**candidate, 'last_error': '作品人物明细不可核验'}
         person_cleanup_db = MagicMock()
+        person_cleanup_db.require_ready_protection_snapshot.return_value = 7
+        person_cleanup_db.get_protection_contract.return_value = {
+            'generation': 7,
+            'person_ids': set(),
+            'name_keys': set(),
+            'provider_identities': set(),
+        }
+        person_cleanup_db.candidate_protection_reason.return_value = None
         person_cleanup_db.get_candidates_by_ids.side_effect = [
             [candidate],
             [refreshed_candidate],
@@ -564,6 +586,8 @@ class PersonCleanupSafetyTests(unittest.TestCase):
             '_disabled_legacy_task_purge_unregistered_actors',
         ):
             self.assertIsInstance(functions[function_name].body[0], ast.Raise)
+            self.assertEqual(1, len(functions[function_name].body))
+            self.assertNotIn('delete_person_custom_api', ast.unparse(functions[function_name]))
 
         legacy_merge = functions['_disabled_legacy_task_merge_duplicate_actors']
         self.assertEqual(1, len(legacy_merge.body))
@@ -600,6 +624,8 @@ class PersonCleanupSafetyTests(unittest.TestCase):
             '_disabled_legacy_task_merge_duplicate_actors',
             registry_source,
         )
+        self.assertNotIn('scan-ghost-actors', registry_source)
+        self.assertNotIn('task_scan_ghost_actor_candidates', registry_source)
 
     def test_manual_verification_never_calls_person_delete_api(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -625,7 +651,9 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertIn("'connection_failed'", actor_source)
         self.assertIn("'invalid_response'", actor_source)
         self.assertIn("reference_status == 'linked'", actor_source)
-        self.assertIn("{'orphan', 'identity_alias_only'}", actor_source)
+        self.assertIn("reference_status == 'identity_alias_only'", actor_source)
+        self.assertIn("reference_status != 'orphan'", actor_source)
+        self.assertIn('reserve_person_delete_attempt', actor_source)
         self.assertIn('person_name=person_name', actor_source)
         emby_source = (repo_root / 'handler' / 'emby.py').read_text()
         self.assertIn("'Fields': 'SeriesName,ProductionYear,People'", emby_source)
@@ -656,15 +684,16 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertIn('merge_protected_names_for_library', task_source)
         self.assertIn('_scan_protected_library_people', task_source)
         self.assertIn('all_person_names', task_source)
-        self.assertIn('get_protected_person_ids', task_source)
         self.assertIn('get_protected_person_names', task_source)
-        self.assertIn('capture_library_ids=protected_library_ids', task_source)
+        self.assertIn('normal_library_ids', task_source)
+        self.assertIn('_refresh_protected_snapshot', task_source)
+        self.assertIn('get_person_details_strict', task_source)
         self.assertIn('include_protected=True', task_source)
-        self.assertIn('person_id in protected_person_ids', task_source)
-        self.assertIn('person_name_protection_keys(person_name)', task_source)
+        self.assertIn('candidate_protection_reason', task_source)
         self.assertIn('person_cleanup_protected_libraries', schema_source)
         self.assertIn('person_cleanup_protected_people', schema_source)
         self.assertIn('person_cleanup_protected_names', schema_source)
+        self.assertIn('person_cleanup_protected_identities', schema_source)
 
     def test_protected_person_count_does_not_add_name_keys(self):
         db_tree = ast.parse((self.repo_root / 'database' / 'person_cleanup_db.py').read_text())
@@ -683,7 +712,8 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         source = (self.repo_root / 'emby-actor-ui' / 'src' / 'components' / 'PersonCleanupPage.vue').read_text()
 
         self.assertIn("disabled: (row) => !isVerifiedOrphan(row)", source)
-        self.assertIn('必须先通过“核对详情”', source)
+        self.assertIn("row.verification_status === 'orphan'", source)
+        self.assertIn('identity_alias_only 始终受保护', source)
 
 
 if __name__ == '__main__':

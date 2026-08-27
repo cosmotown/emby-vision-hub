@@ -359,16 +359,67 @@ def init_db():
                         provider_ids_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                         discovered_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
                         last_checked_at TIMESTAMP WITH TIME ZONE,
-                        last_error TEXT
+                        last_error TEXT,
+                        verification_status TEXT NOT NULL DEFAULT 'unverified',
+                        verification_snapshot_generation BIGINT,
+                        verification_fingerprint TEXT
                     )
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_candidates
+                    ADD COLUMN IF NOT EXISTS verification_status TEXT NOT NULL DEFAULT 'unverified'
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_candidates
+                    ADD COLUMN IF NOT EXISTS verification_snapshot_generation BIGINT
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_candidates
+                    ADD COLUMN IF NOT EXISTS verification_fingerprint TEXT
                 """)
 
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS person_cleanup_protected_libraries (
                         library_id TEXT PRIMARY KEY,
                         library_name TEXT NOT NULL,
+                        snapshot_state TEXT NOT NULL DEFAULT 'pending',
+                        snapshot_generation BIGINT NOT NULL DEFAULT 0,
+                        snapshot_completed_at TIMESTAMP WITH TIME ZONE,
+                        snapshot_error TEXT,
                         updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
                     )
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_protected_libraries
+                    ADD COLUMN IF NOT EXISTS snapshot_state TEXT NOT NULL DEFAULT 'pending'
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_protected_libraries
+                    ADD COLUMN IF NOT EXISTS snapshot_generation BIGINT NOT NULL DEFAULT 0
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_protected_libraries
+                    ADD COLUMN IF NOT EXISTS snapshot_completed_at TIMESTAMP WITH TIME ZONE
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_protected_libraries
+                    ADD COLUMN IF NOT EXISTS snapshot_error TEXT
+                """)
+
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS person_cleanup_protection_state (
+                        singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+                        generation BIGINT NOT NULL DEFAULT 0,
+                        snapshot_state TEXT NOT NULL DEFAULT 'pending',
+                        snapshot_completed_at TIMESTAMP WITH TIME ZONE,
+                        snapshot_error TEXT,
+                        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cursor.execute("""
+                    INSERT INTO person_cleanup_protection_state (singleton)
+                    VALUES (TRUE)
+                    ON CONFLICT (singleton) DO NOTHING
                 """)
 
                 cursor.execute("""
@@ -389,6 +440,81 @@ def init_db():
                         captured_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
                         PRIMARY KEY (library_id, normalized_name)
                     )
+                """)
+
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS person_cleanup_protected_identities (
+                        library_id TEXT NOT NULL REFERENCES person_cleanup_protected_libraries(library_id) ON DELETE CASCADE,
+                        provider TEXT NOT NULL,
+                        provider_id TEXT NOT NULL,
+                        person_id TEXT NOT NULL,
+                        person_name TEXT,
+                        captured_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        PRIMARY KEY (library_id, provider, provider_id, person_id)
+                    )
+                """)
+
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS person_cleanup_jobs (
+                        job_id TEXT PRIMARY KEY,
+                        state TEXT NOT NULL,
+                        snapshot_generation BIGINT,
+                        confirmation_token_hash TEXT,
+                        candidate_total INTEGER NOT NULL DEFAULT 0,
+                        protected_count INTEGER NOT NULL DEFAULT 0,
+                        linked_count INTEGER NOT NULL DEFAULT 0,
+                        verification_failed_count INTEGER NOT NULL DEFAULT 0,
+                        verified_orphan_count INTEGER NOT NULL DEFAULT 0,
+                        deleted_count INTEGER NOT NULL DEFAULT 0,
+                        skipped_count INTEGER NOT NULL DEFAULT 0,
+                        failed_count INTEGER NOT NULL DEFAULT 0,
+                        stop_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        preview_completed_at TIMESTAMP WITH TIME ZONE,
+                        confirmed_at TIMESTAMP WITH TIME ZONE,
+                        started_at TIMESTAMP WITH TIME ZONE,
+                        completed_at TIMESTAMP WITH TIME ZONE,
+                        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        last_error TEXT
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS person_cleanup_job_items (
+                        job_id TEXT NOT NULL REFERENCES person_cleanup_jobs(job_id) ON DELETE CASCADE,
+                        person_id TEXT NOT NULL,
+                        person_name TEXT,
+                        provider_ids_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        candidate_fingerprint TEXT NOT NULL,
+                        preview_state TEXT NOT NULL DEFAULT 'unverified',
+                        execute_state TEXT NOT NULL DEFAULT 'pending',
+                        post_attempts INTEGER NOT NULL DEFAULT 0,
+                        submitted_at TIMESTAMP WITH TIME ZONE,
+                        completed_at TIMESTAMP WITH TIME ZONE,
+                        last_error TEXT,
+                        PRIMARY KEY (job_id, person_id)
+                    )
+                """)
+
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS person_cleanup_delete_attempts (
+                        person_id TEXT PRIMARY KEY,
+                        operation_id TEXT NOT NULL,
+                        state TEXT NOT NULL DEFAULT 'submitting',
+                        post_attempts INTEGER NOT NULL DEFAULT 1 CHECK (post_attempts = 1),
+                        submitted_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        completed_at TIMESTAMP WITH TIME ZONE,
+                        last_error TEXT
+                    )
+                """)
+
+                cursor.execute("""
+                    UPDATE person_cleanup_jobs
+                    SET state = 'interrupted_requires_repreview',
+                        stop_requested = TRUE,
+                        completed_at = COALESCE(completed_at, NOW()),
+                        updated_at = NOW(),
+                        last_error = COALESCE(last_error, '进程重启，必须重新生成预览并核验')
+                    WHERE state IN ('confirmed', 'running', 'stop_requested')
                 """)
 
                 logger.trace("  ➜ 正在创建 'emby_users' 表...")
@@ -871,6 +997,23 @@ def init_db():
                     cursor.execute("""
                         CREATE INDEX IF NOT EXISTS idx_person_cleanup_protected_name
                         ON person_cleanup_protected_names (normalized_name)
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_person_cleanup_protected_identity
+                        ON person_cleanup_protected_identities (provider, provider_id)
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_person_cleanup_jobs_state
+                        ON person_cleanup_jobs (state, updated_at DESC)
+                    """)
+                    cursor.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS uq_person_cleanup_one_active_job
+                        ON person_cleanup_jobs ((TRUE))
+                        WHERE state IN ('previewing', 'preview_ready', 'confirmed', 'running', 'stop_requested')
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_person_cleanup_job_items_state
+                        ON person_cleanup_job_items (job_id, preview_state, execute_state)
                     """)
 
                 except Exception as e_index:

@@ -16,6 +16,7 @@ import utils
 from actor_utils import enrich_all_actor_aliases_task
 from handler.actor_sync import UnifiedSyncHandler
 from services.person_cleanup_safety import (
+    build_protected_library_root_contract,
     build_person_name_protection_keys,
     candidate_fingerprint,
     canonical_person_provider_identities,
@@ -191,6 +192,22 @@ def _refresh_protected_snapshot(processor):
         raise
 
 
+def _build_protected_root_contract(processor, protected_libraries=None):
+    """Load VirtualFolders once for one verify/preview/delete operation."""
+    selected = (
+        list(protected_libraries)
+        if protected_libraries is not None
+        else person_cleanup_db.list_protected_libraries()
+    )
+    if not selected:
+        return build_protected_library_root_contract([], [])
+    libraries = emby.get_all_libraries_with_paths(
+        processor.emby_url,
+        processor.emby_api_key,
+    )
+    return build_protected_library_root_contract(libraries, selected)
+
+
 def task_scan_ghost_actor_candidates(processor):
     task_name = "扫描幽灵人物"
     logger.info(f"--- 开始只读任务: '{task_name}' ---")
@@ -238,6 +255,7 @@ def task_scan_ghost_actor_candidates(processor):
         if contract['generation'] != generation:
             raise RuntimeError('保护快照 generation 在候选生成前发生变化')
         protected_person_ids = contract['person_ids']
+        protected_alias_person_ids = set(contract.get('alias_statuses') or {})
         protected_person_names = person_cleanup_db.get_protected_person_names()
         protected_provider_identities = contract['provider_identities']
         if protected_person_ids or protected_person_names:
@@ -270,13 +288,15 @@ def task_scan_ghost_actor_candidates(processor):
             referenced_person_ids,
             protected_person_names=protected_person_names,
             protected_provider_identities=protected_provider_identities,
+            protected_alias_person_ids=protected_alias_person_ids,
         )
         saved_count = person_cleanup_db.replace_candidates(candidates)
         message = (
             f"只读扫描完成：发现 {saved_count} 位待人工复核的幽灵人物候选；"
             f"保护库快照覆盖 {len(protected_person_ids)} 个 ID、"
             f"{len(protected_person_names)} 个姓名、"
-            f"{len(protected_provider_identities)} 个外部身份。"
+            f"{len(protected_provider_identities)} 个外部身份、"
+            f"{len(protected_alias_person_ids)} 个持久 alias ID。"
         )
         logger.info(f"  ➜ {message}")
         task_manager.update_status_from_thread(100, message)
@@ -317,6 +337,7 @@ def task_delete_selected_ghost_actors(processor, person_ids):
         contract = person_cleanup_db.get_protection_contract()
         if contract['generation'] != generation:
             raise RuntimeError('删除前保护快照 generation 已变化')
+        protected_root_contract = _build_protected_root_contract(processor)
     except Exception as exc:
         logger.error(f"删除前保护库复核失败: {exc}", exc_info=True)
         task_manager.update_status_from_thread(-1, f"删除已取消：{exc}")
@@ -358,8 +379,26 @@ def task_delete_selected_ghost_actors(processor, person_ids):
             person_id,
             limit=1,
             person_name=person_name,
+            protected_root_contract=protected_root_contract,
+            user_id=getattr(processor, 'emby_user_id', None),
         )
         reference_status = classify_reference_check(references)
+        if reference_status in {
+            'protected_library_alias',
+            'protected_library_unverifiable',
+        }:
+            protected_count += 1
+            person_cleanup_db.persist_protected_alias_and_remove_candidate(
+                candidate,
+                references.get('protected_library_id'),
+                reference_status,
+                references.get('evidence_item_id'),
+            )
+            logger.warning(
+                "  ➜ 跳过 '%s'：已按受保护媒体库 alias 合同撤销候选。",
+                person_name,
+            )
+            continue
         if reference_status in {'connection_failed', 'invalid_response', 'people_unavailable'}:
             failed_count += 1
             error = reference_check_failure_message(reference_status, context='删除前复核')
@@ -467,6 +506,7 @@ def task_preview_safe_person_cleanup(processor, job_id):
         contract = person_cleanup_db.get_protection_contract()
         if contract['generation'] != generation:
             raise RuntimeError('预览保护快照 generation 已变化')
+        protected_root_contract = _build_protected_root_contract(processor)
 
         candidates = person_cleanup_db.list_candidates_raw()
         total = len(candidates)
@@ -497,9 +537,27 @@ def task_preview_safe_person_cleanup(processor, job_id):
                 person_id,
                 limit=1,
                 person_name=person_name,
+                protected_root_contract=protected_root_contract,
+                user_id=getattr(processor, 'emby_user_id', None),
             )
             status = classify_reference_check(references)
-            if status == 'linked':
+            if status in {
+                'protected_library_alias',
+                'protected_library_unverifiable',
+            }:
+                person_cleanup_db.persist_protected_alias_and_remove_candidate(
+                    candidate,
+                    references.get('protected_library_id'),
+                    status,
+                    references.get('evidence_item_id'),
+                )
+                person_cleanup_db.add_cleanup_job_item(
+                    job_id,
+                    candidate,
+                    status,
+                    '已按受保护媒体库人物处理并撤销候选',
+                )
+            elif status == 'linked':
                 person_cleanup_db.add_cleanup_job_item(job_id, candidate, 'linked')
                 person_cleanup_db.remove_candidate(person_id)
             elif status == 'orphan':
@@ -567,6 +625,7 @@ def task_execute_safe_person_cleanup(processor, job_id):
         contract = person_cleanup_db.get_protection_contract()
         if contract['generation'] != generation:
             raise RuntimeError('执行保护快照 generation 已变化')
+        protected_root_contract = _build_protected_root_contract(processor)
 
         items = person_cleanup_db.list_cleanup_job_orphans(job_id)
         total = len(items)
@@ -613,10 +672,22 @@ def task_execute_safe_person_cleanup(processor, job_id):
                 person_id,
                 limit=1,
                 person_name=candidate.get('person_name'),
+                protected_root_contract=protected_root_contract,
+                user_id=getattr(processor, 'emby_user_id', None),
             )
             status = classify_reference_check(references)
             if status != 'orphan':
-                if status == 'linked':
+                if status in {
+                    'protected_library_alias',
+                    'protected_library_unverifiable',
+                }:
+                    person_cleanup_db.persist_protected_alias_and_remove_candidate(
+                        candidate,
+                        references.get('protected_library_id'),
+                        status,
+                        references.get('evidence_item_id'),
+                    )
+                elif status == 'linked':
                     person_cleanup_db.remove_candidate(person_id)
                 person_cleanup_db.mark_cleanup_job_item(
                     job_id, person_id, f'skipped_{status}',

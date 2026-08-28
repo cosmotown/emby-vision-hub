@@ -27,6 +27,7 @@ VERIFICATION_STATES = {
 
 def _exclude_protected_candidates(candidates: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     protected_ids = get_protected_person_ids()
+    protected_ids.update(get_protected_alias_statuses())
     protected_names = build_person_name_protection_keys(get_protected_person_names())
     protected_identities = get_protected_provider_identities()
     filtered = []
@@ -146,6 +147,62 @@ def remove_candidate(person_id: str) -> None:
                 "DELETE FROM person_cleanup_candidates WHERE person_id = %s",
                 (str(person_id),),
             )
+
+
+def persist_protected_alias_and_remove_candidate(
+    candidate: Dict[str, Any],
+    library_id: str,
+    protection_status: str,
+    evidence_item_id: str,
+) -> bool:
+    """Atomically persist protected ownership evidence and revoke candidacy."""
+    allowed_statuses = {
+        'protected_library_alias',
+        'protected_library_unverifiable',
+    }
+    if protection_status not in allowed_statuses:
+        raise ValueError(f'不支持的保护库 alias 状态: {protection_status}')
+    person_id = str(candidate.get('person_id') or candidate.get('Id') or '').strip()
+    normalized_library_id = str(library_id or '').strip()
+    normalized_evidence_id = str(evidence_item_id or '').strip()
+    if not person_id or not normalized_library_id or not normalized_evidence_id:
+        raise ValueError('保护库 alias 证据缺少必要身份字段')
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO person_cleanup_protected_aliases (
+                    library_id, person_id, person_name, candidate_fingerprint,
+                    protection_status, evidence_item_id, captured_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (library_id, person_id) DO UPDATE SET
+                    person_name = EXCLUDED.person_name,
+                    candidate_fingerprint = EXCLUDED.candidate_fingerprint,
+                    protection_status = CASE
+                        WHEN person_cleanup_protected_aliases.protection_status =
+                             'protected_library_alias'
+                        THEN person_cleanup_protected_aliases.protection_status
+                        ELSE EXCLUDED.protection_status
+                    END,
+                    evidence_item_id = EXCLUDED.evidence_item_id,
+                    updated_at = NOW()
+                """,
+                (
+                    normalized_library_id,
+                    person_id,
+                    candidate.get('person_name') or candidate.get('Name'),
+                    candidate_fingerprint(candidate),
+                    protection_status,
+                    normalized_evidence_id,
+                ),
+            )
+            cursor.execute(
+                "DELETE FROM person_cleanup_candidates WHERE person_id = %s",
+                (person_id,),
+            )
+            return cursor.rowcount > 0
 
 
 def mark_candidate_checked(
@@ -533,6 +590,42 @@ def get_protected_provider_identities() -> set[tuple[str, str]]:
             }
 
 
+def get_protected_alias_statuses() -> Dict[str, str]:
+    """Return exact protected alias Person IDs; fingerprint drift is irrelevant."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT aliases.person_id, aliases.protection_status
+                FROM person_cleanup_protected_aliases aliases
+                JOIN person_cleanup_protected_libraries libraries
+                  ON libraries.library_id = aliases.library_id
+                ORDER BY aliases.person_id ASC, aliases.protection_status ASC
+                """
+            )
+            statuses = {}
+            for row in cursor.fetchall():
+                person_id = str(row.get('person_id') or '').strip()
+                if person_id:
+                    statuses.setdefault(person_id, str(row['protection_status']))
+            return statuses
+
+
+def list_protected_aliases() -> List[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT library_id, person_id, person_name,
+                       candidate_fingerprint, protection_status,
+                       evidence_item_id, captured_at, updated_at
+                FROM person_cleanup_protected_aliases
+                ORDER BY library_id ASC, person_id ASC
+                """
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
 def get_protection_contract() -> Dict[str, Any]:
     generation = require_ready_protection_snapshot()
     return {
@@ -540,6 +633,7 @@ def get_protection_contract() -> Dict[str, Any]:
         'person_ids': get_protected_person_ids(),
         'name_keys': build_person_name_protection_keys(get_protected_person_names()),
         'provider_identities': get_protected_provider_identities(),
+        'alias_statuses': get_protected_alias_statuses(),
     }
 
 
@@ -551,6 +645,9 @@ def candidate_protection_reason(
     person_id = str(candidate.get('person_id') or candidate.get('Id') or '').strip()
     if person_id in contract['person_ids']:
         return 'protected_id'
+    alias_status = contract.get('alias_statuses', {}).get(person_id)
+    if alias_status:
+        return alias_status
     if not person_name_protection_keys(
         candidate.get('person_name') or candidate.get('Name')
     ).isdisjoint(contract['name_keys']):

@@ -455,6 +455,29 @@ def init_db():
                 """)
 
                 cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS person_cleanup_protected_aliases (
+                        library_id TEXT NOT NULL REFERENCES person_cleanup_protected_libraries(library_id) ON DELETE CASCADE,
+                        person_id TEXT NOT NULL,
+                        person_name TEXT,
+                        candidate_fingerprint TEXT,
+                        protection_status TEXT NOT NULL CHECK (
+                            protection_status IN (
+                                'protected_library_alias',
+                                'protected_library_unverifiable'
+                            )
+                        ),
+                        evidence_item_id TEXT NOT NULL,
+                        captured_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        UNIQUE (library_id, person_id)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_person_cleanup_protected_aliases_person
+                    ON person_cleanup_protected_aliases (person_id)
+                """)
+
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS person_cleanup_jobs (
                         job_id TEXT PRIMARY KEY,
                         state TEXT NOT NULL,

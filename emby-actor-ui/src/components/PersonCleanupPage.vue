@@ -411,6 +411,8 @@ const isDeleteRunning = computed(() => isBackgroundBusy.value && currentAction.v
 const verificationAlertType = computed(() => ({
   orphan: 'success',
   identity_alias_only: 'info',
+  protected_library_alias: 'info',
+  protected_library_unverifiable: 'warning',
   linked: 'warning',
   people_unavailable: 'warning',
   connection_failed: 'error',
@@ -419,6 +421,8 @@ const verificationAlertType = computed(() => ({
 const verificationAlertTitle = computed(() => ({
   orphan: '当前精确关联作品为 0',
   identity_alias_only: '仅发现其他 Person 的关联作品',
+  protected_library_alias: '受保护媒体库别名人物',
+  protected_library_unverifiable: '受保护媒体库人物明细不可核验',
   linked: `发现 ${verificationResult.value?.reference_count || 0} 部精确关联作品`,
   people_unavailable: '作品人物明细不可核验',
   connection_failed: '无法连接 Emby',
@@ -429,6 +433,12 @@ const verificationSummary = computed(() => {
   if (!result) return '-';
   if (result.status === 'people_unavailable') {
     return `${result.query_reference_count || 0} 部可能关联作品，People 不可核验`;
+  }
+  if (result.status === 'protected_library_alias') {
+    return '该人物仅以其他 Person 身份关联受保护媒体库作品，已移出待复核';
+  }
+  if (result.status === 'protected_library_unverifiable') {
+    return '受保护媒体库作品的 People 明细无法完整核验，已按保护处理并移出待复核';
   }
   if (['connection_failed', 'invalid_response'].includes(result.status)) {
     return '核对未完成，禁止删除';

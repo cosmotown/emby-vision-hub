@@ -10,6 +10,7 @@ import task_manager
 from database import person_cleanup_db
 from extensions import admin_required, processor_ready_required, task_lock_required
 from services.person_cleanup_safety import (
+    build_protected_library_root_contract,
     build_identity_provider_pairs,
     classify_reference_check,
     reference_check_failure_message,
@@ -43,6 +44,17 @@ def _serialize_reference_items(items):
 def _refreshed_candidate(person_id, fallback):
     refreshed = person_cleanup_db.get_candidates_by_ids([person_id])
     return refreshed[0] if refreshed else fallback
+
+
+def _build_protected_root_contract():
+    selected = person_cleanup_db.list_protected_libraries()
+    if not selected:
+        return build_protected_library_root_contract([], [])
+    libraries = emby.get_all_libraries_with_paths(
+        extensions.media_processor_instance.emby_url,
+        extensions.media_processor_instance.emby_api_key,
+    )
+    return build_protected_library_root_contract(libraries, selected)
 
 
 @person_cleanup_bp.route('/candidates', methods=['GET'])
@@ -204,12 +216,15 @@ def verify_person_cleanup_candidate(person_id):
             'candidate_removed': True,
             'verification_complete': False,
         }), 409
+    protected_root_contract = _build_protected_root_contract()
     references = emby.get_person_media_references(
         extensions.media_processor_instance.emby_url,
         extensions.media_processor_instance.emby_api_key,
         normalized_id,
         limit=50,
         person_name=candidate.get('person_name'),
+        protected_root_contract=protected_root_contract,
+        user_id=getattr(extensions.media_processor_instance, 'emby_user_id', None),
     )
     reference_status = classify_reference_check(references)
     safe_references = references if isinstance(references, dict) else {}
@@ -228,6 +243,9 @@ def verify_person_cleanup_candidate(person_id):
         'reference_count': reference_count,
         'query_reference_count': query_reference_count,
         'identity_alias_only': reference_status == 'identity_alias_only',
+        'protected_library_id': safe_references.get('protected_library_id'),
+        'protected_library_name': safe_references.get('protected_library_name'),
+        'evidence_item_id': safe_references.get('evidence_item_id'),
         'items': _serialize_reference_items(safe_references.get('items')),
         'unverified_items': _serialize_reference_items(safe_references.get('unverified_items')),
         'emby_url': (
@@ -237,6 +255,30 @@ def verify_person_cleanup_candidate(person_id):
         ).rstrip('/'),
         'emby_server_id': extensions.EMBY_SERVER_ID or '',
     }
+
+    if reference_status in {
+        'protected_library_alias',
+        'protected_library_unverifiable',
+    }:
+        person_cleanup_db.persist_protected_alias_and_remove_candidate(
+            candidate,
+            safe_references.get('protected_library_id'),
+            reference_status,
+            safe_references.get('evidence_item_id'),
+        )
+        response.update({
+            'candidate_removed': True,
+            'verification_complete': True,
+            'message': (
+                '该人物仅以其他 Person 身份关联受保护媒体库作品，'
+                '已按保护库人物处理并移出待复核。'
+                if reference_status == 'protected_library_alias'
+                else
+                '该人物关联受保护媒体库作品，但 People 明细无法完整核验；'
+                '已按保护处理并移出待复核。'
+            ),
+        })
+        return jsonify(response)
 
     if reference_status in {'connection_failed', 'invalid_response', 'people_unavailable'}:
         error = reference_check_failure_message(reference_status)
@@ -319,6 +361,7 @@ def verify_person_cleanup_candidate(person_id):
                 matching_id,
                 limit=50,
                 person_name=matching_person.get('Name'),
+                user_id=getattr(extensions.media_processor_instance, 'emby_user_id', None),
             )
             matching_status = classify_reference_check(matching_references)
             if matching_status in {'connection_failed', 'invalid_response', 'people_unavailable'}:

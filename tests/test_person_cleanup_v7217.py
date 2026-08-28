@@ -118,6 +118,7 @@ class PersonCleanupV7217Tests(unittest.TestCase):
              patch.object(db, 'finish_cleanup_preview'), \
              patch.object(db, 'cleanup_job_stop_requested', return_value=False), \
              patch.object(actors, '_refresh_protected_snapshot', return_value=(10, {})), \
+             patch.object(actors, '_build_protected_root_contract', return_value={'complete': True}), \
              patch.object(actors.emby, 'get_person_media_references', return_value={
                  'status': 'identity_alias_only', 'count': 0, 'query_count': 1,
              }), \
@@ -146,6 +147,7 @@ class PersonCleanupV7217Tests(unittest.TestCase):
              patch.object(db, 'mark_cleanup_job_item', return_value=False) as mark_item, \
              patch.object(db, 'finish_cleanup_job'), \
              patch.object(actors, '_refresh_protected_snapshot', return_value=(11, {})), \
+             patch.object(actors, '_build_protected_root_contract', return_value={'complete': True}), \
              patch.object(actors.emby, 'get_person_media_references', return_value={
                  'status': 'orphan', 'count': 0, 'items': [],
              }), \
@@ -178,6 +180,7 @@ class PersonCleanupV7217Tests(unittest.TestCase):
              patch.object(db, 'mark_cleanup_job_item', side_effect=mark), \
              patch.object(db, 'finish_cleanup_job'), \
              patch.object(actors, '_refresh_protected_snapshot', return_value=(12, {})), \
+             patch.object(actors, '_build_protected_root_contract', return_value={'complete': True}), \
              patch.object(actors.emby, 'get_person_media_references', return_value={
                  'status': 'orphan', 'count': 0, 'items': [],
              }), \

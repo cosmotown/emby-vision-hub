@@ -249,6 +249,27 @@ class PersonCleanupSafetyTests(unittest.TestCase):
             {'http://emby/Items/m1', 'http://emby/Items/m2'},
         )
 
+    def test_individual_people_details_use_user_item_endpoint_when_available(self):
+        def response_for_url(url, **_kwargs):
+            item_id = url.rsplit('/', 1)[-1]
+            response = MagicMock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {'Id': item_id, 'People': []}
+            return response
+
+        client = MagicMock()
+        client.get.side_effect = response_for_url
+        with patch.dict(self.emby_globals, {'emby_client': client}):
+            details = self.get_emby_item_people_details(
+                'http://emby', 'token', ['m1'], user_id='user-1'
+            )
+
+        self.assertEqual(details, [{'Id': 'm1', 'People': []}])
+        self.assertEqual(
+            client.get.call_args.args[0],
+            'http://emby/Users/user-1/Items/m1',
+        )
+
     def test_list_people_with_other_id_is_identity_alias_only(self):
         list_item = {
             'Id': 'm1',
@@ -453,6 +474,9 @@ class PersonCleanupSafetyTests(unittest.TestCase):
             'person_cleanup_db': person_cleanup_db,
             'task_manager': MagicMock(),
             '_refresh_protected_snapshot': MagicMock(return_value=(7, {})),
+            '_build_protected_root_contract': MagicMock(
+                return_value={'complete': True, 'roots': ()},
+            ),
             'build_person_name_protection_keys': lambda values: set(values),
             'person_name_protection_keys': person_name_protection_keys,
             'is_explicit_verified_orphan': MagicMock(return_value=True),
@@ -545,6 +569,9 @@ class PersonCleanupSafetyTests(unittest.TestCase):
             ],
             '_refreshed_candidate': lambda person_id, fallback: (
                 person_cleanup_db.get_candidates_by_ids([person_id])[0]
+            ),
+            '_build_protected_root_contract': MagicMock(
+                return_value={'complete': True, 'roots': ()},
             ),
             'config_manager': SimpleNamespace(APP_CONFIG={}),
             'constants': SimpleNamespace(
@@ -656,7 +683,7 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         self.assertIn('reserve_person_delete_attempt', actor_source)
         self.assertIn('person_name=person_name', actor_source)
         emby_source = (repo_root / 'handler' / 'emby.py').read_text()
-        self.assertIn("'Fields': 'SeriesName,ProductionYear,People'", emby_source)
+        self.assertIn("'Fields': 'SeriesName,ProductionYear,People,Path'", emby_source)
         self.assertIn('media_item_has_exact_person_reference', emby_source)
         self.assertIn('get_emby_items_by_id', emby_source)
         self.assertIn('get_emby_item_people_details', emby_source)

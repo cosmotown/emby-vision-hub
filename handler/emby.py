@@ -2348,6 +2348,7 @@ def get_emby_item_people_details(
     api_key: str,
     item_ids: List[str],
     max_workers: int = 6,
+    user_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """最后一层兼容兜底：并发读取少量单作品详情中的 People。"""
     normalized_ids = list(dict.fromkeys(
@@ -2357,10 +2358,16 @@ def get_emby_item_people_details(
         return []
 
     headers = {'X-Emby-Token': api_key}
+    normalized_user_id = str(user_id or '').strip()
 
     def fetch_one(item_id: str) -> Dict[str, Any]:
+        detail_path = (
+            f"/Users/{normalized_user_id}/Items/{item_id}"
+            if normalized_user_id
+            else f"/Items/{item_id}"
+        )
         response = emby_client.get(
-            f"{base_url.rstrip('/')}/Items/{item_id}",
+            f"{base_url.rstrip('/')}{detail_path}",
             headers=headers,
             params={'Fields': 'People', 'PersonFields': 'ProviderIds'},
             timeout=30,
@@ -2393,6 +2400,8 @@ def get_person_media_references(
     person_id: str,
     limit: int = 1,
     person_name: Optional[str] = None,
+    protected_root_contract: Optional[Dict[str, Any]] = None,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     '''
     Return exact current media references for a Person.
@@ -2414,6 +2423,7 @@ def get_person_media_references(
         }
 
     from services.person_cleanup_safety import (
+        find_protected_library_item_match,
         media_item_has_exact_person_reference,
     )
 
@@ -2423,22 +2433,40 @@ def get_person_media_references(
     start_index = 0
     query_items = []
 
+    def apply_protected_library_status(result: Dict[str, Any]) -> Dict[str, Any]:
+        base_status = result.get('status')
+        if base_status not in {'identity_alias_only', 'people_unavailable'}:
+            return result
+        match = find_protected_library_item_match(
+            query_items,
+            protected_root_contract,
+        )
+        if not match:
+            return result
+        result.update(match)
+        result['status'] = (
+            'protected_library_alias'
+            if base_status == 'identity_alias_only'
+            else 'protected_library_unverifiable'
+        )
+        return result
+
     def failed_result(status: str, unverified_items=None) -> Dict[str, Any]:
-        return {
+        return apply_protected_library_status({
             'status': status,
             'count': None,
             'items': [],
             'query_count': len(query_items),
             'identity_alias_only': False,
             'unverified_items': list(unverified_items or []),
-        }
+        })
 
     while True:
         params = {
             'PersonIds': str(person_id),
             'Recursive': 'true',
             'IncludeItemTypes': 'Movie,Series,Episode,Video,MusicVideo',
-            'Fields': 'SeriesName,ProductionYear,People',
+            'Fields': 'SeriesName,ProductionYear,People,Path',
             'StartIndex': start_index,
             'Limit': batch_size,
             'EnableTotalRecordCount': 'false',
@@ -2547,11 +2575,19 @@ def get_person_media_references(
                 )
                 return failed_result('people_unavailable', items_needing_details)
             try:
-                individual_details = get_emby_item_people_details(
-                    base_url,
-                    api_key,
-                    unresolved_detail_ids,
-                )
+                if str(user_id or '').strip():
+                    individual_details = get_emby_item_people_details(
+                        base_url,
+                        api_key,
+                        unresolved_detail_ids,
+                        user_id=user_id,
+                    )
+                else:
+                    individual_details = get_emby_item_people_details(
+                        base_url,
+                        api_key,
+                        unresolved_detail_ids,
+                    )
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
                 logger.error(f"复核人物 {person_id} 的单作品详情连接失败: {exc}")
                 return failed_result('connection_failed', items_needing_details)
@@ -2613,14 +2649,14 @@ def get_person_media_references(
     else:
         status = 'orphan'
 
-    return {
+    return apply_protected_library_status({
         'status': status,
         'count': exact_count,
         'items': exact_items,
         'query_count': query_match_count,
         'identity_alias_only': status == 'identity_alias_only',
         'unverified_items': [],
-    }
+    })
 
 def get_people_by_provider_ids(
     base_url: str,

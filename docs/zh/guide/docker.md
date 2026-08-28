@@ -15,7 +15,7 @@ mkdir -p /path/emby-vision-hub
 ```yaml
 services:
   emby-vision-hub:
-    image: tzyzero186/emby-vision-hub:7.2.17
+    image: tzyzero186/emby-vision-hub:7.2.18
     container_name: emby-vision-hub
     network_mode: bridge
     ports:
@@ -38,7 +38,7 @@ services:
       - DB_PASSWORD=请替换为强密码
       - DB_NAME=evh
       - CONTAINER_NAME=emby-vision-hub
-      - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:7.2.17
+      - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:7.2.18
     restart: unless-stopped
     depends_on:
       db:

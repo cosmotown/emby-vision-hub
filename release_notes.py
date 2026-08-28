@@ -2,6 +2,31 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.18",
+        "published_at": "2026-08-28T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.18",
+        "changelog": """## 保护媒体库 alias 人物安全收口
+
+- 当 PersonIds 查询命中保护媒体库作品、但作品 People 没有精确引用当前 Person ID 时，将候选明确归类为 `protected_library_alias`。
+- 当保护媒体库作品的 People 明细无法可靠核验时，将候选明确归类为 `protected_library_unverifiable`，继续失败关闭。
+- 保护库归属只接受 exact library ancestor 或 Path 与 VirtualFolder Location 的严格边界匹配；不按标题、文件名或人物姓名猜测。
+- 无法确认媒体库归属时保持原有失败关闭状态，绝不扩大人物删除许可。
+
+## 候选撤销与删除防线
+
+- 已确认属于保护域的 alias / unverifiable 人物会持久化保护证据并从待复核候选撤销，页面刷新和重新扫描后不会重新生成。
+- 单项核验、一键安全清理 preview、执行前防御检查和 legacy selected-delete 防线统一使用同一保护合同。
+- `identity_alias_only` 命中普通媒体库时仍保持失败关闭，不会误判为可删除人物。
+- `DeletePerson` 许可没有放宽；保护域人物不会进入 verified orphan 或删除提交路径。
+
+### 明确不包含
+
+- 不修改 Fast Audit、STRM Inventory、watcher、MediaInfo、ReviewList 或神医 MediaInfo 逻辑。
+
+""",
+    },
+
+    {
         "version": "v7.2.17",
         "published_at": "2026-08-27T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.17",

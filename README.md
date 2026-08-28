@@ -6,7 +6,7 @@
 
 [![中文文档](https://img.shields.io/badge/docs-中文文档-8D51F9)](https://github.com/cosmotown/emby-vision-hub/tree/main/docs/zh)
 [![GitHub license](https://img.shields.io/github/license/cosmotown/emby-vision-hub.svg)](https://github.com/cosmotown/emby-vision-hub/blob/main/LICENSE)
-[![Version](https://img.shields.io/badge/version-7.2.17-6E66ED)](https://github.com/cosmotown/emby-vision-hub/releases)
+[![Version](https://img.shields.io/badge/version-7.2.18-6E66ED)](https://github.com/cosmotown/emby-vision-hub/releases)
 
 EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 STRM 入库协调、元数据增强、智能订阅、媒体整理、合集与虚拟库、封面生成、任务调度、用户权限和运行诊断。
 
@@ -53,7 +53,7 @@ EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 S
     services:
       # --- 1. Emby Vision Hub 主程序 ---
       emby-vision-hub:
-        image: tzyzero186/emby-vision-hub:7.2.17
+        image: tzyzero186/emby-vision-hub:7.2.18
         container_name: emby-vision-hub
         network_mode: bridge                          # 网络模式
         ports:
@@ -76,7 +76,7 @@ EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 S
           - DB_PASSWORD=请替换为强密码                 # !!! (必填) 与下方保持一致 !!!
           - DB_NAME=evh                               # !!! (可选) 修改为你自己的数据库名
           - CONTAINER_NAME=emby-vision-hub            # 以下两项都是一键更新用，不需要可以不配置
-          - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:7.2.17
+          - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:7.2.18
         restart: unless-stopped
         depends_on:                                   # 确保主程序只在数据库健康检查通过后才启动 
           db:

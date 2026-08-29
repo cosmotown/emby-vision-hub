@@ -1186,6 +1186,150 @@ def get_cleanup_job(job_id: str, include_items: bool = False) -> Optional[Dict[s
             return result
 
 
+def get_latest_cleanup_job(include_items: bool = False) -> Optional[Dict[str, Any]]:
+    """Return the newest persisted cleanup job without changing its state."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT job_id
+                FROM person_cleanup_jobs
+                ORDER BY created_at DESC, job_id DESC
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+    if not row:
+        return None
+    return get_cleanup_job(str(row['job_id']), include_items=include_items)
+
+
+def get_cleanup_job_preview_summary(job_id: str) -> Optional[Dict[str, Any]]:
+    """Read the complete persisted preview-state distribution for one job."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT candidate_total
+                FROM person_cleanup_jobs
+                WHERE job_id = %s
+                """,
+                (str(job_id),),
+            )
+            job = cursor.fetchone()
+            if not job:
+                return None
+            cursor.execute(
+                """
+                SELECT preview_state, COUNT(*)::INTEGER AS count
+                FROM person_cleanup_job_items
+                WHERE job_id = %s
+                GROUP BY preview_state
+                ORDER BY count DESC, preview_state ASC
+                """,
+                (str(job_id),),
+            )
+            grouped = [dict(row) for row in cursor.fetchall()]
+
+    candidate_total = int(job.get('candidate_total') or 0)
+    actual_counts = {
+        str(row.get('preview_state') or 'unknown'): int(row.get('count') or 0)
+        for row in grouped
+    }
+    items_total = sum(actual_counts.values())
+    expected_states = (
+        'verified_orphan',
+        'identity_alias_only',
+        'people_unavailable',
+        'invalid_response',
+        'connection_failed',
+        'linked',
+        'protected_library_alias',
+        'protected_library_unverifiable',
+        'protected_id',
+        'protected_name',
+        'protected_provider_identity',
+    )
+    ordered_statuses = list(expected_states)
+    ordered_statuses.extend(sorted(set(actual_counts) - set(expected_states)))
+    states = []
+    for status in ordered_statuses:
+        count = int(actual_counts.get(status) or 0)
+        states.append({
+            'status': status,
+            'count': count,
+            'percentage': round((count * 100.0 / candidate_total), 2)
+            if candidate_total else 0.0,
+        })
+
+    counts = {row['status']: row['count'] for row in states}
+    verified_orphan = int(counts.get('verified_orphan') or 0)
+    warning = None
+    if items_total != candidate_total:
+        warning = (
+            '持久化预览明细数量与任务候选总数不一致：'
+            f'job_items={items_total}, candidate_total={candidate_total}'
+        )
+    return {
+        'total': candidate_total,
+        'candidate_total': candidate_total,
+        'items_total': items_total,
+        'verified_orphan': verified_orphan,
+        'non_verified_orphan': max(0, items_total - verified_orphan),
+        'states': states,
+        'counts': counts,
+        'consistent': warning is None,
+        'consistency_warning': warning,
+    }
+
+
+def list_cleanup_job_preview_items(
+    job_id: str,
+    preview_state: str,
+    page: int = 1,
+    page_size: int = 5,
+) -> Dict[str, Any]:
+    """Page persisted preview items for an exact state; never re-verify them."""
+    normalized_page = max(1, int(page))
+    normalized_page_size = max(1, min(50, int(page_size)))
+    offset = (normalized_page - 1) * normalized_page_size
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*)::INTEGER AS total
+                FROM person_cleanup_job_items
+                WHERE job_id = %s AND preview_state = %s
+                """,
+                (str(job_id), str(preview_state)),
+            )
+            total = int(cursor.fetchone()['total'] or 0)
+            cursor.execute(
+                """
+                SELECT person_id, person_name, provider_ids_json,
+                       preview_state, execute_state, last_error
+                FROM person_cleanup_job_items
+                WHERE job_id = %s AND preview_state = %s
+                ORDER BY person_name ASC NULLS LAST, person_id ASC
+                LIMIT %s OFFSET %s
+                """,
+                (
+                    str(job_id),
+                    str(preview_state),
+                    normalized_page_size,
+                    offset,
+                ),
+            )
+            items = [dict(row) for row in cursor.fetchall()]
+    return {
+        'status': str(preview_state),
+        'items': items,
+        'total': total,
+        'page': normalized_page,
+        'page_size': normalized_page_size,
+    }
+
+
 def issue_cleanup_confirmation_token(job_id: str) -> str:
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()

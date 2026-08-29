@@ -29,6 +29,13 @@
             一键安全清理
           </n-button>
           <n-button
+            v-if="safeCleanupJob?.job_id"
+            secondary
+            @click="openLatestSafeCleanupJob"
+          >
+            最近预览
+          </n-button>
+          <n-button
             type="error"
             :loading="isDeleteRunning"
             :disabled="selectedIds.length === 0 || isBackgroundBusy"
@@ -338,6 +345,42 @@
           <n-descriptions-item label="核验失败/删除失败">{{ safeCleanupJob.verification_failed_count || 0 }} / {{ safeCleanupJob.failed_count || 0 }}</n-descriptions-item>
           <n-descriptions-item v-if="safeCleanupJob.last_error" label="错误">{{ safeCleanupJob.last_error }}</n-descriptions-item>
         </n-descriptions>
+        <template v-if="previewStateRows.length">
+          <n-divider>核验结果明细</n-divider>
+          <n-alert
+            v-if="safeCleanupJob.preview_summary?.consistency_warning"
+            type="error"
+            title="持久化预览数据不一致"
+            style="margin-bottom: 12px;"
+          >
+            {{ safeCleanupJob.preview_summary.consistency_warning }}
+          </n-alert>
+          <n-alert type="info" style="margin-bottom: 12px;">
+            “核验失败”不等于“不是幽灵人物”，而是当前证据不足以授予删除资格。
+            以下统计只读取本次历史 preview 已持久化的结果，不会重新访问 Emby。
+          </n-alert>
+          <n-list bordered>
+            <n-list-item v-for="row in previewStateRows" :key="row.status">
+              <n-space justify="space-between" align="center" :wrap="false">
+                <div>
+                  <n-text strong>{{ row.label }}</n-text>
+                  <n-text depth="3" style="display:block;font-size:12px;">{{ row.status }}</n-text>
+                </div>
+                <n-space align="center" :wrap="false">
+                  <n-text>{{ row.count }}（{{ row.percentage_text }}）</n-text>
+                  <n-button
+                    v-if="row.sample_available"
+                    size="small"
+                    tertiary
+                    @click="openPreviewSamples(row)"
+                  >
+                    查看样本
+                  </n-button>
+                </n-space>
+              </n-space>
+            </n-list-item>
+          </n-list>
+        </template>
         <template v-if="safeCleanupJob?.state === 'preview_ready'">
           <n-divider>显式确认</n-divider>
           <n-text depth="3">输入“确认删除已核验孤儿人物”后才允许开始。</n-text>
@@ -363,12 +406,52 @@
         </n-space>
       </n-card>
     </n-modal>
+
+    <n-modal v-model:show="previewSamplesVisible" :mask-closable="!previewSamplesLoading">
+      <n-card
+        class="person-verify-card"
+        :title="`预览样本：${previewSamplesLabel}`"
+        closable
+        @close="previewSamplesVisible = false"
+      >
+        <n-alert type="info" style="margin-bottom: 12px;">
+          样本来自该 cleanup job 的持久化 job_items；不会实时访问 Emby 或重新核验人物。
+        </n-alert>
+        <n-data-table
+          :columns="previewSampleColumns"
+          :data="previewSamplesItems"
+          :loading="previewSamplesLoading"
+          :row-key="row => row.person_id"
+          :pagination="false"
+          :scroll-x="900"
+        />
+        <n-empty
+          v-if="!previewSamplesLoading && previewSamplesItems.length === 0"
+          description="该分类没有持久化样本"
+          size="small"
+          style="margin-top: 12px;"
+        />
+        <n-space justify="end" style="margin-top: 16px;">
+          <n-pagination
+            v-if="previewSamplesTotal > previewSamplesPageSize"
+            :page="previewSamplesPage"
+            :page-count="previewSamplesPageCount"
+            :page-size="previewSamplesPageSize"
+            @update:page="fetchPreviewSamples"
+          />
+        </n-space>
+      </n-card>
+    </n-modal>
   </n-layout>
 </template>
 
 <script setup>
 import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import axios from 'axios';
+import {
+  buildPersonCleanupPreviewRows,
+  personCleanupPreviewLabel,
+} from '../utils/personCleanupPreview';
 import {
   NAlert,
   NButton,
@@ -387,6 +470,7 @@ import {
   NListItem,
   NModal,
   NPageHeader,
+  NPagination,
   NSpace,
   NSpin,
   NTag,
@@ -421,6 +505,14 @@ const safeCleanupModalVisible = ref(false);
 const safeCleanupJob = ref(null);
 const safeCleanupConfirmation = ref('');
 const safeCleanupConfirming = ref(false);
+const previewSamplesVisible = ref(false);
+const previewSamplesLoading = ref(false);
+const previewSamplesState = ref('');
+const previewSamplesLabel = ref('');
+const previewSamplesItems = ref([]);
+const previewSamplesPage = ref(1);
+const previewSamplesPageSize = 5;
+const previewSamplesTotal = ref(0);
 let safeCleanupPollTimer = null;
 const pagination = { pageSize: 30, showSizePicker: true, pageSizes: [20, 30, 50, 100] };
 
@@ -428,6 +520,13 @@ const currentAction = computed(() => props.taskStatus?.current_action || '');
 const isBackgroundBusy = computed(() => Boolean(props.taskStatus?.is_running));
 const isScanRunning = computed(() => isBackgroundBusy.value && currentAction.value.includes('扫描幽灵人物'));
 const isDeleteRunning = computed(() => isBackgroundBusy.value && currentAction.value.includes('删除') && currentAction.value.includes('幽灵人物'));
+const previewStateRows = computed(() => (
+  buildPersonCleanupPreviewRows(safeCleanupJob.value?.preview_summary)
+));
+const previewSamplesPageCount = computed(() => Math.max(
+  1,
+  Math.ceil(previewSamplesTotal.value / previewSamplesPageSize),
+));
 const readonlyScanTitle = computed(() => {
   const state = readonlyScan.value?.state;
   if (state === 'completed') return '两阶段只读扫描已完成';
@@ -578,6 +677,39 @@ const providerIdText = (providerIds) => {
   const labels = Object.entries(normalized).map(([key, value]) => `${key}: ${value}`);
   return labels.length ? labels.join(' / ') : '无';
 };
+
+const previewSampleColumns = [
+  {
+    title: '人物',
+    key: 'person_name',
+    minWidth: 170,
+    render: (row) => h('div', null, [
+      h('strong', null, row.person_name || '未知人物'),
+      h(NText, { depth: 3, style: 'display:block;font-size:12px;' }, () => `Emby: ${row.person_id}`),
+    ]),
+  },
+  {
+    title: '外部 ID',
+    key: 'provider_ids_json',
+    minWidth: 170,
+    render: (row) => providerIdText(row.provider_ids_json),
+  },
+  {
+    title: '预览状态',
+    key: 'preview_state',
+    minWidth: 190,
+    render: (row) => h('div', null, [
+      h(NText, null, () => personCleanupPreviewLabel(row.preview_state)),
+      h(NText, { depth: 3, style: 'display:block;font-size:12px;' }, () => row.preview_state),
+    ]),
+  },
+  {
+    title: '原因',
+    key: 'last_error',
+    minWidth: 260,
+    render: (row) => row.last_error || '无持久化错误信息',
+  },
+];
 
 const embyUrlForItem = (itemId) => {
   const baseUrl = verificationResult.value?.emby_url?.replace(/\/$/, '');
@@ -758,6 +890,57 @@ const deleteSelected = async () => {
   }
 };
 
+const fetchLatestSafeCleanupJob = async () => {
+  try {
+    const response = await axios.get('/api/person-cleanup/cleanup-jobs/latest');
+    if (response.data.job) safeCleanupJob.value = response.data.job;
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法读取最近一次安全清理预览');
+  }
+};
+
+const openLatestSafeCleanupJob = () => {
+  safeCleanupConfirmation.value = '';
+  safeCleanupModalVisible.value = true;
+};
+
+const fetchPreviewSamples = async (page = 1) => {
+  if (!safeCleanupJob.value?.job_id || !previewSamplesState.value) return;
+  previewSamplesLoading.value = true;
+  try {
+    const response = await axios.get(
+      `/api/person-cleanup/cleanup-jobs/${encodeURIComponent(safeCleanupJob.value.job_id)}/preview-items`,
+      {
+        params: {
+          state: previewSamplesState.value,
+          page,
+          page_size: previewSamplesPageSize,
+        },
+      },
+    );
+    previewSamplesItems.value = response.data.items || [];
+    previewSamplesPage.value = response.data.page || page;
+    previewSamplesTotal.value = response.data.total || 0;
+  } catch (error) {
+    previewSamplesItems.value = [];
+    previewSamplesTotal.value = 0;
+    message.error(error.response?.data?.error || '无法读取持久化预览样本');
+  } finally {
+    previewSamplesLoading.value = false;
+  }
+};
+
+const openPreviewSamples = async (row) => {
+  if (!row?.sample_available) return;
+  previewSamplesState.value = row.status;
+  previewSamplesLabel.value = row.label;
+  previewSamplesPage.value = 1;
+  previewSamplesItems.value = [];
+  previewSamplesTotal.value = 0;
+  previewSamplesVisible.value = true;
+  await fetchPreviewSamples(1);
+};
+
 const scheduleSafeCleanupPoll = () => {
   if (safeCleanupPollTimer) window.clearTimeout(safeCleanupPollTimer);
   const terminalStates = new Set(['preview_ready', 'completed', 'stopped', 'failed', 'superseded', 'interrupted_requires_repreview']);
@@ -830,6 +1013,7 @@ watch(
 onMounted(() => {
   fetchCandidates();
   fetchProtectedLibraries();
+  fetchLatestSafeCleanupJob();
 });
 
 onBeforeUnmount(() => {

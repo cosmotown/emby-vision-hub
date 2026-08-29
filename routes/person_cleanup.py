@@ -488,14 +488,57 @@ def create_safe_cleanup_preview():
     }), 202
 
 
+def _cleanup_job_with_preview_summary(job):
+    if not job:
+        return None
+    result = dict(job)
+    result['preview_summary'] = person_cleanup_db.get_cleanup_job_preview_summary(
+        result['job_id'],
+    )
+    return result
+
+
+@person_cleanup_bp.route('/cleanup-jobs/latest', methods=['GET'])
+@admin_required
+def get_latest_safe_cleanup_job():
+    job = person_cleanup_db.get_latest_cleanup_job()
+    return jsonify({'job': _cleanup_job_with_preview_summary(job)})
+
+
 @person_cleanup_bp.route('/cleanup-jobs/<job_id>', methods=['GET'])
 @admin_required
 def get_safe_cleanup_job(job_id):
     include_items = request.args.get('include_items', 'false').lower() == 'true'
-    job = person_cleanup_db.get_cleanup_job(job_id, include_items=include_items)
+    job = _cleanup_job_with_preview_summary(
+        person_cleanup_db.get_cleanup_job(job_id, include_items=include_items),
+    )
     if not job:
         return jsonify({'error': '未找到清理任务'}), 404
     return jsonify({'job': job})
+
+
+@person_cleanup_bp.route('/cleanup-jobs/<job_id>/preview-items', methods=['GET'])
+@admin_required
+def get_safe_cleanup_preview_items(job_id):
+    preview_state = str(request.args.get('state') or '').strip()
+    if not preview_state or len(preview_state) > 128:
+        return jsonify({'error': '必须提供有效的 preview state'}), 400
+    try:
+        page = int(request.args.get('page', '1'))
+        page_size = int(request.args.get('page_size', '5'))
+    except (TypeError, ValueError):
+        return jsonify({'error': '分页参数必须为整数'}), 400
+    if page < 1 or page_size < 1 or page_size > 50:
+        return jsonify({'error': '分页范围无效'}), 400
+    if not person_cleanup_db.get_cleanup_job(job_id):
+        return jsonify({'error': '未找到清理任务'}), 404
+    result = person_cleanup_db.list_cleanup_job_preview_items(
+        job_id,
+        preview_state,
+        page=page,
+        page_size=page_size,
+    )
+    return jsonify(result)
 
 
 @person_cleanup_bp.route('/cleanup-jobs/<job_id>/confirmation-token', methods=['POST'])

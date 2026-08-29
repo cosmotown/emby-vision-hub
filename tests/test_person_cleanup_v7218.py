@@ -287,7 +287,7 @@ class ProtectedLibraryWorkflowTests(unittest.TestCase):
         )
         delete.assert_not_called()
 
-    def test_initial_scan_has_zero_per_candidate_reference_requests(self):
+    def test_initial_scan_adds_persistent_phase_two_reference_checks(self):
         people = [
             {'Id': str(index), 'Name': f'人物{index}', 'ProviderIds': {}}
             for index in range(22908)
@@ -305,53 +305,28 @@ class ProtectedLibraryWorkflowTests(unittest.TestCase):
             source.index('def task_scan_ghost_actor_candidates'):
             source.index('def task_delete_selected_ghost_actors')
         ]
-        self.assertNotIn('get_person_media_references', scan_source)
+        self.assertIn('_run_readonly_alias_scan', scan_source)
+        self.assertIn('start_readonly_alias_scan', scan_source)
 
-    def test_initial_scan_22908_has_zero_personids_http_and_one_virtualfolder_read(self):
-        people = [
-            {'Id': str(index), 'Name': f'人物{index}', 'ProviderIds': {}}
-            for index in range(22908)
+    def test_phase_two_is_bounded_and_get_only(self):
+        source = Path(actors.__file__).read_text()
+        checker_source = source[
+            source.index('def _check_readonly_alias_candidate'):
+            source.index('def _run_readonly_alias_scan')
         ]
-        processor = SimpleNamespace(
-            emby_url='http://emby',
-            emby_api_key='token',
-            emby_user_id='user',
-            get_stop_event=lambda: None,
-            is_stop_requested=lambda: False,
-        )
-        db = actors.person_cleanup_db
-        libraries = [
-            {'info': {'Id': 'normal', 'Name': '普通库'}},
-            {'info': {'Id': 'protected', 'Name': '保护库'}},
+        phase_two_source = source[
+            source.index('def _run_readonly_alias_scan'):
+            source.index('def task_scan_ghost_actor_candidates')
         ]
-        with patch.object(
-            actors.emby, 'get_all_libraries_with_paths', return_value=libraries,
-        ) as virtualfolders, \
-             patch.object(db, 'list_protected_libraries', return_value=[{
-                 'library_id': 'protected', 'library_name': '保护库',
-             }]), \
-             patch.object(actors, '_refresh_protected_snapshot', return_value=(30, {})), \
-             patch.object(actors.emby, 'get_referenced_person_ids_strict', return_value={
-                 'person_ids': set(), 'media_count': 0,
-             }), \
-             patch.object(db, 'get_protection_contract', return_value={
-                 **self.empty_contract(30),
-                 'alias_statuses': {'1024': 'protected_library_alias'},
-             }), \
-             patch.object(db, 'get_protected_person_names', return_value=set()), \
-             patch.object(
-                 actors.emby, 'get_all_persons_from_emby', return_value=iter([people]),
-             ), \
-             patch.object(db, 'replace_candidates', return_value=22907) as replace, \
-             patch.object(
-                 actors.emby, 'get_person_media_references',
-             ) as personids_query:
-            actors.task_scan_ghost_actor_candidates(processor)
-
-        virtualfolders.assert_called_once()
-        personids_query.assert_not_called()
-        replace.assert_called_once()
-        self.assertEqual(len(replace.call_args.args[0]), 22907)
+        self.assertIn('max_workers=PERSON_ALIAS_SCAN_WORKERS', phase_two_source)
+        self.assertEqual(actors.PERSON_ALIAS_SCAN_WORKERS, 4)
+        self.assertLessEqual(actors.PERSON_ALIAS_SCAN_CLAIM_LIMIT, 6)
+        self.assertIn('get_person_media_references', checker_source)
+        self.assertIn('detail_workers=1', checker_source)
+        self.assertNotIn('.post(', checker_source)
+        self.assertNotIn('delete_person', checker_source)
+        self.assertNotIn('delete_person', phase_two_source)
+        self.assertNotIn('.post(', phase_two_source)
 
     def test_route_verify_atomically_revokes_protected_alias(self):
         route_path = Path(__file__).resolve().parents[1] / 'routes' / 'person_cleanup.py'

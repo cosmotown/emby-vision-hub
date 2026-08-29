@@ -372,7 +372,9 @@ class PersonCleanupSafetyTests(unittest.TestCase):
 
         self.assertEqual(result['status'], 'linked')
         self.assertEqual(result['count'], 1)
-        individual_fetch.assert_called_once_with('http://emby', 'token', ['m2'])
+        individual_fetch.assert_called_once_with(
+            'http://emby', 'token', ['m2'], max_workers=6,
+        )
 
     def test_individual_detail_without_people_still_fails_closed(self):
         client = MagicMock()
@@ -699,12 +701,14 @@ class PersonCleanupSafetyTests(unittest.TestCase):
         merge_source = ast.unparse(functions['merge_protected_people_for_library'])
         merge_names_source = ast.unparse(functions['merge_protected_names_for_library'])
         replace_candidates_source = ast.unparse(functions['replace_candidates'])
+        normalize_candidates_source = ast.unparse(functions['_normalize_candidates'])
         task_source = (repo_root / 'tasks' / 'actors.py').read_text()
         schema_source = (repo_root / 'database' / 'connection.py').read_text()
 
         self.assertNotIn('DELETE FROM person_cleanup_protected_people', merge_source)
         self.assertNotIn('DELETE FROM person_cleanup_protected_names', merge_names_source)
-        self.assertIn('_exclude_protected_candidates', replace_candidates_source)
+        self.assertIn('_normalize_candidates', replace_candidates_source)
+        self.assertIn('_exclude_protected_candidates', normalize_candidates_source)
         self.assertIn('ON CONFLICT', merge_source)
         self.assertIn('ON CONFLICT', merge_names_source)
         self.assertIn('merge_protected_people_for_library', task_source)

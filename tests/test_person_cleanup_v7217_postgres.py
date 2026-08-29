@@ -32,6 +32,7 @@ class PersonCleanupV7217PostgresTests(unittest.TestCase):
             with conn.cursor() as cursor:
                 cursor.execute("""
                     TRUNCATE TABLE
+                        person_cleanup_readonly_scans,
                         person_cleanup_job_items,
                         person_cleanup_jobs,
                         person_cleanup_delete_attempts,

@@ -29,6 +29,9 @@ from services.person_cleanup_safety import (
 
 logger = logging.getLogger(__name__)
 
+PERSON_ALIAS_SCAN_WORKERS = 4
+PERSON_ALIAS_SCAN_CLAIM_LIMIT = 4
+
 def _scan_protected_library_people(processor, protected_libraries, batch_size: int = 500):
     """Build a complete protected snapshot or raise without marking it ready."""
     snapshots = {}
@@ -208,12 +211,165 @@ def _build_protected_root_contract(processor, protected_libraries=None):
     return build_protected_library_root_contract(libraries, selected)
 
 
+def _check_readonly_alias_candidate(processor, candidate, protected_root_contract):
+    """Perform the phase-2 GET-only check without granting delete eligibility."""
+    references = emby.get_person_media_references(
+        processor.emby_url,
+        processor.emby_api_key,
+        str(candidate.get('person_id') or ''),
+        limit=1,
+        person_name=candidate.get('person_name'),
+        protected_root_contract=protected_root_contract,
+        user_id=getattr(processor, 'emby_user_id', None),
+        detail_workers=1,
+    )
+    return references, classify_reference_check(references)
+
+
+def _run_readonly_alias_scan(
+    processor,
+    scan_id: str,
+    protected_root_contract,
+):
+    """Drain persistent candidate work with four bounded GET-only workers."""
+    last_reported_checked = -1
+    with ThreadPoolExecutor(
+        max_workers=PERSON_ALIAS_SCAN_WORKERS,
+        thread_name_prefix='person-alias-readonly',
+    ) as executor:
+        while True:
+            if processor.is_stop_requested():
+                person_cleanup_db.stop_readonly_scan(scan_id)
+                scan = person_cleanup_db.get_readonly_scan(scan_id) or {}
+                checked = int(scan.get('checked_count') or 0)
+                total = int(scan.get('candidate_total') or 0)
+                task_manager.update_status_from_thread(
+                    50 + int((checked / max(1, total)) * 49),
+                    '只读扫描已中止；未核验候选已持久保留，可再次点击继续。',
+                )
+                return scan
+
+            claimed = person_cleanup_db.claim_readonly_alias_candidates(
+                scan_id,
+                limit=PERSON_ALIAS_SCAN_CLAIM_LIMIT,
+            )
+            if not claimed:
+                return person_cleanup_db.complete_readonly_scan(scan_id)
+
+            futures = {
+                executor.submit(
+                    _check_readonly_alias_candidate,
+                    processor,
+                    candidate,
+                    protected_root_contract,
+                ): candidate
+                for candidate in claimed
+            }
+            for future in as_completed(futures):
+                candidate = futures[future]
+                try:
+                    references, status = future.result()
+                except Exception as exc:
+                    logger.error(
+                        "只读保护别名核验异常 person_id=%s error=%s",
+                        candidate.get('person_id'),
+                        type(exc).__name__,
+                    )
+                    references = {}
+                    status = 'invalid_response'
+
+                if status in {
+                    'protected_library_alias',
+                    'protected_library_unverifiable',
+                }:
+                    error = None
+                elif status == 'linked':
+                    error = None
+                elif status == 'orphan':
+                    # Phase 2 only excludes protected/linked people. A GET-only
+                    # scan never grants verified-orphan delete eligibility.
+                    error = None
+                elif status == 'identity_alias_only':
+                    error = '仅命中普通库或归属不明的同身份人物；保持失败关闭'
+                else:
+                    error = reference_check_failure_message(
+                        status,
+                        context='保护别名核验',
+                    )
+
+                scan = person_cleanup_db.finish_readonly_alias_candidate(
+                    scan_id,
+                    candidate,
+                    status,
+                    library_id=(references or {}).get('protected_library_id'),
+                    evidence_item_id=(references or {}).get('evidence_item_id'),
+                    error=error,
+                )
+                if not scan:
+                    continue
+                checked = int(scan.get('checked_count') or 0)
+                total = int(scan.get('candidate_total') or 0)
+                protected = int(scan.get('protected_count') or 0)
+                progress = 50 + int((checked / max(1, total)) * 49)
+                if checked == total or checked - last_reported_checked >= 25:
+                    task_manager.update_status_from_thread(
+                        progress,
+                        f"阶段 2：核验保护库别名人物 {checked}/{total}；"
+                        f"本轮新增保护 {protected}。",
+                    )
+                    last_reported_checked = checked
+
+            if processor.is_stop_requested():
+                person_cleanup_db.stop_readonly_scan(scan_id)
+                return person_cleanup_db.get_readonly_scan(scan_id) or {}
+
+
 def task_scan_ghost_actor_candidates(processor):
     task_name = "扫描幽灵人物"
     logger.info(f"--- 开始只读任务: '{task_name}' ---")
-    task_manager.update_status_from_thread(0, "正在读取全部媒体库...")
+    task_manager.update_status_from_thread(0, "阶段 1：建立幽灵人物候选...")
 
+    scan_id = None
     try:
+        protection_state = person_cleanup_db.get_protection_state()
+        resumable = None
+        if protection_state.get('snapshot_state') == 'ready':
+            resumable = person_cleanup_db.get_resumable_readonly_scan(
+                int(protection_state.get('generation') or 0),
+            )
+
+        if resumable:
+            scan_id = str(resumable['scan_id'])
+            protected_libraries = person_cleanup_db.list_protected_libraries()
+            protected_root_contract = _build_protected_root_contract(
+                processor,
+                protected_libraries,
+            )
+            if protected_libraries and not protected_root_contract.get('complete'):
+                raise RuntimeError('受保护媒体库路径归属合同不完整，已暂停只读核验')
+            task_manager.update_status_from_thread(
+                50,
+                f"阶段 2：继续核验保护库别名人物 "
+                f"{resumable.get('checked_count', 0)}/{resumable.get('candidate_total', 0)}。",
+            )
+            final_scan = _run_readonly_alias_scan(
+                processor,
+                scan_id,
+                protected_root_contract,
+            )
+            if final_scan.get('state') != 'completed':
+                return
+            remaining = len(person_cleanup_db.list_candidates())
+            message = (
+                f"只读扫描完成：保护别名核验 "
+                f"{final_scan.get('checked_count', 0)}/{final_scan.get('candidate_total', 0)}；"
+                f"本轮新增保护 {final_scan.get('protected_count', 0)}；"
+                f"待人工复核 {remaining}。"
+            )
+            logger.info(f"  ➜ {message}")
+            task_manager.update_status_from_thread(100, message)
+            return
+
         libraries = emby.get_all_libraries_with_paths(
             processor.emby_url,
             processor.emby_api_key,
@@ -237,6 +393,12 @@ def task_scan_ghost_actor_candidates(processor):
             raise RuntimeError('至少一个受保护媒体库已无法从 Emby 精确读取')
 
         generation, _ = _refresh_protected_snapshot(processor)
+        protected_root_contract = build_protected_library_root_contract(
+            libraries,
+            protected_libraries,
+        )
+        if protected_libraries and not protected_root_contract.get('complete'):
+            raise RuntimeError('受保护媒体库路径归属合同不完整，候选列表保持不变')
         normal_library_ids = sorted(library_ids - protected_library_ids)
         reference_scan = emby.get_referenced_person_ids_strict(
             processor.emby_url,
@@ -272,7 +434,12 @@ def task_scan_ghost_actor_candidates(processor):
             user_id=processor.emby_user_id,
             stop_event=processor.get_stop_event(),
             force_full_scan=True,
-            update_status_callback=task_manager.update_status_from_thread,
+            update_status_callback=lambda progress, message: (
+                task_manager.update_status_from_thread(
+                    min(49, 10 + int(max(0, progress) * 0.39)),
+                    f"阶段 1：建立幽灵人物候选；{message}",
+                )
+            ),
         )
         for person_batch in person_generator:
             if processor.is_stop_requested():
@@ -290,9 +457,26 @@ def task_scan_ghost_actor_candidates(processor):
             protected_provider_identities=protected_provider_identities,
             protected_alias_person_ids=protected_alias_person_ids,
         )
-        saved_count = person_cleanup_db.replace_candidates(candidates)
+        scan = person_cleanup_db.start_readonly_alias_scan(candidates, generation)
+        scan_id = str(scan['scan_id'])
+        saved_count = int(scan.get('candidate_total') or 0)
+        task_manager.update_status_from_thread(
+            50,
+            f"阶段 2：核验保护库别名人物 0/{saved_count}；本轮新增保护 0。",
+        )
+        final_scan = _run_readonly_alias_scan(
+            processor,
+            scan_id,
+            protected_root_contract,
+        )
+        if final_scan.get('state') != 'completed':
+            return
+        remaining = len(person_cleanup_db.list_candidates())
         message = (
-            f"只读扫描完成：发现 {saved_count} 位待人工复核的幽灵人物候选；"
+            f"只读扫描完成：阶段 1 发现 {saved_count} 位候选；"
+            f"保护别名核验 {final_scan.get('checked_count', 0)}/{saved_count}；"
+            f"本轮新增保护 {final_scan.get('protected_count', 0)}；"
+            f"待人工复核 {remaining}；"
             f"保护库快照覆盖 {len(protected_person_ids)} 个 ID、"
             f"{len(protected_person_names)} 个姓名、"
             f"{len(protected_provider_identities)} 个外部身份、"
@@ -301,6 +485,11 @@ def task_scan_ghost_actor_candidates(processor):
         logger.info(f"  ➜ {message}")
         task_manager.update_status_from_thread(100, message)
     except Exception as exc:
+        if scan_id:
+            try:
+                person_cleanup_db.stop_readonly_scan(scan_id, error=str(exc))
+            except Exception:
+                logger.error('持久化只读 alias scan 暂停状态失败', exc_info=True)
         logger.error(f"执行 '{task_name}' 失败: {exc}", exc_info=True)
         task_manager.update_status_from_thread(-1, f"扫描失败: {exc}")
         raise

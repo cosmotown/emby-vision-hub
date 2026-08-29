@@ -68,11 +68,13 @@ def get_person_cleanup_candidates():
             'total': len(candidates),
             'snapshot_generation': generation,
             'snapshot_state': 'ready',
+            'readonly_scan': person_cleanup_db.get_readonly_scan(),
         })
     except RuntimeError as exc:
         return jsonify({
             'error': str(exc),
             'snapshot_state': person_cleanup_db.get_protection_state(),
+            'readonly_scan': person_cleanup_db.get_readonly_scan(),
         }), 409
     except Exception as exc:
         logger.error(f"读取人物清理候选失败: {exc}", exc_info=True)

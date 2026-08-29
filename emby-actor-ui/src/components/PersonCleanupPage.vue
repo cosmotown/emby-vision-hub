@@ -112,9 +112,28 @@
       {{ taskStatus.message }}
     </n-alert>
 
+    <n-alert
+      v-if="readonlyScan"
+      :type="readonlyScan.state === 'completed' ? 'success' : (readonlyScan.last_error ? 'warning' : 'info')"
+      :title="readonlyScanTitle"
+      style="margin-bottom: 16px;"
+    >
+      <template v-if="readonlyScan.state === 'completed'">
+        保护别名核验 {{ readonlyScan.checked_count || 0 }}/{{ readonlyScan.candidate_total || 0 }}；
+        本轮新增保护 {{ readonlyScan.protected_count || 0 }}；
+        待人工复核 {{ candidates.length }}。
+      </template>
+      <template v-else>
+        保护别名核验 {{ readonlyScan.checked_count || 0 }}/{{ readonlyScan.candidate_total || 0 }}；
+        待核验 {{ readonlyScan.pending_count || 0 }}；
+        本轮新增保护 {{ readonlyScan.protected_count || 0 }}。
+        <span v-if="readonlyScan.last_error">原因：{{ readonlyScan.last_error }}</span>
+      </template>
+    </n-alert>
+
     <n-space align="center" style="margin: 16px 0 10px;">
       <n-text strong>全服务器幽灵人物候选</n-text>
-      <n-text depth="3">已排除当前在用人物，以及保护库快照中 ID 或姓名匹配的人物。</n-text>
+      <n-text depth="3">已排除当前在用人物、保护库快照身份，以及只读核验确认的保护库别名人物。</n-text>
     </n-space>
 
     <div v-if="loading" class="center-state"><n-spin size="large" /></div>
@@ -397,6 +416,7 @@ const protectedLoading = ref(false);
 const protectedSaving = ref(false);
 const protectionSnapshot = ref({ state: 'unknown', generation: null });
 const snapshotGeneration = ref(null);
+const readonlyScan = ref(null);
 const safeCleanupModalVisible = ref(false);
 const safeCleanupJob = ref(null);
 const safeCleanupConfirmation = ref('');
@@ -408,6 +428,13 @@ const currentAction = computed(() => props.taskStatus?.current_action || '');
 const isBackgroundBusy = computed(() => Boolean(props.taskStatus?.is_running));
 const isScanRunning = computed(() => isBackgroundBusy.value && currentAction.value.includes('扫描幽灵人物'));
 const isDeleteRunning = computed(() => isBackgroundBusy.value && currentAction.value.includes('删除') && currentAction.value.includes('幽灵人物'));
+const readonlyScanTitle = computed(() => {
+  const state = readonlyScan.value?.state;
+  if (state === 'completed') return '两阶段只读扫描已完成';
+  if (state === 'stopped') return '保护别名核验已中止，可继续';
+  if (state === 'interrupted') return '保护别名核验在重启后等待继续';
+  return '阶段 2：核验保护库别名人物';
+});
 const verificationAlertType = computed(() => ({
   orphan: 'success',
   identity_alias_only: 'info',
@@ -631,6 +658,7 @@ const fetchCandidates = async () => {
   try {
     const response = await axios.get('/api/person-cleanup/candidates');
     candidates.value = response.data.candidates || [];
+    readonlyScan.value = response.data.readonly_scan || null;
     snapshotGeneration.value = response.data.snapshot_generation;
     protectionSnapshot.value = {
       state: response.data.snapshot_state || 'ready',
@@ -646,6 +674,7 @@ const fetchCandidates = async () => {
   } catch (error) {
     loadError.value = error.response?.data?.error || '无法读取人物候选';
     const snapshot = error.response?.data?.snapshot_state;
+    readonlyScan.value = error.response?.data?.readonly_scan || readonlyScan.value;
     if (snapshot && typeof snapshot === 'object') {
       protectionSnapshot.value = {
         ...snapshot,

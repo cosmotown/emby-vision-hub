@@ -362,7 +362,11 @@ def init_db():
                         last_error TEXT,
                         verification_status TEXT NOT NULL DEFAULT 'unverified',
                         verification_snapshot_generation BIGINT,
-                        verification_fingerprint TEXT
+                        verification_fingerprint TEXT,
+                        alias_scan_id TEXT,
+                        alias_scan_status TEXT NOT NULL DEFAULT 'unassigned',
+                        alias_scan_checked_at TIMESTAMP WITH TIME ZONE,
+                        alias_scan_error TEXT
                     )
                 """)
                 cursor.execute("""
@@ -376,6 +380,22 @@ def init_db():
                 cursor.execute("""
                     ALTER TABLE person_cleanup_candidates
                     ADD COLUMN IF NOT EXISTS verification_fingerprint TEXT
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_candidates
+                    ADD COLUMN IF NOT EXISTS alias_scan_id TEXT
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_candidates
+                    ADD COLUMN IF NOT EXISTS alias_scan_status TEXT NOT NULL DEFAULT 'unassigned'
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_candidates
+                    ADD COLUMN IF NOT EXISTS alias_scan_checked_at TIMESTAMP WITH TIME ZONE
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_candidates
+                    ADD COLUMN IF NOT EXISTS alias_scan_error TEXT
                 """)
 
                 cursor.execute("""
@@ -475,6 +495,39 @@ def init_db():
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_person_cleanup_protected_aliases_person
                     ON person_cleanup_protected_aliases (person_id)
+                """)
+
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS person_cleanup_readonly_scans (
+                        scan_id TEXT PRIMARY KEY,
+                        state TEXT NOT NULL,
+                        phase TEXT NOT NULL DEFAULT 'protected_alias_verification',
+                        snapshot_generation BIGINT NOT NULL,
+                        candidate_total INTEGER NOT NULL DEFAULT 0,
+                        checked_count INTEGER NOT NULL DEFAULT 0,
+                        protected_count INTEGER NOT NULL DEFAULT 0,
+                        linked_count INTEGER NOT NULL DEFAULT 0,
+                        failed_count INTEGER NOT NULL DEFAULT 0,
+                        started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        stopped_at TIMESTAMP WITH TIME ZONE,
+                        completed_at TIMESTAMP WITH TIME ZONE,
+                        last_error TEXT
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_person_cleanup_readonly_scans_state
+                    ON person_cleanup_readonly_scans (state, updated_at DESC)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_person_cleanup_candidates_alias_scan
+                    ON person_cleanup_candidates (alias_scan_id, alias_scan_status, person_id)
+                """)
+                cursor.execute("""
+                    UPDATE person_cleanup_readonly_scans
+                    SET state = 'interrupted', updated_at = NOW(),
+                        last_error = COALESCE(last_error, '进程重启，等待人工继续只读核验')
+                    WHERE state = 'running'
                 """)
 
                 cursor.execute("""

@@ -2402,6 +2402,7 @@ def get_person_media_references(
     person_name: Optional[str] = None,
     protected_root_contract: Optional[Dict[str, Any]] = None,
     user_id: Optional[str] = None,
+    detail_workers: int = 6,
 ) -> Dict[str, Any]:
     '''
     Return exact current media references for a Person.
@@ -2580,6 +2581,7 @@ def get_person_media_references(
                         base_url,
                         api_key,
                         unresolved_detail_ids,
+                        max_workers=detail_workers,
                         user_id=user_id,
                     )
                 else:
@@ -2587,6 +2589,7 @@ def get_person_media_references(
                         base_url,
                         api_key,
                         unresolved_detail_ids,
+                        max_workers=detail_workers,
                     )
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
                 logger.error(f"复核人物 {person_id} 的单作品详情连接失败: {exc}")

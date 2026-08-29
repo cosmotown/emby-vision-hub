@@ -24,7 +24,6 @@ VERIFICATION_STATES = {
     'invalid_response',
 }
 
-
 def _exclude_protected_candidates(candidates: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     protected_ids = get_protected_person_ids()
     protected_ids.update(get_protected_alias_statuses())
@@ -53,17 +52,25 @@ def _exclude_protected_candidates(candidates: Iterable[Dict[str, Any]]) -> List[
     return filtered
 
 
-def replace_candidates(candidates: Iterable[Dict[str, Any]]) -> int:
+def _normalize_candidates(candidates: Iterable[Dict[str, Any]]) -> List[tuple]:
     normalized = []
     for candidate in _exclude_protected_candidates(candidates):
-        person_id = str(candidate.get('Id') or '').strip()
+        person_id = str(candidate.get('Id') or candidate.get('person_id') or '').strip()
         if not person_id:
             continue
         normalized.append((
             person_id,
-            candidate.get('Name') or '未知人物',
-            json.dumps(candidate.get('ProviderIds') or {}, ensure_ascii=False),
+            candidate.get('Name') or candidate.get('person_name') or '未知人物',
+            json.dumps(
+                candidate.get('ProviderIds') or candidate.get('provider_ids_json') or {},
+                ensure_ascii=False,
+            ),
         ))
+    return normalized
+
+
+def replace_candidates(candidates: Iterable[Dict[str, Any]]) -> int:
+    normalized = _normalize_candidates(candidates)
 
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -83,6 +90,345 @@ def replace_candidates(candidates: Iterable[Dict[str, Any]]) -> int:
     return len(normalized)
 
 
+def start_readonly_alias_scan(
+    candidates: Iterable[Dict[str, Any]],
+    snapshot_generation: int,
+) -> Dict[str, Any]:
+    """Atomically replace phase-1 candidates and persist phase-2 work."""
+    normalized = _normalize_candidates(candidates)
+    scan_id = str(uuid.uuid4())
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_readonly_scans
+                SET state = 'superseded', updated_at = NOW(),
+                    completed_at = COALESCE(completed_at, NOW())
+                WHERE state IN ('running', 'stopped', 'interrupted')
+                """
+            )
+            cursor.execute("DELETE FROM person_cleanup_candidates")
+            cursor.execute(
+                """
+                INSERT INTO person_cleanup_readonly_scans (
+                    scan_id, state, phase, snapshot_generation, candidate_total
+                )
+                VALUES (%s, 'running', 'protected_alias_verification', %s, %s)
+                """,
+                (scan_id, int(snapshot_generation), len(normalized)),
+            )
+            if normalized:
+                cursor.executemany(
+                    """
+                    INSERT INTO person_cleanup_candidates (
+                        person_id, person_name, provider_ids_json,
+                        verification_status, verification_snapshot_generation,
+                        verification_fingerprint, last_checked_at, last_error,
+                        alias_scan_id, alias_scan_status,
+                        alias_scan_checked_at, alias_scan_error
+                    )
+                    VALUES (
+                        %s, %s, %s::jsonb, 'unverified', NULL, NULL, NULL, NULL,
+                        %s, 'pending', NULL, NULL
+                    )
+                    """,
+                    [(*row, scan_id) for row in normalized],
+                )
+    return get_readonly_scan(scan_id)
+
+
+def get_readonly_scan(scan_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            if scan_id:
+                cursor.execute(
+                    """
+                    SELECT * FROM person_cleanup_readonly_scans
+                    WHERE scan_id = %s
+                    """,
+                    (str(scan_id),),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT * FROM person_cleanup_readonly_scans
+                    ORDER BY started_at DESC, scan_id DESC
+                    LIMIT 1
+                    """
+                )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            result['pending_count'] = max(
+                0,
+                int(result.get('candidate_total') or 0)
+                - int(result.get('checked_count') or 0),
+            )
+            return result
+
+
+def get_resumable_readonly_scan(snapshot_generation: int) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT * FROM person_cleanup_readonly_scans
+                WHERE snapshot_generation = %s
+                  AND state IN ('running', 'stopped', 'interrupted')
+                ORDER BY started_at DESC, scan_id DESC
+                LIMIT 1
+                """,
+                (int(snapshot_generation),),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            scan_id = str(row['scan_id'])
+            cursor.execute(
+                """
+                UPDATE person_cleanup_candidates
+                SET alias_scan_status = 'pending', alias_scan_error = NULL
+                WHERE alias_scan_id = %s AND alias_scan_status = 'checking'
+                """,
+                (scan_id,),
+            )
+            cursor.execute(
+                """
+                UPDATE person_cleanup_readonly_scans
+                SET state = 'running', stopped_at = NULL, last_error = NULL,
+                    updated_at = NOW()
+                WHERE scan_id = %s
+                RETURNING *
+                """,
+                (scan_id,),
+            )
+            resumed = dict(cursor.fetchone())
+            resumed['pending_count'] = max(
+                0,
+                int(resumed.get('candidate_total') or 0)
+                - int(resumed.get('checked_count') or 0),
+            )
+            return resumed
+
+
+def claim_readonly_alias_candidates(scan_id: str, limit: int = 4) -> List[Dict[str, Any]]:
+    safe_limit = max(1, min(int(limit), 6))
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                WITH claimed AS (
+                    SELECT person_id
+                    FROM person_cleanup_candidates
+                    WHERE alias_scan_id = %s AND alias_scan_status = 'pending'
+                    ORDER BY person_id ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT %s
+                )
+                UPDATE person_cleanup_candidates candidates
+                SET alias_scan_status = 'checking', alias_scan_error = NULL
+                FROM claimed
+                WHERE candidates.person_id = claimed.person_id
+                RETURNING candidates.person_id, candidates.person_name,
+                          candidates.provider_ids_json, candidates.discovered_at,
+                          candidates.verification_status,
+                          candidates.verification_snapshot_generation,
+                          candidates.verification_fingerprint,
+                          candidates.alias_scan_id, candidates.alias_scan_status
+                """,
+                (str(scan_id), safe_limit),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
+def finish_readonly_alias_candidate(
+    scan_id: str,
+    candidate: Dict[str, Any],
+    outcome: str,
+    *,
+    library_id: Optional[str] = None,
+    evidence_item_id: Optional[str] = None,
+    error: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Persist one GET-only result and advance progress exactly once."""
+    person_id = str(candidate.get('person_id') or candidate.get('Id') or '').strip()
+    if not person_id:
+        raise ValueError('只读 alias 核验缺少 Person ID')
+    protected = outcome in {
+        'protected_library_alias',
+        'protected_library_unverifiable',
+    }
+    linked = outcome == 'linked'
+    failed = outcome in {
+        'connection_failed', 'invalid_response', 'people_unavailable',
+        'identity_alias_only',
+    }
+    if protected and (not library_id or not evidence_item_id):
+        raise ValueError('保护库 alias 结果缺少 ownership 证据')
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT alias_scan_status
+                FROM person_cleanup_candidates
+                WHERE person_id = %s AND alias_scan_id = %s
+                FOR UPDATE
+                """,
+                (person_id, str(scan_id)),
+            )
+            row = cursor.fetchone()
+            if not row or row['alias_scan_status'] != 'checking':
+                return None
+
+            if protected:
+                cursor.execute(
+                    """
+                    INSERT INTO person_cleanup_protected_aliases (
+                        library_id, person_id, person_name, candidate_fingerprint,
+                        protection_status, evidence_item_id, captured_at, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (library_id, person_id) DO UPDATE SET
+                        person_name = EXCLUDED.person_name,
+                        candidate_fingerprint = EXCLUDED.candidate_fingerprint,
+                        protection_status = CASE
+                            WHEN person_cleanup_protected_aliases.protection_status =
+                                 'protected_library_alias'
+                            THEN person_cleanup_protected_aliases.protection_status
+                            ELSE EXCLUDED.protection_status
+                        END,
+                        evidence_item_id = EXCLUDED.evidence_item_id,
+                        updated_at = NOW()
+                    """,
+                    (
+                        str(library_id), person_id,
+                        candidate.get('person_name') or candidate.get('Name'),
+                        candidate_fingerprint(candidate), outcome,
+                        str(evidence_item_id),
+                    ),
+                )
+
+            if protected or linked:
+                cursor.execute(
+                    """
+                    DELETE FROM person_cleanup_candidates
+                    WHERE person_id = %s AND alias_scan_id = %s
+                      AND alias_scan_status = 'checking'
+                    """,
+                    (person_id, str(scan_id)),
+                )
+            else:
+                cursor.execute(
+                    """
+                    UPDATE person_cleanup_candidates
+                    SET alias_scan_status = 'checked',
+                        alias_scan_checked_at = NOW(), alias_scan_error = %s
+                    WHERE person_id = %s AND alias_scan_id = %s
+                      AND alias_scan_status = 'checking'
+                    """,
+                    (str(error)[:4000] if error else None, person_id, str(scan_id)),
+                )
+            if cursor.rowcount != 1:
+                return None
+
+            cursor.execute(
+                """
+                UPDATE person_cleanup_readonly_scans
+                SET checked_count = checked_count + 1,
+                    protected_count = protected_count + %s,
+                    linked_count = linked_count + %s,
+                    failed_count = failed_count + %s,
+                    updated_at = NOW()
+                WHERE scan_id = %s AND state = 'running'
+                RETURNING *
+                """,
+                (int(protected), int(linked), int(failed), str(scan_id)),
+            )
+            updated = cursor.fetchone()
+            if not updated:
+                raise RuntimeError('只读 alias scan 已不再运行，拒绝提交结果')
+            result = dict(updated)
+            result['pending_count'] = max(
+                0,
+                int(result.get('candidate_total') or 0)
+                - int(result.get('checked_count') or 0),
+            )
+            return result
+
+
+def stop_readonly_scan(scan_id: str, error: Optional[str] = None) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_readonly_scans
+                SET state = 'stopped', stopped_at = NOW(), updated_at = NOW(),
+                    last_error = %s
+                WHERE scan_id = %s AND state = 'running'
+                """,
+                (str(error)[:4000] if error else None, str(scan_id)),
+            )
+            cursor.execute(
+                """
+                UPDATE person_cleanup_candidates
+                SET alias_scan_status = 'pending'
+                WHERE alias_scan_id = %s AND alias_scan_status = 'checking'
+                """,
+                (str(scan_id),),
+            )
+
+
+def complete_readonly_scan(scan_id: str) -> Dict[str, Any]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS pending
+                FROM person_cleanup_candidates
+                WHERE alias_scan_id = %s
+                  AND alias_scan_status IN ('pending', 'checking')
+                """,
+                (str(scan_id),),
+            )
+            if int(cursor.fetchone()['pending']) != 0:
+                raise RuntimeError('只读 alias scan 仍有未核验候选，拒绝完成')
+            cursor.execute(
+                """
+                UPDATE person_cleanup_readonly_scans
+                SET state = 'completed', completed_at = NOW(), updated_at = NOW()
+                WHERE scan_id = %s AND state = 'running'
+                RETURNING scan_id
+                """,
+                (str(scan_id),),
+            )
+            if not cursor.fetchone():
+                raise RuntimeError('只读 alias scan 状态已变化，拒绝完成')
+    return get_readonly_scan(scan_id)
+
+
+def fail_readonly_scan(scan_id: str, error: str) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_readonly_scans
+                SET state = 'failed', last_error = %s, updated_at = NOW()
+                WHERE scan_id = %s AND state = 'running'
+                """,
+                (str(error or '只读 alias 核验失败')[:4000], str(scan_id)),
+            )
+            cursor.execute(
+                """
+                UPDATE person_cleanup_candidates
+                SET alias_scan_status = 'pending'
+                WHERE alias_scan_id = %s AND alias_scan_status = 'checking'
+                """,
+                (str(scan_id),),
+            )
+
+
 def list_candidates() -> List[Dict[str, Any]]:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -91,7 +437,8 @@ def list_candidates() -> List[Dict[str, Any]]:
                 SELECT person_id, person_name, provider_ids_json,
                        discovered_at, last_checked_at, last_error,
                        verification_status, verification_snapshot_generation,
-                       verification_fingerprint
+                       verification_fingerprint, alias_scan_id,
+                       alias_scan_status, alias_scan_checked_at, alias_scan_error
                 FROM person_cleanup_candidates
                 ORDER BY person_name ASC, person_id ASC
                 """
@@ -108,7 +455,8 @@ def list_candidates_raw() -> List[Dict[str, Any]]:
                 SELECT person_id, person_name, provider_ids_json,
                        discovered_at, last_checked_at, last_error,
                        verification_status, verification_snapshot_generation,
-                       verification_fingerprint
+                       verification_fingerprint, alias_scan_id,
+                       alias_scan_status, alias_scan_checked_at, alias_scan_error
                 FROM person_cleanup_candidates
                 ORDER BY person_name ASC, person_id ASC
                 """
@@ -130,7 +478,8 @@ def get_candidates_by_ids(
                 SELECT person_id, person_name, provider_ids_json,
                        discovered_at, last_checked_at, last_error,
                        verification_status, verification_snapshot_generation,
-                       verification_fingerprint
+                       verification_fingerprint, alias_scan_id,
+                       alias_scan_status, alias_scan_checked_at, alias_scan_error
                 FROM person_cleanup_candidates
                 WHERE person_id = ANY(%s)
                 """,

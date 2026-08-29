@@ -46,6 +46,7 @@ class PersonCleanupV7218PostgresTests(unittest.TestCase):
             with conn.cursor() as cursor:
                 cursor.execute("""
                     TRUNCATE TABLE
+                        person_cleanup_readonly_scans,
                         person_cleanup_job_items,
                         person_cleanup_jobs,
                         person_cleanup_delete_attempts,
@@ -167,6 +168,111 @@ class PersonCleanupV7218PostgresTests(unittest.TestCase):
         job = person_cleanup_db.get_cleanup_job(job_id)
         self.assertEqual(job['protected_count'], 1)
         self.assertEqual(job['verified_orphan_count'], 0)
+
+    def test_readonly_scan_persists_production_aliases_and_second_scan_is_cheap(self):
+        generation = self.ready(('lib-protected',))
+        source_candidates = [
+            {'Id': '1020094', 'Name': '1田中', 'ProviderIds': {}},
+            {'Id': '619579', 'Name': '2◎ゆうか', 'ProviderIds': {}},
+            {'Id': '619697', 'Name': '----', 'ProviderIds': {}},
+        ]
+        scan = person_cleanup_db.start_readonly_alias_scan(
+            source_candidates,
+            generation,
+        )
+        claimed = person_cleanup_db.claim_readonly_alias_candidates(
+            scan['scan_id'], limit=4,
+        )
+        self.assertEqual(len(claimed), 3)
+
+        outcomes = {
+            '1020094': 'protected_library_alias',
+            '619579': 'protected_library_alias',
+            '619697': 'protected_library_unverifiable',
+        }
+        for candidate in claimed:
+            updated = person_cleanup_db.finish_readonly_alias_candidate(
+                scan['scan_id'],
+                candidate,
+                outcomes[candidate['person_id']],
+                library_id='lib-protected',
+                evidence_item_id=f"media-{candidate['person_id']}",
+            )
+            self.assertIsNotNone(updated)
+
+        completed = person_cleanup_db.complete_readonly_scan(scan['scan_id'])
+        self.assertEqual(completed['state'], 'completed')
+        self.assertEqual(completed['checked_count'], 3)
+        self.assertEqual(completed['protected_count'], 3)
+        self.assertEqual(completed['pending_count'], 0)
+        self.assertEqual(person_cleanup_db.list_candidates_raw(), [])
+        self.assertEqual(
+            {row['person_id'] for row in person_cleanup_db.list_protected_aliases()},
+            {'1020094', '619579', '619697'},
+        )
+
+        second = person_cleanup_db.start_readonly_alias_scan(
+            source_candidates,
+            generation,
+        )
+        self.assertEqual(second['candidate_total'], 0)
+        self.assertEqual(
+            person_cleanup_db.claim_readonly_alias_candidates(second['scan_id'], limit=4),
+            [],
+        )
+        second_completed = person_cleanup_db.complete_readonly_scan(second['scan_id'])
+        self.assertEqual(second_completed['state'], 'completed')
+        self.assertEqual(second_completed['checked_count'], 0)
+        self.assertEqual(person_cleanup_db.list_candidates_raw(), [])
+
+    def test_readonly_scan_stop_resume_and_exactly_once_progress(self):
+        generation = self.ready(('lib-protected',))
+        source_candidates = [
+            {'Id': f'p-{index}', 'Name': f'人物 {index}', 'ProviderIds': {}}
+            for index in range(6)
+        ]
+        scan = person_cleanup_db.start_readonly_alias_scan(
+            source_candidates,
+            generation,
+        )
+        claimed = person_cleanup_db.claim_readonly_alias_candidates(
+            scan['scan_id'], limit=4,
+        )
+        first = claimed[0]
+        updated = person_cleanup_db.finish_readonly_alias_candidate(
+            scan['scan_id'], first, 'orphan',
+        )
+        self.assertEqual(updated['checked_count'], 1)
+        self.assertIsNone(person_cleanup_db.finish_readonly_alias_candidate(
+            scan['scan_id'], first, 'orphan',
+        ))
+
+        person_cleanup_db.stop_readonly_scan(scan['scan_id'])
+        stopped = person_cleanup_db.get_readonly_scan(scan['scan_id'])
+        self.assertEqual(stopped['state'], 'stopped')
+        self.assertEqual(stopped['checked_count'], 1)
+        self.assertEqual(stopped['pending_count'], 5)
+
+        resumed = person_cleanup_db.get_resumable_readonly_scan(generation)
+        self.assertEqual(resumed['scan_id'], scan['scan_id'])
+        self.assertEqual(resumed['state'], 'running')
+        remaining = []
+        while True:
+            batch = person_cleanup_db.claim_readonly_alias_candidates(
+                scan['scan_id'], limit=4,
+            )
+            if not batch:
+                break
+            remaining.extend(item['person_id'] for item in batch)
+            for candidate in batch:
+                person_cleanup_db.finish_readonly_alias_candidate(
+                    scan['scan_id'], candidate, 'orphan',
+                )
+        self.assertNotIn(first['person_id'], remaining)
+        self.assertEqual(len(remaining), 5)
+        completed = person_cleanup_db.complete_readonly_scan(scan['scan_id'])
+        self.assertEqual(completed['checked_count'], 6)
+        self.assertEqual(completed['pending_count'], 0)
 
     def test_deterministic_http_db_route_preview_execute_legacy_chain(self):
         """Exercise the real HTTP handler and real PostgreSQL safety chain."""

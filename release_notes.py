@@ -2,6 +2,28 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.20",
+        "published_at": "2026-08-29T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.20",
+        "changelog": """## Person Cleanup 历史预览可观测性
+
+- 一键安全清理的历史 preview 新增完整核验结果分类明细，统计直接读取已持久化的 cleanup job，不重新访问 Emby。
+- 展示每个 `preview_state` 的数量及其占候选总数的百分比；数据库中实际存在的未知状态也会完整保留。
+- 状态数量总和与历史 `candidate_total` 不一致时显示 consistency warning，不静默吞掉记录。
+- 支持按状态分页查看已持久化样本，仅在用户展开分类时读取对应 job items。
+- 历史 preview 的原始快照统计保持不变；即使 verified orphan 后续已删除，仍可查看当时完整的候选与分类分布。
+- 页面明确说明：“核验失败”表示当前证据不足以授予删除资格，并不等于确认该人物不是幽灵人物。
+
+### 安全边界
+
+- 本版本仅增强 Person Cleanup preview 可观测性。
+- 不改变 Person 删除资格、安全核验、`DeletePerson` 提交或执行合同。
+- 不修改 Inventory、MediaInfo、ReviewList、Fast Audit、STRM 或演员 provisioning 行为。
+
+""",
+    },
+
+    {
         "version": "v7.2.18",
         "published_at": "2026-08-28T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.18",

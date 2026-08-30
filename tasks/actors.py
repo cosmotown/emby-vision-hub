@@ -699,6 +699,7 @@ def task_preview_safe_person_cleanup(processor, job_id):
 
         candidates = person_cleanup_db.list_candidates_raw()
         total = len(candidates)
+        person_cleanup_db.initialize_cleanup_job_candidate_total(job_id, total)
         for index, candidate in enumerate(candidates, start=1):
             if processor.is_stop_requested() or person_cleanup_db.cleanup_job_stop_requested(job_id):
                 person_cleanup_db.finish_cleanup_job(job_id, stopped=True)

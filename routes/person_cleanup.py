@@ -498,6 +498,22 @@ def _cleanup_job_with_preview_summary(job):
     return result
 
 
+@person_cleanup_bp.route('/cleanup-jobs', methods=['GET'])
+@admin_required
+def list_safe_cleanup_jobs():
+    try:
+        limit = int(request.args.get('limit', '20'))
+    except (TypeError, ValueError):
+        return jsonify({'error': '历史任务数量必须为整数'}), 400
+    if limit < 1 or limit > 100:
+        return jsonify({'error': '历史任务数量范围为 1 到 100'}), 400
+    jobs = [
+        _cleanup_job_with_preview_summary(job)
+        for job in person_cleanup_db.list_cleanup_jobs(limit=limit)
+    ]
+    return jsonify({'jobs': jobs})
+
+
 @person_cleanup_bp.route('/cleanup-jobs/latest', methods=['GET'])
 @admin_required
 def get_latest_safe_cleanup_job():

@@ -61,9 +61,11 @@ class PersonCleanupPreviewDetailsPostgresTests(unittest.TestCase):
                     """
                     INSERT INTO person_cleanup_jobs (
                         job_id, state, candidate_total,
-                        verification_failed_count, verified_orphan_count
+                        verification_failed_count, verified_orphan_count,
+                        created_at
                     )
-                    VALUES (%s, 'completed', 22714, 22002, 712)
+                    VALUES (%s, 'completed', 22714, 22002, 712,
+                            '2026-08-28T00:00:00+08:00')
                     """,
                     (job_id,),
                 )
@@ -144,6 +146,58 @@ class PersonCleanupPreviewDetailsPostgresTests(unittest.TestCase):
         )
         self.assertIn('Tmdb', first_page['items'][0]['provider_ids_json'])
 
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO person_cleanup_jobs (
+                        job_id, state, candidate_total, created_at
+                    ) VALUES (
+                        'new-preview-22002', 'previewing', 22002,
+                        '2026-08-29T00:00:00+08:00'
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO person_cleanup_job_items (
+                        job_id, person_id, person_name, provider_ids_json,
+                        candidate_fingerprint, preview_state
+                    )
+                    SELECT
+                        'new-preview-22002',
+                        'alias-' || item_number::TEXT,
+                        'Alias ' || item_number::TEXT,
+                        '{}'::jsonb,
+                        md5(item_number::TEXT),
+                        'identity_alias_only'
+                    FROM generate_series(1, 376) AS item_number
+                    """
+                )
+
+        running = person_cleanup_db.get_cleanup_job_preview_summary(
+            'new-preview-22002'
+        )
+        self.assertEqual(running['preview_progress_count'], 376)
+        self.assertEqual(running['preview_expected_count'], 22002)
+        self.assertFalse(running['preview_complete'])
+        self.assertTrue(running['consistent'])
+        self.assertIsNone(running['consistency_warning'])
+        self.assertEqual(running['counts']['identity_alias_only'], 376)
+        self.assertEqual(
+            next(row['percentage'] for row in running['states']
+                 if row['status'] == 'identity_alias_only'),
+            1.71,
+        )
+
+        history = person_cleanup_db.list_cleanup_jobs(limit=20)
+        self.assertEqual(history[0]['job_id'], 'new-preview-22002')
+        self.assertIn(job_id, [job['job_id'] for job in history])
+        historical = person_cleanup_db.get_cleanup_job_preview_summary(job_id)
+        self.assertEqual(historical['candidate_total'], 22714)
+        self.assertEqual(historical['verified_orphan'], 712)
+        self.assertEqual(historical['non_verified_orphan'], 22002)
+
         init_db()
         restarted = person_cleanup_db.get_cleanup_job_preview_summary(job_id)
         self.assertEqual(restarted['counts'], distribution)
@@ -171,6 +225,49 @@ class PersonCleanupPreviewDetailsPostgresTests(unittest.TestCase):
                 after_items = int(cursor.fetchone()['count'])
         self.assertEqual(after_job, before_job)
         self.assertEqual(after_items, before_items)
+
+    def test_stopped_partial_preview_is_progress_not_corruption(self):
+        job_id = person_cleanup_db.create_cleanup_job()
+        self.assertEqual(
+            person_cleanup_db.initialize_cleanup_job_candidate_total(job_id, 22002),
+            22002,
+        )
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO person_cleanup_job_items (
+                        job_id, person_id, person_name, provider_ids_json,
+                        candidate_fingerprint, preview_state
+                    )
+                    SELECT
+                        %s,
+                        'stopped-' || item_number::TEXT,
+                        'Stopped ' || item_number::TEXT,
+                        '{}'::jsonb,
+                        md5(item_number::TEXT),
+                        'identity_alias_only'
+                    FROM generate_series(1, 500) AS item_number
+                    """,
+                    (job_id,),
+                )
+        self.assertEqual(
+            person_cleanup_db.initialize_cleanup_job_candidate_total(job_id, 22002),
+            22002,
+        )
+        with self.assertRaisesRegex(RuntimeError, '候选总数已固定'):
+            person_cleanup_db.initialize_cleanup_job_candidate_total(job_id, 22001)
+        person_cleanup_db.finish_cleanup_job(job_id, stopped=True)
+
+        job = person_cleanup_db.get_cleanup_job(job_id)
+        summary = person_cleanup_db.get_cleanup_job_preview_summary(job_id)
+        self.assertEqual(job['state'], 'stopped')
+        self.assertEqual(job['candidate_total'], 22002)
+        self.assertEqual(summary['preview_progress_count'], 500)
+        self.assertEqual(summary['preview_expected_count'], 22002)
+        self.assertFalse(summary['preview_complete'])
+        self.assertTrue(summary['consistent'])
+        self.assertIsNone(summary['consistency_warning'])
 
     def test_consistency_warning_never_hides_unknown_rows(self):
         with get_db_connection() as conn:

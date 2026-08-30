@@ -66,3 +66,29 @@ test('page loads historical job summary and lazily pages persisted samples', () 
   assert.match(source, /providerIdText\(row\.provider_ids_json\)/);
   assert.match(source, /fetchLatestSafeCleanupJob\(\)/);
 });
+
+test('history chooser keeps old completed jobs separate from new preview creation', () => {
+  assert.match(source, />\s*一键安全清理\s*</);
+  assert.match(source, />\s*历史安全任务\s*</);
+  assert.match(source, /axios\.get\('\/api\/person-cleanup\/cleanup-jobs'/);
+  assert.match(source, /params: \{ limit: 20 \}/);
+  assert.match(source, /openHistoricalSafeCleanupJob\(row\)/);
+  assert.match(
+    source,
+    /cleanup-jobs\/\$\{encodeURIComponent\(row\.job_id\)\}/,
+  );
+  assert.match(source, /历史任务及分类统计只读取已持久化的 cleanup job\/job_items/);
+  assert.match(source, /不会重新访问 Emby、重新核验或修改任务/);
+  assert.match(source, /历史任务只读详情/);
+  assert.match(source, /不会停止、确认或重新执行历史任务/);
+  assert.match(source, /safeCleanupViewMode !== 'history'.*\['previewing', 'running', 'stop_requested'\]/);
+  assert.match(source, /safeCleanupViewMode !== 'history'.*safeCleanupJob\?\.state === 'preview_ready'/);
+});
+
+test('running and stopped previews render persisted progress against the fixed total', () => {
+  assert.equal(personCleanupPreviewPercentage(376, 22002), '1.71%');
+  assert.equal(personCleanupPreviewPercentage(500, 22002), '2.27%');
+  assert.match(source, /preview_progress_count/);
+  assert.match(source, /preview_expected_count/);
+  assert.match(source, /preview_complete \? '已完成' : '未完成'/);
+});

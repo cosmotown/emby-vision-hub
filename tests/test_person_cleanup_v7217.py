@@ -112,6 +112,7 @@ class PersonCleanupV7217Tests(unittest.TestCase):
                 'provider_identities': set(),
              }), \
              patch.object(db, 'list_candidates_raw', return_value=[self.candidate]), \
+             patch.object(db, 'initialize_cleanup_job_candidate_total') as initialize_total, \
              patch.object(db, 'candidate_protection_reason', return_value=None), \
              patch.object(db, 'mark_candidate_checked') as checked, \
              patch.object(db, 'add_cleanup_job_item') as add_item, \
@@ -125,6 +126,7 @@ class PersonCleanupV7217Tests(unittest.TestCase):
              patch.object(actors.emby, 'delete_person_custom_api_outcome') as delete:
             actors.task_preview_safe_person_cleanup(self.processor, 'job1')
 
+        initialize_total.assert_called_once_with('job1', 1)
         checked.assert_called_once_with(
             'p1', 'identity_alias_only', 10,
             '仅命中同身份其他 Person；不属于 verified orphan',

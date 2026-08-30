@@ -1046,6 +1046,45 @@ def create_cleanup_job() -> str:
     return job_id
 
 
+def initialize_cleanup_job_candidate_total(job_id: str, candidate_total: int) -> int:
+    """Persist the immutable candidate count before preview item processing starts."""
+    normalized_total = max(0, int(candidate_total))
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_jobs
+                SET candidate_total = %s, updated_at = NOW()
+                WHERE job_id = %s AND state = 'previewing'
+                  AND candidate_total = 0
+                RETURNING candidate_total
+                """,
+                (normalized_total, str(job_id)),
+            )
+            updated = cursor.fetchone()
+            if updated:
+                return int(updated['candidate_total'] or 0)
+            cursor.execute(
+                """
+                SELECT state, candidate_total
+                FROM person_cleanup_jobs
+                WHERE job_id = %s
+                """,
+                (str(job_id),),
+            )
+            existing = cursor.fetchone()
+            if not existing:
+                raise RuntimeError('未找到安全清理预览任务')
+            persisted_total = int(existing['candidate_total'] or 0)
+            if existing['state'] != 'previewing':
+                raise RuntimeError('安全清理预览任务状态已变化')
+            if persisted_total != normalized_total:
+                raise RuntimeError(
+                    '安全清理预览候选总数已固定，禁止按变化后的候选表重算'
+                )
+            return persisted_total
+
+
 def add_cleanup_job_item(
     job_id: str,
     candidate: Dict[str, Any],
@@ -1082,8 +1121,7 @@ def _refresh_cleanup_job_counts(cursor, job_id: str) -> None:
     cursor.execute(
         """
         UPDATE person_cleanup_jobs jobs
-        SET candidate_total = counts.candidate_total,
-            protected_count = counts.protected_count,
+        SET protected_count = counts.protected_count,
             linked_count = counts.linked_count,
             verification_failed_count = counts.verification_failed_count,
             verified_orphan_count = counts.verified_orphan_count,
@@ -1093,7 +1131,6 @@ def _refresh_cleanup_job_counts(cursor, job_id: str) -> None:
             updated_at = NOW()
         FROM (
             SELECT
-                COUNT(*)::INTEGER AS candidate_total,
                 COUNT(*) FILTER (WHERE preview_state LIKE 'protected%%')::INTEGER AS protected_count,
                 COUNT(*) FILTER (WHERE preview_state = 'linked')::INTEGER AS linked_count,
                 COUNT(*) FILTER (WHERE preview_state IN (
@@ -1204,13 +1241,35 @@ def get_latest_cleanup_job(include_items: bool = False) -> Optional[Dict[str, An
     return get_cleanup_job(str(row['job_id']), include_items=include_items)
 
 
+def list_cleanup_jobs(limit: int = 20) -> List[Dict[str, Any]]:
+    """Return recent persisted cleanup jobs without changing any job state."""
+    normalized_limit = max(1, min(100, int(limit)))
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    job_id, state, candidate_total,
+                    verified_orphan_count, verification_failed_count,
+                    protected_count, linked_count, deleted_count,
+                    skipped_count, failed_count,
+                    created_at, preview_completed_at, completed_at, last_error
+                FROM person_cleanup_jobs
+                ORDER BY created_at DESC, job_id DESC
+                LIMIT %s
+                """,
+                (normalized_limit,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
 def get_cleanup_job_preview_summary(job_id: str) -> Optional[Dict[str, Any]]:
     """Read the complete persisted preview-state distribution for one job."""
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT candidate_total
+                SELECT state, candidate_total
                 FROM person_cleanup_jobs
                 WHERE job_id = %s
                 """,
@@ -1231,6 +1290,7 @@ def get_cleanup_job_preview_summary(job_id: str) -> Optional[Dict[str, Any]]:
             )
             grouped = [dict(row) for row in cursor.fetchall()]
 
+    job_state = str(job.get('state') or 'unknown')
     candidate_total = int(job.get('candidate_total') or 0)
     actual_counts = {
         str(row.get('preview_state') or 'unknown'): int(row.get('count') or 0)
@@ -1265,15 +1325,25 @@ def get_cleanup_job_preview_summary(job_id: str) -> Optional[Dict[str, Any]]:
     counts = {row['status']: row['count'] for row in states}
     verified_orphan = int(counts.get('verified_orphan') or 0)
     warning = None
-    if items_total != candidate_total:
+    partial_preview_states = {'previewing', 'stopped', 'failed'}
+    if items_total > candidate_total:
         warning = (
-            '持久化预览明细数量与任务候选总数不一致：'
+            '持久化预览明细数量超过任务启动时的候选总数：'
             f'job_items={items_total}, candidate_total={candidate_total}'
         )
+    elif job_state not in partial_preview_states and items_total != candidate_total:
+        warning = (
+            '已完成预览的明细数量与任务启动时的候选总数不一致：'
+            f'job_items={items_total}, candidate_total={candidate_total}'
+        )
+    preview_complete = items_total == candidate_total
     return {
         'total': candidate_total,
         'candidate_total': candidate_total,
         'items_total': items_total,
+        'preview_progress_count': items_total,
+        'preview_expected_count': candidate_total,
+        'preview_complete': preview_complete,
         'verified_orphan': verified_orphan,
         'non_verified_orphan': max(0, items_total - verified_orphan),
         'states': states,

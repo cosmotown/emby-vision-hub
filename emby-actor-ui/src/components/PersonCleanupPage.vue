@@ -29,11 +29,10 @@
             一键安全清理
           </n-button>
           <n-button
-            v-if="safeCleanupJob?.job_id"
             secondary
-            @click="openLatestSafeCleanupJob"
+            @click="openSafeCleanupHistory"
           >
-            最近预览
+            历史安全任务
           </n-button>
           <n-button
             type="error"
@@ -332,10 +331,46 @@
       </n-card>
     </n-modal>
 
+    <n-modal v-model:show="safeCleanupHistoryVisible" :mask-closable="!safeCleanupHistoryLoading">
+      <n-card
+        class="person-cleanup-history-card"
+        title="历史安全任务"
+        closable
+        @close="safeCleanupHistoryVisible = false"
+      >
+        <n-alert type="info" style="margin-bottom: 12px;">
+          历史任务及分类统计只读取已持久化的 cleanup job/job_items；不会重新访问 Emby、重新核验或修改任务。
+        </n-alert>
+        <n-data-table
+          :columns="safeCleanupHistoryColumns"
+          :data="safeCleanupHistoryJobs"
+          :loading="safeCleanupHistoryLoading"
+          :row-key="row => row.job_id"
+          :pagination="false"
+          :scroll-x="1050"
+        />
+        <n-empty
+          v-if="!safeCleanupHistoryLoading && safeCleanupHistoryJobs.length === 0"
+          description="没有持久化安全清理任务"
+          size="small"
+          style="margin-top: 12px;"
+        />
+      </n-card>
+    </n-modal>
+
     <n-modal v-model:show="safeCleanupModalVisible" :mask-closable="false">
-      <n-card class="person-verify-card" title="一键安全清理" closable @close="safeCleanupModalVisible = false">
-        <n-alert type="warning" title="持久化安全任务" style="margin-bottom: 16px;">
-          预览不会删除人物。确认后将串行执行；每位人物删除前都会刷新完整保护快照并实时核验，且删除尝试必须先持久化后才发送一次 POST。
+      <n-card class="person-verify-card" :title="safeCleanupModalTitle" closable @close="safeCleanupModalVisible = false">
+        <n-alert
+          :type="safeCleanupViewMode === 'history' ? 'info' : 'warning'"
+          :title="safeCleanupViewMode === 'history' ? '历史任务只读详情' : '持久化安全任务'"
+          style="margin-bottom: 16px;"
+        >
+          <template v-if="safeCleanupViewMode === 'history'">
+            这里只读取该任务已持久化的 preview 和 job_items；不会停止、确认或重新执行历史任务。
+          </template>
+          <template v-else>
+            预览不会删除人物。确认后将串行执行；每位人物删除前都会刷新完整保护快照并实时核验，且删除尝试必须先持久化后才发送一次 POST。
+          </template>
         </n-alert>
         <n-descriptions v-if="safeCleanupJob" bordered :column="1" label-placement="left">
           <n-descriptions-item label="状态">{{ safeCleanupJob.state }}</n-descriptions-item>
@@ -343,6 +378,11 @@
           <n-descriptions-item label="显式 orphan">{{ safeCleanupJob.verified_orphan_count || 0 }}</n-descriptions-item>
           <n-descriptions-item label="受保护/跳过">{{ safeCleanupJob.protected_count || 0 }} / {{ safeCleanupJob.skipped_count || 0 }}</n-descriptions-item>
           <n-descriptions-item label="核验失败/删除失败">{{ safeCleanupJob.verification_failed_count || 0 }} / {{ safeCleanupJob.failed_count || 0 }}</n-descriptions-item>
+          <n-descriptions-item v-if="safeCleanupJob.preview_summary" label="预览进度">
+            {{ safeCleanupJob.preview_summary.preview_progress_count || 0 }} /
+            {{ safeCleanupJob.preview_summary.preview_expected_count || 0 }}
+            （{{ safeCleanupJob.preview_summary.preview_complete ? '已完成' : '未完成' }}）
+          </n-descriptions-item>
           <n-descriptions-item v-if="safeCleanupJob.last_error" label="错误">{{ safeCleanupJob.last_error }}</n-descriptions-item>
         </n-descriptions>
         <template v-if="previewStateRows.length">
@@ -381,21 +421,21 @@
             </n-list-item>
           </n-list>
         </template>
-        <template v-if="safeCleanupJob?.state === 'preview_ready'">
+        <template v-if="safeCleanupViewMode !== 'history' && safeCleanupJob?.state === 'preview_ready'">
           <n-divider>显式确认</n-divider>
           <n-text depth="3">输入“确认删除已核验孤儿人物”后才允许开始。</n-text>
           <n-input v-model:value="safeCleanupConfirmation" style="margin-top: 8px;" />
         </template>
         <n-space justify="end" style="margin-top: 16px;">
           <n-button
-            v-if="['previewing', 'running', 'stop_requested'].includes(safeCleanupJob?.state)"
+            v-if="safeCleanupViewMode !== 'history' && ['previewing', 'running', 'stop_requested'].includes(safeCleanupJob?.state)"
             type="warning"
             @click="stopSafeCleanup"
           >
             安全停止
           </n-button>
           <n-button
-            v-if="safeCleanupJob?.state === 'preview_ready'"
+            v-if="safeCleanupViewMode !== 'history' && safeCleanupJob?.state === 'preview_ready'"
             type="error"
             :disabled="safeCleanupConfirmation !== '确认删除已核验孤儿人物' || safeCleanupConfirming"
             :loading="safeCleanupConfirming"
@@ -503,8 +543,12 @@ const snapshotGeneration = ref(null);
 const readonlyScan = ref(null);
 const safeCleanupModalVisible = ref(false);
 const safeCleanupJob = ref(null);
+const safeCleanupViewMode = ref('active');
 const safeCleanupConfirmation = ref('');
 const safeCleanupConfirming = ref(false);
+const safeCleanupHistoryVisible = ref(false);
+const safeCleanupHistoryLoading = ref(false);
+const safeCleanupHistoryJobs = ref([]);
 const previewSamplesVisible = ref(false);
 const previewSamplesLoading = ref(false);
 const previewSamplesState = ref('');
@@ -522,6 +566,9 @@ const isScanRunning = computed(() => isBackgroundBusy.value && currentAction.val
 const isDeleteRunning = computed(() => isBackgroundBusy.value && currentAction.value.includes('删除') && currentAction.value.includes('幽灵人物'));
 const previewStateRows = computed(() => (
   buildPersonCleanupPreviewRows(safeCleanupJob.value?.preview_summary)
+));
+const safeCleanupModalTitle = computed(() => (
+  safeCleanupViewMode.value === 'history' ? '历史安全任务详情' : '一键安全清理'
 ));
 const previewSamplesPageCount = computed(() => Math.max(
   1,
@@ -708,6 +755,32 @@ const previewSampleColumns = [
     key: 'last_error',
     minWidth: 260,
     render: (row) => row.last_error || '无持久化错误信息',
+  },
+];
+
+const safeCleanupHistoryColumns = [
+  {
+    title: '时间',
+    key: 'created_at',
+    width: 180,
+    render: (row) => formatDate(row.created_at),
+  },
+  { title: '状态', key: 'state', minWidth: 150 },
+  { title: '候选数', key: 'candidate_total', width: 90 },
+  { title: '显式 orphan', key: 'verified_orphan_count', width: 110 },
+  { title: '核验失败', key: 'verification_failed_count', width: 100 },
+  { title: '已删除', key: 'deleted_count', width: 90 },
+  { title: '删除失败', key: 'failed_count', width: 100 },
+  {
+    title: '操作',
+    key: 'actions',
+    width: 90,
+    fixed: 'right',
+    render: (row) => h(NButton, {
+      size: 'small',
+      secondary: true,
+      onClick: () => openHistoricalSafeCleanupJob(row),
+    }, () => '查看'),
   },
 ];
 
@@ -899,9 +972,38 @@ const fetchLatestSafeCleanupJob = async () => {
   }
 };
 
-const openLatestSafeCleanupJob = () => {
-  safeCleanupConfirmation.value = '';
-  safeCleanupModalVisible.value = true;
+const openSafeCleanupHistory = async () => {
+  safeCleanupHistoryVisible.value = true;
+  safeCleanupHistoryLoading.value = true;
+  try {
+    const response = await axios.get('/api/person-cleanup/cleanup-jobs', {
+      params: { limit: 20 },
+    });
+    safeCleanupHistoryJobs.value = response.data.jobs || [];
+  } catch (error) {
+    safeCleanupHistoryJobs.value = [];
+    message.error(error.response?.data?.error || '无法读取历史安全任务');
+  } finally {
+    safeCleanupHistoryLoading.value = false;
+  }
+};
+
+const openHistoricalSafeCleanupJob = async (row) => {
+  if (!row?.job_id) return;
+  try {
+    const response = await axios.get(
+      `/api/person-cleanup/cleanup-jobs/${encodeURIComponent(row.job_id)}`,
+    );
+    safeCleanupJob.value = response.data.job;
+    safeCleanupViewMode.value = 'history';
+    safeCleanupHistoryVisible.value = false;
+    previewSamplesVisible.value = false;
+    safeCleanupConfirmation.value = '';
+    safeCleanupModalVisible.value = true;
+    scheduleSafeCleanupPoll();
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法读取历史安全任务详情');
+  }
 };
 
 const fetchPreviewSamples = async (page = 1) => {
@@ -964,6 +1066,7 @@ const startSafeCleanupPreview = async () => {
   try {
     const response = await axios.post('/api/person-cleanup/cleanup-jobs/preview');
     safeCleanupJob.value = { job_id: response.data.job_id, state: response.data.state };
+    safeCleanupViewMode.value = 'active';
     safeCleanupConfirmation.value = '';
     safeCleanupModalVisible.value = true;
     scheduleSafeCleanupPoll();
@@ -1051,6 +1154,12 @@ onBeforeUnmount(() => {
   overflow: auto;
 }
 
+.person-cleanup-history-card {
+  width: min(1120px, calc(100vw - 32px));
+  max-height: min(82vh, calc(100dvh - 48px));
+  overflow: auto;
+}
+
 @media (max-width: 767px) {
   .person-cleanup-page :deep(.n-layout-scroll-container) {
     padding: 14px 12px 96px !important;
@@ -1078,6 +1187,11 @@ onBeforeUnmount(() => {
   }
 
   .person-verify-card {
+    width: calc(100vw - 20px);
+    max-height: calc(100dvh - 20px);
+  }
+
+  .person-cleanup-history-card {
     width: calc(100vw - 20px);
     max-height: calc(100dvh - 20px);
   }

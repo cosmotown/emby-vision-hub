@@ -221,6 +221,7 @@ class ProtectedLibraryWorkflowTests(unittest.TestCase):
         db = actors.person_cleanup_db
         with patch.object(db, 'get_protection_contract', return_value=self.empty_contract(20)), \
              patch.object(db, 'list_candidates_raw', return_value=[self.candidate]), \
+             patch.object(db, 'initialize_cleanup_job_candidate_total') as initialize_total, \
              patch.object(db, 'candidate_protection_reason', return_value=None), \
              patch.object(db, 'persist_protected_alias_and_remove_candidate') as persist, \
              patch.object(db, 'add_cleanup_job_item') as add_item, \
@@ -232,6 +233,7 @@ class ProtectedLibraryWorkflowTests(unittest.TestCase):
              patch.object(actors.emby, 'delete_person_custom_api_outcome') as delete:
             actors.task_preview_safe_person_cleanup(self.processor, 'job1')
 
+        initialize_total.assert_called_once_with('job1', 1)
         roots.assert_called_once()
         persist.assert_called_once_with(
             self.candidate, 'protected', 'protected_library_alias', 'media1',

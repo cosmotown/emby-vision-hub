@@ -2,6 +2,28 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.21",
+        "published_at": "2026-08-30T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.21",
+        "changelog": """## Person Cleanup 历史任务与预览进度修复
+
+- 修复创建新的一键安全清理 preview 后，旧历史任务无法再从页面打开的问题。
+- 新增“历史安全任务”列表，可选择并查看任一已持久化 cleanup job 的历史分类明细与样本。
+- 历史 preview 详情和样本完全读取 PostgreSQL 中已有的 job / job items，不访问 Emby、不重新核验人物，也不修改历史任务。
+- preview 启动时、处理第一条 candidate 之前固定持久化本次候选总数，后续计数刷新不再按变化后的候选表重算历史总数。
+- 修复 previewing 期间 job items 已增长而候选总数尚为 0 导致的假数据不一致告警与错误百分比。
+- previewing 和 stopped 的部分进度按正常状态展示；preview ready 和 completed 历史任务继续执行严格完整性校验。
+- 历史查看模式为只读，不能停止、确认、删除或重新执行历史任务。
+
+### 安全边界
+
+- 本版本没有修改 Person 删除资格、保护合同或 `DeletePerson` 执行语义。
+- 不包含演员 provisioning、Inventory、MediaInfo、ReviewList、Fast Audit 或 STRM 逻辑变更。
+
+""",
+    },
+
+    {
         "version": "v7.2.20",
         "published_at": "2026-08-29T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.20",

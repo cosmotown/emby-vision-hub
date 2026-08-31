@@ -2250,13 +2250,70 @@ def get_all_libraries_with_paths(base_url: str, api_key: str) -> List[Dict[str, 
         return []
 
 
+_ALIAS_PROOF_NON_PHYSICAL_COLLECTION_TYPES = frozenset({
+    # Emby exposes these as aggregate/system views.  They do not own the
+    # Movie/Series/Episode/Video/MusicVideo files used by Alias Proof.
+    'boxsets',
+    'playlists',
+    'livetv',
+    'channels',
+})
+
+
+def _safe_virtual_folder_log_value(value: Any, *, fallback: str = '<missing>') -> str:
+    text = ' '.join(str(value or '').split()).strip()
+    return text[:160] if text else fallback
+
+
+class StrictVirtualFoldersError(ValueError):
+    """A safe, path-free VirtualFolders validation failure."""
+
+    def __init__(
+        self,
+        reason: str,
+        folder: Optional[Dict[str, Any]] = None,
+        *,
+        index: Optional[int] = None,
+    ):
+        row = folder if isinstance(folder, dict) else {}
+        locations_present = 'Locations' in row
+        locations = row.get('Locations')
+        if isinstance(locations, list):
+            locations_count: Any = len(locations)
+        elif locations is None:
+            locations_count = 0
+        else:
+            locations_count = 'invalid'
+        self.reason = str(reason)
+        self.library_id = _safe_virtual_folder_log_value(row.get('ItemId'))
+        self.library_name = _safe_virtual_folder_log_value(row.get('Name'))
+        self.collection_type = _safe_virtual_folder_log_value(row.get('CollectionType'))
+        self.locations_present = locations_present
+        self.locations_count = locations_count
+        index_text = f' index={int(index)}' if index is not None else ''
+        super().__init__(
+            f'reason={self.reason}{index_text} '
+            f'ItemId={self.library_id} Name={self.library_name} '
+            f'CollectionType={self.collection_type} '
+            f'locations_present={str(locations_present).lower()} '
+            f'locations_count={locations_count}'
+        )
+
+
 def get_all_libraries_with_paths_strict(
     base_url: str,
     api_key: str,
-) -> Optional[List[Dict[str, Any]]]:
-    """Read every VirtualFolder exactly once or fail the readonly proof closed."""
+    *,
+    required_library_ids: Optional[Iterable[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Read every physical VirtualFolder exactly once or fail the proof closed."""
     if not base_url or not api_key:
-        return None
+        raise StrictVirtualFoldersError('connection_config_missing')
+    required_ids = {
+        str(value).strip()
+        for value in (required_library_ids or ())
+        if str(value).strip()
+    }
     try:
         response = emby_client.get(
             f"{base_url.rstrip('/')}/Library/VirtualFolders",
@@ -2266,24 +2323,49 @@ def get_all_libraries_with_paths_strict(
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, list):
-            raise ValueError('VirtualFolders 响应不是列表')
+            raise StrictVirtualFoldersError('payload_not_list')
         libraries = []
         seen_ids = set()
-        for folder in payload:
+        for index, folder in enumerate(payload):
             if not isinstance(folder, dict):
-                raise ValueError('VirtualFolders 含非法媒体库')
+                raise StrictVirtualFoldersError('entry_not_object', index=index)
             library_id = str(folder.get('ItemId') or '').strip()
             library_name = str(folder.get('Name') or '').strip()
+            collection_type = str(folder.get('CollectionType') or '').strip().lower()
             locations = folder.get('Locations')
-            if not library_id or library_id in seen_ids or not library_name:
-                raise ValueError('VirtualFolders 媒体库身份缺失或重复')
-            if (
-                not isinstance(locations, list)
-                or not locations
-                or any(not isinstance(path, str) or not path.strip() for path in locations)
-            ):
-                raise ValueError('VirtualFolders 媒体库 Locations 不完整')
+            if not library_id:
+                raise StrictVirtualFoldersError('ItemId_missing', folder, index=index)
+            if library_id in seen_ids:
+                raise StrictVirtualFoldersError('ItemId_duplicate', folder, index=index)
+            if not library_name:
+                raise StrictVirtualFoldersError('Name_missing', folder, index=index)
             seen_ids.add(library_id)
+
+            if collection_type in _ALIAS_PROOF_NON_PHYSICAL_COLLECTION_TYPES:
+                if library_id in required_ids:
+                    raise StrictVirtualFoldersError(
+                        'protected_library_is_non_physical', folder, index=index,
+                    )
+                logger.info(
+                    'Alias Proof 明确排除非物理 VirtualFolder: '
+                    'reason=CollectionType_non_physical ItemId=%s Name=%s '
+                    'CollectionType=%s locations_present=%s locations_count=%s',
+                    _safe_virtual_folder_log_value(library_id),
+                    _safe_virtual_folder_log_value(library_name),
+                    _safe_virtual_folder_log_value(collection_type),
+                    str('Locations' in folder).lower(),
+                    len(locations) if isinstance(locations, list) else 0,
+                )
+                continue
+
+            if 'Locations' not in folder:
+                raise StrictVirtualFoldersError('Locations_missing', folder, index=index)
+            if not isinstance(locations, list):
+                raise StrictVirtualFoldersError('Locations_not_list', folder, index=index)
+            if not locations:
+                raise StrictVirtualFoldersError('Locations_empty', folder, index=index)
+            if any(not isinstance(path, str) or not path.strip() for path in locations):
+                raise StrictVirtualFoldersError('Location_invalid', folder, index=index)
             libraries.append({
                 'info': {
                     'Name': library_name,
@@ -2294,11 +2376,21 @@ def get_all_libraries_with_paths_strict(
                 'paths': list(locations),
             })
         if not libraries:
-            raise ValueError('VirtualFolders 未返回任何可核验媒体库')
+            raise StrictVirtualFoldersError('no_physical_media_libraries')
         return libraries
+    except StrictVirtualFoldersError as exc:
+        logger.error('严格读取媒体库失败：%s', exc)
+        raise
     except Exception as exc:
-        logger.error('严格读取全部媒体库失败: %s', type(exc).__name__)
-        return None
+        safe_error = StrictVirtualFoldersError(
+            'request_or_response_failed',
+        )
+        logger.error(
+            '严格读取媒体库失败：%s exception_type=%s',
+            safe_error,
+            type(exc).__name__,
+        )
+        raise safe_error from exc
 
 # --- 定位媒体库 ---
 def get_library_root_for_item(item_id: str, base_url: str, api_key: str, user_id: str) -> Optional[Dict[str, Any]]:

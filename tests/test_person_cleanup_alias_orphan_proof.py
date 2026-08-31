@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from flask import Flask
 
 import config_manager
+from database import person_cleanup_db
 from handler import emby
 from routes.person_cleanup import person_cleanup_bp
 from services.person_cleanup_safety import classify_alias_orphan_proof
@@ -169,7 +170,9 @@ class AliasOrphanSnapshotTests(unittest.TestCase):
             'Guid': 'g1', 'Locations': ['/media/mixed'],
         }]
         with patch.object(emby.emby_client, 'get', return_value=self.response(payload)):
-            libraries = emby.get_all_libraries_with_paths_strict('http://emby', 'token')
+            libraries = emby.get_all_libraries_with_paths_strict(
+                'http://emby', 'token', required_library_ids={'mixed'},
+            )
         self.assertEqual([row['info']['Id'] for row in libraries], ['mixed'])
 
     def test_strict_library_snapshot_rejects_missing_locations_and_duplicate_ids(self):
@@ -184,9 +187,98 @@ class AliasOrphanSnapshotTests(unittest.TestCase):
             with self.subTest(payload=payload), patch.object(
                 emby.emby_client, 'get', return_value=self.response(payload),
             ):
-                self.assertIsNone(
+                with self.assertRaises(emby.StrictVirtualFoldersError):
                     emby.get_all_libraries_with_paths_strict('http://emby', 'token')
-                )
+
+    def test_strict_library_snapshot_includes_physical_types_and_excludes_system_views(self):
+        payload = [
+            {'ItemId': 'movies', 'Name': 'Movies', 'CollectionType': 'movies', 'Locations': ['/movie']},
+            {'ItemId': 'tv', 'Name': 'TV', 'CollectionType': 'tvshows', 'Locations': ['/tv']},
+            {'ItemId': 'mixed', 'Name': 'Mixed', 'CollectionType': 'mixed', 'Locations': ['/media']},
+            {'ItemId': 'null-mixed', 'Name': 'Null Mixed', 'CollectionType': None, 'Locations': ['/mixed']},
+            {'ItemId': 'boxsets', 'Name': 'Collections', 'CollectionType': 'boxsets', 'Locations': []},
+            {'ItemId': 'playlists', 'Name': 'Playlists', 'CollectionType': 'playlists', 'Locations': []},
+        ]
+        with patch.object(emby.emby_client, 'get', return_value=self.response(payload)), \
+                self.assertLogs(emby.logger.name, level='INFO') as captured:
+            libraries = emby.get_all_libraries_with_paths_strict('http://emby', 'token')
+        self.assertEqual(
+            [row['info']['Id'] for row in libraries],
+            ['movies', 'tv', 'mixed', 'null-mixed'],
+        )
+        output = '\n'.join(captured.output)
+        self.assertIn('CollectionType_non_physical', output)
+        self.assertNotIn('/movie', output)
+        self.assertNotIn('token', output)
+
+    def test_unknown_empty_locations_fails_with_safe_diagnostics(self):
+        payload = [{
+            'ItemId': 'unknown', 'Name': 'Unknown Root',
+            'CollectionType': 'future-type', 'Locations': [],
+        }]
+        with patch.object(emby.emby_client, 'get', return_value=self.response(payload)), \
+                self.assertLogs(emby.logger.name, level='ERROR') as captured, \
+                self.assertRaisesRegex(
+                    emby.StrictVirtualFoldersError,
+                    r'reason=Locations_empty.*ItemId=unknown.*Name=Unknown Root.*CollectionType=future-type.*locations_count=0',
+                ):
+            emby.get_all_libraries_with_paths_strict('http://emby', 'secret-api-key')
+        output = '\n'.join(captured.output)
+        self.assertIn('reason=Locations_empty', output)
+        self.assertNotIn('secret-api-key', output)
+
+    def test_strict_library_identity_failures_remain_closed(self):
+        invalid_payloads = [
+            ([{'Name': 'Missing ID', 'CollectionType': 'movies', 'Locations': ['/one']}], 'ItemId_missing'),
+            ([{'ItemId': 'missing-name', 'CollectionType': 'movies', 'Locations': ['/one']}], 'Name_missing'),
+            ([
+                {'ItemId': 'same', 'Name': 'One', 'CollectionType': 'movies', 'Locations': ['/one']},
+                {'ItemId': 'same', 'Name': 'Two', 'CollectionType': 'tvshows', 'Locations': ['/two']},
+            ], 'ItemId_duplicate'),
+        ]
+        for payload, reason in invalid_payloads:
+            with self.subTest(reason=reason), patch.object(
+                emby.emby_client, 'get', return_value=self.response(payload),
+            ), self.assertRaisesRegex(emby.StrictVirtualFoldersError, f'reason={reason}'):
+                emby.get_all_libraries_with_paths_strict('http://emby', 'token')
+
+    def test_selected_protected_system_view_is_not_silently_excluded(self):
+        payload = [{
+            'ItemId': 'collections', 'Name': 'Collections',
+            'CollectionType': 'boxsets', 'Locations': [],
+        }]
+        with patch.object(emby.emby_client, 'get', return_value=self.response(payload)), \
+                self.assertRaisesRegex(
+                    emby.StrictVirtualFoldersError,
+                    r'reason=protected_library_is_non_physical.*ItemId=collections',
+                ):
+            emby.get_all_libraries_with_paths_strict(
+                'http://emby', 'token', required_library_ids={'collections'},
+            )
+
+    def test_snapshot_task_preserves_safe_virtual_folder_diagnostic(self):
+        failure = emby.StrictVirtualFoldersError(
+            'Locations_missing',
+            {'ItemId': 'lib-1', 'Name': 'Broken', 'CollectionType': 'movies'},
+        )
+        contract = {
+            'generation': 9,
+            'person_ids': set(),
+            'name_keys': set(),
+            'provider_identities': set(),
+            'alias_statuses': {},
+        }
+        with patch.object(person_cleanup_db, 'require_ready_protection_snapshot', return_value=9), \
+                patch.object(person_cleanup_db, 'get_protection_contract', return_value=contract), \
+                patch.object(person_cleanup_db, 'list_protected_libraries', return_value=[]), \
+                patch.object(emby, 'get_all_libraries_with_paths_strict', side_effect=failure), \
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    r'Alias Proof 无法启动：VirtualFolder reason=Locations_missing.*Name=Broken',
+                ):
+            actors._build_alias_proof_snapshots(
+                SimpleNamespace(emby_url='http://emby', emby_api_key='token'),
+            )
 
     def test_protection_hash_is_deterministic_and_alias_sensitive(self):
         contract = {

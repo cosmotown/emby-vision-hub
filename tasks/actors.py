@@ -544,17 +544,6 @@ def _build_alias_proof_snapshots(processor):
     if int(contract['generation']) != int(generation):
         raise RuntimeError('保护快照 generation 不一致')
 
-    libraries = emby.get_all_libraries_with_paths_strict(
-        processor.emby_url,
-        processor.emby_api_key,
-    )
-    library_ids = {
-        str(library.get('info', {}).get('Id') or '').strip()
-        for library in libraries or []
-        if str(library.get('info', {}).get('Id') or '').strip()
-    }
-    if not library_ids:
-        raise RuntimeError('无法读取完整媒体库列表')
     protected_libraries = person_cleanup_db.list_protected_libraries()
     for protected_library in protected_libraries:
         if (
@@ -567,6 +556,21 @@ def _build_alias_proof_snapshots(processor):
         for item in protected_libraries
         if str(item.get('library_id') or '').strip()
     }
+    try:
+        libraries = emby.get_all_libraries_with_paths_strict(
+            processor.emby_url,
+            processor.emby_api_key,
+            required_library_ids=protected_ids,
+        )
+    except emby.StrictVirtualFoldersError as exc:
+        raise RuntimeError(f'Alias Proof 无法启动：VirtualFolder {exc}') from exc
+    library_ids = {
+        str(library.get('info', {}).get('Id') or '').strip()
+        for library in libraries or []
+        if str(library.get('info', {}).get('Id') or '').strip()
+    }
+    if not library_ids:
+        raise RuntimeError('无法读取完整媒体库列表')
     if not protected_ids.issubset(library_ids):
         raise RuntimeError('至少一个受保护媒体库已无法精确读取')
     root_contract = build_protected_library_root_contract(libraries, protected_libraries)

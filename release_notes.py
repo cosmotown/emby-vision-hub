@@ -2,6 +2,33 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.23",
+        "published_at": "2026-08-31T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.23",
+        "changelog": """## Alias Orphan VirtualFolders 兼容性修复
+
+- 修复 Alias Orphan 只读证明因 Emby 4.9.5.0 返回无物理路径的系统/聚合 VirtualFolder 而无法启动的问题。
+- 明确识别并排除 `boxsets`、`playlists`、`livetv` 和 `channels` 非物理视图；不会因为这些系统项缺少 Locations 而使整个只读证明失败。
+- Movie、TV、mixed、`CollectionType=None` 及其他具有完整物理 Locations 的真实媒体库仍全部纳入严格快照。
+- 未知类型、真实媒体库 Locations 缺失或不完整、ItemId/Name 缺失、ItemId 重复及响应异常仍然失败关闭。
+- selected protected library 必须存在于最终严格物理库集合且 root contract 完整；不会因系统视图分类而放宽保护库合同。
+
+## 安全诊断
+
+- VirtualFolders 校验失败日志新增安全的 reason、ItemId、Name、CollectionType、Locations 是否存在及数量。
+- 日志不输出 API key、token、完整 headers、完整路径或原始响应正文。
+- 快照构建失败时不会产生 proof result 或 `verified_alias_orphan`。
+
+### 安全边界
+
+- 本版本不修改 Person 删除资格、保护快照合同或 `DeletePerson` 执行语义。
+- Alias Orphan 路径仍为 GET-only，Emby mutation 数为 0。
+- 不包含 Person provisioning、Inventory、MediaInfo、ReviewList、Fast Audit 或 STRM 变更。
+
+""",
+    },
+
+    {
         "version": "v7.2.22",
         "published_at": "2026-08-31T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.22",

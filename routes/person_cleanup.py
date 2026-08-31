@@ -16,6 +16,7 @@ from services.person_cleanup_safety import (
     reference_check_failure_message,
 )
 from tasks.actors import (
+    task_alias_orphan_readonly_proof,
     task_delete_selected_ghost_actors,
     task_execute_safe_person_cleanup,
     task_preview_safe_person_cleanup,
@@ -94,6 +95,86 @@ def scan_person_cleanup_candidates():
     if not submitted:
         return jsonify({'error': '扫描任务提交失败，可能已有后台任务运行'}), 409
     return jsonify({'message': '只读扫描任务已提交，不会删除任何人物'}), 202
+
+
+@person_cleanup_bp.route('/alias-proof-runs', methods=['POST'])
+@admin_required
+@task_lock_required
+@processor_ready_required
+def start_alias_orphan_proof():
+    payload = request.get_json(silent=True) or {}
+    proof_id = str(payload.get('proof_id') or '').strip() or None
+    if proof_id:
+        run = person_cleanup_db.get_alias_proof_run(proof_id)
+        if not run:
+            return jsonify({'error': '只读证明任务不存在'}), 404
+        if run.get('state') not in {'stopped', 'interrupted'}:
+            return jsonify({'error': '该只读证明任务当前不可继续'}), 409
+    submitted = task_manager.submit_task(
+        task_alias_orphan_readonly_proof,
+        'Alias Orphan 只读证明',
+        'media',
+        proof_id,
+    )
+    if not submitted:
+        return jsonify({'error': '只读证明提交失败，可能已有后台任务运行'}), 409
+    return jsonify({
+        'message': 'Alias Orphan 只读证明已提交；只执行 Emby GET，不会删除人物',
+        'proof_id': proof_id,
+    }), 202
+
+
+def _alias_proof_response(proof_id=None):
+    run = person_cleanup_db.get_alias_proof_summary(proof_id) if proof_id else None
+    if run is None:
+        latest = person_cleanup_db.get_alias_proof_run()
+        if latest:
+            run = person_cleanup_db.get_alias_proof_summary(latest['proof_id'])
+    return run
+
+
+@person_cleanup_bp.route('/alias-proof-runs/latest', methods=['GET'])
+@admin_required
+def get_latest_alias_orphan_proof():
+    try:
+        return jsonify({'proof': _alias_proof_response()})
+    except KeyError:
+        return jsonify({'proof': None})
+
+
+@person_cleanup_bp.route('/alias-proof-runs/<proof_id>', methods=['GET'])
+@admin_required
+def get_alias_orphan_proof(proof_id):
+    try:
+        return jsonify({'proof': person_cleanup_db.get_alias_proof_summary(proof_id)})
+    except KeyError:
+        return jsonify({'error': '只读证明任务不存在'}), 404
+
+
+@person_cleanup_bp.route('/alias-proof-runs/<proof_id>/items', methods=['GET'])
+@admin_required
+def get_alias_orphan_proof_items(proof_id):
+    if not person_cleanup_db.get_alias_proof_run(proof_id):
+        return jsonify({'error': '只读证明任务不存在'}), 404
+    proof_state = str(request.args.get('state') or '').strip()
+    if not proof_state:
+        return jsonify({'error': 'state 不能为空'}), 400
+    try:
+        page = int(request.args.get('page', 1))
+        page_size = int(request.args.get('page_size', 20))
+    except (TypeError, ValueError):
+        return jsonify({'error': '分页参数无效'}), 400
+    return jsonify(person_cleanup_db.list_alias_proof_items(
+        proof_id, proof_state, page=page, page_size=page_size,
+    ))
+
+
+@person_cleanup_bp.route('/alias-proof-runs/<proof_id>/stop', methods=['POST'])
+@admin_required
+def stop_alias_orphan_proof(proof_id):
+    if not person_cleanup_db.request_alias_proof_stop(proof_id):
+        return jsonify({'error': '只读证明未运行或状态已变化'}), 409
+    return jsonify({'message': '已请求安全停止；当前 bounded GET 将完成后停止'})
 
 
 @person_cleanup_bp.route('/protected-libraries', methods=['GET'])

@@ -24,6 +24,28 @@ VERIFICATION_STATES = {
     'invalid_response',
 }
 
+ALIAS_PROOF_STATES = {
+    'verified_alias_orphan',
+    'linked',
+    'protected',
+    'identity_unavailable',
+    'identity_not_found',
+    'identity_ambiguous',
+    'people_unavailable',
+    'invalid_response',
+    'connection_failed',
+    'candidate_changed',
+    'failed_safe',
+}
+
+ALIAS_PROOF_FAILED_STATES = {
+    'people_unavailable', 'invalid_response', 'connection_failed',
+    'candidate_changed', 'failed_safe',
+}
+ALIAS_PROOF_REJECTED_STATES = {
+    'linked', 'identity_unavailable', 'identity_not_found', 'identity_ambiguous',
+}
+
 def _exclude_protected_candidates(candidates: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     protected_ids = get_protected_person_ids()
     protected_ids.update(get_protected_alias_statuses())
@@ -429,6 +451,515 @@ def fail_readonly_scan(scan_id: str, error: str) -> None:
             )
 
 
+def create_alias_proof_run(
+    snapshot_generation: int,
+    protection_snapshot_hash: str,
+    normal_snapshot_hash: str,
+    person_snapshot_hash: str,
+    candidates: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Create a persistent GET-only proof run from explicit alias candidates."""
+    eligible = []
+    seen = set()
+    for candidate in candidates:
+        person_id = str(candidate.get('person_id') or '').strip()
+        if (
+            not person_id or person_id in seen
+            or candidate.get('verification_status') != 'identity_alias_only'
+        ):
+            continue
+        seen.add(person_id)
+        eligible.append(candidate)
+    proof_id = str(uuid.uuid4())
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_alias_proof_runs
+                SET state = 'superseded', completed_at = COALESCE(completed_at, NOW()),
+                    updated_at = NOW()
+                WHERE state IN ('running', 'stopped', 'interrupted')
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO person_cleanup_alias_proof_runs (
+                    proof_id, state, snapshot_generation,
+                    protection_snapshot_hash, normal_snapshot_hash,
+                    person_snapshot_hash, candidate_total
+                ) VALUES (%s, 'running', %s, %s, %s, %s, %s)
+                """,
+                (
+                    proof_id, int(snapshot_generation), str(protection_snapshot_hash),
+                    str(normal_snapshot_hash),
+                    str(person_snapshot_hash), len(eligible),
+                ),
+            )
+            if eligible:
+                cursor.executemany(
+                    """
+                    INSERT INTO person_cleanup_alias_proof_items (
+                        proof_id, person_id, person_name, candidate_fingerprint,
+                        candidate_provider_ids, proof_state
+                    ) VALUES (%s, %s, %s, %s, %s::jsonb, 'pending')
+                    """,
+                    [
+                        (
+                            proof_id,
+                            str(candidate['person_id']),
+                            candidate.get('person_name'),
+                            candidate_fingerprint(candidate),
+                            json.dumps(candidate.get('provider_ids_json') or {}, ensure_ascii=False),
+                        )
+                        for candidate in eligible
+                    ],
+                )
+    return get_alias_proof_run(proof_id)
+
+
+def get_alias_proof_run(proof_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            if proof_id:
+                cursor.execute(
+                    "SELECT * FROM person_cleanup_alias_proof_runs WHERE proof_id = %s",
+                    (str(proof_id),),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT * FROM person_cleanup_alias_proof_runs
+                    ORDER BY started_at DESC, proof_id DESC LIMIT 1
+                    """
+                )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            result['pending_count'] = max(
+                0,
+                int(result.get('candidate_total') or 0)
+                - int(result.get('checked_count') or 0),
+            )
+            return result
+
+
+def resume_alias_proof_run(
+    proof_id: str,
+    snapshot_generation: int,
+    protection_snapshot_hash: str,
+    normal_snapshot_hash: str,
+    person_snapshot_hash: str,
+) -> Dict[str, Any]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_alias_proof_runs
+                SET state = 'running', stop_requested = FALSE,
+                    updated_at = NOW(), last_error = NULL
+                WHERE proof_id = %s
+                  AND state IN ('stopped', 'interrupted')
+                  AND snapshot_generation = %s
+                  AND protection_snapshot_hash = %s
+                  AND normal_snapshot_hash = %s
+                  AND person_snapshot_hash = %s
+                RETURNING proof_id
+                """,
+                (
+                    str(proof_id), int(snapshot_generation),
+                    str(protection_snapshot_hash),
+                    str(normal_snapshot_hash), str(person_snapshot_hash),
+                ),
+            )
+            if not cursor.fetchone():
+                raise RuntimeError('只读证明 snapshot/generation 不兼容，拒绝继续')
+            cursor.execute(
+                """
+                UPDATE person_cleanup_alias_proof_items
+                SET proof_state = 'pending', error = NULL
+                WHERE proof_id = %s AND proof_state = 'checking'
+                """,
+                (str(proof_id),),
+            )
+    return get_alias_proof_run(proof_id)
+
+
+def requeue_changed_alias_proof_items(
+    proof_id: str,
+    current_candidates: Iterable[Dict[str, Any]],
+) -> int:
+    """Requeue only completed items whose current candidate fingerprint drifted."""
+    current = {
+        str(item.get('person_id') or ''): item
+        for item in current_candidates
+        if str(item.get('person_id') or '')
+    }
+    changed = 0
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT person_id, candidate_fingerprint, proof_state
+                FROM person_cleanup_alias_proof_items
+                WHERE proof_id = %s AND proof_state NOT IN ('pending', 'checking')
+                """,
+                (str(proof_id),),
+            )
+            for row in cursor.fetchall():
+                candidate = current.get(str(row['person_id']))
+                current_fingerprint = candidate_fingerprint(candidate) if candidate else None
+                if current_fingerprint == row['candidate_fingerprint']:
+                    continue
+                cursor.execute(
+                    """
+                    UPDATE person_cleanup_alias_proof_items
+                    SET person_name = COALESCE(%s, person_name),
+                        candidate_provider_ids = %s::jsonb,
+                        candidate_fingerprint = COALESCE(%s, candidate_fingerprint),
+                        proof_state = 'pending', matched_live_person_id = NULL,
+                        matched_live_provider_ids = '{}'::jsonb,
+                        query_count = 0, exact_reference_count = 0,
+                        error = NULL, checked_at = NULL
+                    WHERE proof_id = %s AND person_id = %s
+                    """,
+                    (
+                        candidate.get('person_name') if candidate else None,
+                        json.dumps(candidate.get('provider_ids_json') or {}, ensure_ascii=False)
+                        if candidate else '{}',
+                        current_fingerprint,
+                        str(proof_id), str(row['person_id']),
+                    ),
+                )
+                changed += cursor.rowcount
+            cursor.execute(
+                """
+                UPDATE person_cleanup_alias_proof_runs runs
+                SET checked_count = counts.checked_count,
+                    verified_alias_orphan_count = counts.verified_count,
+                    protected_count = counts.protected_count,
+                    rejected_count = counts.rejected_count,
+                    failed_count = counts.failed_count,
+                    updated_at = NOW()
+                FROM (
+                    SELECT
+                        COUNT(*) FILTER (WHERE proof_state NOT IN ('pending', 'checking'))::INTEGER AS checked_count,
+                        COUNT(*) FILTER (WHERE proof_state = 'verified_alias_orphan')::INTEGER AS verified_count,
+                        COUNT(*) FILTER (WHERE proof_state = 'protected')::INTEGER AS protected_count,
+                        COUNT(*) FILTER (WHERE proof_state = ANY(%s))::INTEGER AS rejected_count,
+                        COUNT(*) FILTER (WHERE proof_state = ANY(%s))::INTEGER AS failed_count
+                    FROM person_cleanup_alias_proof_items WHERE proof_id = %s
+                ) counts
+                WHERE runs.proof_id = %s
+                """,
+                (
+                    sorted(ALIAS_PROOF_REJECTED_STATES),
+                    sorted(ALIAS_PROOF_FAILED_STATES),
+                    str(proof_id), str(proof_id),
+                ),
+            )
+    return changed
+
+
+def claim_alias_proof_items(proof_id: str, limit: int = 4) -> List[Dict[str, Any]]:
+    safe_limit = max(1, min(int(limit), 4))
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT state, stop_requested
+                FROM person_cleanup_alias_proof_runs
+                WHERE proof_id = %s
+                FOR UPDATE
+                """,
+                (str(proof_id),),
+            )
+            run = cursor.fetchone()
+            if not run or run['state'] != 'running' or run['stop_requested']:
+                return []
+            cursor.execute(
+                """
+                WITH claimed AS (
+                    SELECT person_id
+                    FROM person_cleanup_alias_proof_items
+                    WHERE proof_id = %s AND proof_state = 'pending'
+                    ORDER BY person_id ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT %s
+                )
+                UPDATE person_cleanup_alias_proof_items items
+                SET proof_state = 'checking', error = NULL
+                FROM claimed
+                WHERE items.proof_id = %s AND items.person_id = claimed.person_id
+                RETURNING items.*
+                """,
+                (str(proof_id), safe_limit, str(proof_id)),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
+def finish_alias_proof_item(
+    proof_id: str,
+    person_id: str,
+    outcome: Dict[str, Any],
+) -> bool:
+    state = str(outcome.get('proof_state') or '')
+    if state not in ALIAS_PROOF_STATES:
+        raise ValueError(f'不支持的 alias proof 状态: {state}')
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_alias_proof_items
+                SET proof_state = %s,
+                    matched_live_person_id = %s,
+                    matched_live_provider_ids = %s::jsonb,
+                    query_count = %s,
+                    exact_reference_count = %s,
+                    error = %s,
+                    checked_at = NOW()
+                WHERE proof_id = %s AND person_id = %s
+                  AND proof_state = 'checking'
+                RETURNING person_id
+                """,
+                (
+                    state,
+                    outcome.get('matched_live_person_id'),
+                    json.dumps(outcome.get('matched_live_provider_ids') or {}, ensure_ascii=False),
+                    max(0, int(outcome.get('query_count') or 0)),
+                    max(0, int(outcome.get('exact_reference_count') or 0)),
+                    str(outcome.get('error'))[:4000] if outcome.get('error') else None,
+                    str(proof_id), str(person_id),
+                ),
+            )
+            if not cursor.fetchone():
+                return False
+            cursor.execute(
+                """
+                UPDATE person_cleanup_alias_proof_runs
+                SET checked_count = checked_count + 1,
+                    verified_alias_orphan_count = verified_alias_orphan_count + %s,
+                    protected_count = protected_count + %s,
+                    rejected_count = rejected_count + %s,
+                    failed_count = failed_count + %s,
+                    updated_at = NOW()
+                WHERE proof_id = %s AND state IN ('running', 'stop_requested')
+                RETURNING proof_id
+                """,
+                (
+                    int(state == 'verified_alias_orphan'),
+                    int(state == 'protected'),
+                    int(state in ALIAS_PROOF_REJECTED_STATES),
+                    int(state in ALIAS_PROOF_FAILED_STATES),
+                    str(proof_id),
+                ),
+            )
+            if not cursor.fetchone():
+                raise RuntimeError('只读证明 run 已停止，拒绝提交 item 结果')
+            return True
+
+
+def request_alias_proof_stop(proof_id: str) -> bool:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_alias_proof_runs
+                SET stop_requested = TRUE, state = 'stop_requested', updated_at = NOW()
+                WHERE proof_id = %s AND state = 'running'
+                RETURNING proof_id
+                """,
+                (str(proof_id),),
+            )
+            return bool(cursor.fetchone())
+
+
+def alias_proof_stop_requested(proof_id: str) -> bool:
+    run = get_alias_proof_run(proof_id)
+    return bool(not run or run.get('stop_requested') or run.get('state') != 'running')
+
+
+def stop_alias_proof_run(proof_id: str) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_alias_proof_items
+                SET proof_state = 'pending', error = NULL
+                WHERE proof_id = %s AND proof_state = 'checking'
+                """,
+                (str(proof_id),),
+            )
+            cursor.execute(
+                """
+                UPDATE person_cleanup_alias_proof_runs
+                SET state = 'stopped', stop_requested = FALSE, updated_at = NOW()
+                WHERE proof_id = %s AND state IN ('running', 'stop_requested')
+                """,
+                (str(proof_id),),
+            )
+
+
+def fail_alias_proof_run(proof_id: str, error: str, stale: bool = False) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_alias_proof_items
+                SET proof_state = 'failed_safe', error = %s, checked_at = NOW()
+                WHERE proof_id = %s
+                  AND proof_state IN ('pending', 'checking', 'verified_alias_orphan')
+                """,
+                (str(error)[:4000], str(proof_id)),
+            )
+            cursor.execute(
+                """
+                UPDATE person_cleanup_alias_proof_runs runs
+                SET state = %s, completed_at = NOW(), updated_at = NOW(),
+                    last_error = %s,
+                    verified_alias_orphan_count = 0,
+                    checked_count = counts.checked_count,
+                    protected_count = counts.protected_count,
+                    rejected_count = counts.rejected_count,
+                    failed_count = counts.failed_count
+                FROM (
+                    SELECT
+                        COUNT(*) FILTER (WHERE proof_state NOT IN ('pending', 'checking'))::INTEGER AS checked_count,
+                        COUNT(*) FILTER (WHERE proof_state = 'protected')::INTEGER AS protected_count,
+                        COUNT(*) FILTER (WHERE proof_state = ANY(%s))::INTEGER AS rejected_count,
+                        COUNT(*) FILTER (WHERE proof_state = ANY(%s))::INTEGER AS failed_count
+                    FROM person_cleanup_alias_proof_items WHERE proof_id = %s
+                ) counts
+                WHERE runs.proof_id = %s
+                """,
+                (
+                    'stale' if stale else 'failed', str(error)[:4000],
+                    sorted(ALIAS_PROOF_REJECTED_STATES),
+                    sorted(ALIAS_PROOF_FAILED_STATES),
+                    str(proof_id), str(proof_id),
+                ),
+            )
+
+
+def complete_alias_proof_run(proof_id: str, snapshot_generation: int) -> Dict[str, Any]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT generation, snapshot_state
+                FROM person_cleanup_protection_state WHERE singleton = TRUE
+                """
+            )
+            protection = cursor.fetchone()
+            if (
+                not protection or protection['snapshot_state'] != 'ready'
+                or int(protection['generation']) != int(snapshot_generation)
+            ):
+                raise RuntimeError('保护快照 generation 已漂移')
+            cursor.execute(
+                """
+                SELECT runs.candidate_total, runs.checked_count,
+                       COUNT(items.person_id)::INTEGER AS items_total,
+                       COUNT(items.person_id) FILTER (
+                           WHERE items.proof_state IN ('pending', 'checking')
+                       )::INTEGER AS pending,
+                       COUNT(items.person_id) FILTER (
+                           WHERE NOT (items.proof_state = ANY(%s))
+                       )::INTEGER AS unknown
+                FROM person_cleanup_alias_proof_runs runs
+                LEFT JOIN person_cleanup_alias_proof_items items
+                  ON items.proof_id = runs.proof_id
+                WHERE runs.proof_id = %s
+                GROUP BY runs.candidate_total, runs.checked_count
+                """,
+                (sorted(ALIAS_PROOF_STATES | {'pending', 'checking'}), str(proof_id)),
+            )
+            counts = cursor.fetchone()
+            if not counts:
+                raise RuntimeError('只读证明任务不存在')
+            expected = int(counts['candidate_total'] or 0)
+            if (
+                int(counts['pending'] or 0)
+                or int(counts['unknown'] or 0)
+                or int(counts['items_total'] or 0) != expected
+                or int(counts['checked_count'] or 0) != expected
+            ):
+                raise RuntimeError('只读证明项目状态或计数不完整')
+            cursor.execute(
+                """
+                UPDATE person_cleanup_alias_proof_runs
+                SET state = 'completed', completed_at = NOW(), updated_at = NOW()
+                WHERE proof_id = %s AND state = 'running'
+                  AND snapshot_generation = %s
+                  AND checked_count = candidate_total
+                RETURNING proof_id
+                """,
+                (str(proof_id), int(snapshot_generation)),
+            )
+            if not cursor.fetchone():
+                raise RuntimeError('只读证明计数或状态不完整')
+    return get_alias_proof_run(proof_id)
+
+
+def list_alias_proof_items(
+    proof_id: str,
+    proof_state: str,
+    page: int = 1,
+    page_size: int = 20,
+) -> Dict[str, Any]:
+    safe_page = max(1, int(page))
+    safe_size = max(1, min(100, int(page_size)))
+    offset = (safe_page - 1) * safe_size
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*)::INTEGER AS total
+                FROM person_cleanup_alias_proof_items
+                WHERE proof_id = %s AND proof_state = %s
+                """,
+                (str(proof_id), str(proof_state)),
+            )
+            total = int(cursor.fetchone()['total'] or 0)
+            cursor.execute(
+                """
+                SELECT person_id, person_name, candidate_provider_ids,
+                       proof_state, matched_live_person_id,
+                       matched_live_provider_ids, query_count,
+                       exact_reference_count, error, checked_at
+                FROM person_cleanup_alias_proof_items
+                WHERE proof_id = %s AND proof_state = %s
+                ORDER BY person_name ASC NULLS LAST, person_id ASC
+                LIMIT %s OFFSET %s
+                """,
+                (str(proof_id), str(proof_state), safe_size, offset),
+            )
+            items = [dict(row) for row in cursor.fetchall()]
+    return {'items': items, 'total': total, 'page': safe_page, 'page_size': safe_size}
+
+
+def get_alias_proof_summary(proof_id: str) -> Dict[str, Any]:
+    run = get_alias_proof_run(proof_id)
+    if not run:
+        raise KeyError('只读证明任务不存在')
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT proof_state, COUNT(*)::INTEGER AS count
+                FROM person_cleanup_alias_proof_items
+                WHERE proof_id = %s
+                GROUP BY proof_state ORDER BY count DESC, proof_state ASC
+                """,
+                (str(proof_id),),
+            )
+            states = [dict(row) for row in cursor.fetchall()]
+    run['states'] = states
+    run['items_total'] = sum(int(row['count']) for row in states)
+    run['consistent'] = run['items_total'] == int(run.get('candidate_total') or 0)
+    return run
+
+
 def list_candidates() -> List[Dict[str, Any]]:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -462,6 +993,60 @@ def list_candidates_raw() -> List[Dict[str, Any]]:
                 """
             )
             return [dict(row) for row in cursor.fetchall()]
+
+
+def list_alias_proof_candidates() -> List[Dict[str, Any]]:
+    """Return current candidates with persisted identity-alias evidence.
+
+    A phase-2 readonly scan may leave the candidate verification status as
+    unverified while a later safe-preview persists identity_alias_only.  The
+    historical evidence is accepted only when its immutable fingerprint still
+    matches the current candidate.
+    """
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT candidates.person_id, candidates.person_name,
+                       candidates.provider_ids_json, candidates.discovered_at,
+                       candidates.last_checked_at, candidates.last_error,
+                       candidates.verification_status,
+                       candidates.verification_snapshot_generation,
+                       candidates.verification_fingerprint,
+                       candidates.alias_scan_id, candidates.alias_scan_status,
+                       candidates.alias_scan_checked_at, candidates.alias_scan_error,
+                       ARRAY(
+                           SELECT DISTINCT items.candidate_fingerprint
+                           FROM person_cleanup_job_items items
+                           WHERE items.person_id = candidates.person_id
+                             AND items.preview_state = 'identity_alias_only'
+                       ) AS alias_preview_fingerprints
+                FROM person_cleanup_candidates candidates
+                WHERE candidates.verification_status = 'identity_alias_only'
+                   OR EXISTS (
+                        SELECT 1
+                        FROM person_cleanup_job_items items
+                        WHERE items.person_id = candidates.person_id
+                          AND items.preview_state = 'identity_alias_only'
+                   )
+                ORDER BY candidates.person_id ASC
+                """
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+
+    accepted = []
+    for candidate in rows:
+        preview_fingerprints = set(candidate.pop('alias_preview_fingerprints') or [])
+        if candidate.get('verification_status') == 'identity_alias_only':
+            accepted.append(candidate)
+            continue
+        if (
+            candidate.get('verification_status') == 'unverified'
+            and candidate_fingerprint(candidate) in preview_fingerprints
+        ):
+            candidate['verification_status'] = 'identity_alias_only'
+            accepted.append(candidate)
+    return accepted
 
 
 def get_candidates_by_ids(

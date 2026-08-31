@@ -21,6 +21,15 @@
             只读扫描
           </n-button>
           <n-button
+            type="info"
+            secondary
+            :loading="isAliasProofRunning"
+            :disabled="isBackgroundBusy && !isAliasProofRunning"
+            @click="startAliasProof"
+          >
+            Alias Orphan 只读证明
+          </n-button>
+          <n-button
             type="warning"
             :loading="safeCleanupJob?.state === 'previewing'"
             :disabled="isBackgroundBusy || protectionSnapshot.state !== 'ready'"
@@ -136,6 +145,57 @@
         <span v-if="readonlyScan.last_error">原因：{{ readonlyScan.last_error }}</span>
       </template>
     </n-alert>
+
+    <n-card v-if="aliasProof" size="small" title="Alias Orphan 只读证明" style="margin-bottom: 16px;">
+      <n-alert type="info" style="margin-bottom: 12px;">
+        verified_alias_orphan 仅表示满足当前只读安全证明；本版本不会删除人物，也不会改变现有删除资格。
+      </n-alert>
+      <n-descriptions bordered :column="2" label-placement="left">
+        <n-descriptions-item label="状态">{{ aliasProof.state }}</n-descriptions-item>
+        <n-descriptions-item label="进度">
+          {{ aliasProof.checked_count || 0 }} / {{ aliasProof.candidate_total || 0 }}
+        </n-descriptions-item>
+        <n-descriptions-item label="verified alias orphan">
+          {{ aliasProof.verified_alias_orphan_count || 0 }}
+        </n-descriptions-item>
+        <n-descriptions-item label="受保护 / 拒绝 / 失败">
+          {{ aliasProof.protected_count || 0 }} / {{ aliasProof.rejected_count || 0 }} / {{ aliasProof.failed_count || 0 }}
+        </n-descriptions-item>
+      </n-descriptions>
+      <n-list v-if="aliasProofStates.length" bordered style="margin-top: 12px;">
+        <n-list-item v-for="row in aliasProofStates" :key="row.proof_state">
+          <n-space justify="space-between" align="center">
+            <span>{{ aliasProofStateLabel(row.proof_state) }}（{{ row.proof_state }}）</span>
+            <n-space align="center">
+              <n-text>{{ row.count }}</n-text>
+              <n-button
+                v-if="!['pending', 'checking'].includes(row.proof_state) && row.count"
+                size="small"
+                tertiary
+                @click="openAliasProofSamples(row.proof_state)"
+              >查看样本</n-button>
+            </n-space>
+          </n-space>
+        </n-list-item>
+      </n-list>
+      <n-alert v-if="aliasProof.last_error" type="warning" style="margin-top: 12px;">
+        {{ aliasProof.last_error }}
+      </n-alert>
+      <n-space justify="end" style="margin-top: 12px;">
+        <n-button
+          v-if="['running', 'stop_requested'].includes(aliasProof.state)"
+          type="warning"
+          @click="stopAliasProof"
+        >安全停止</n-button>
+        <n-button
+          v-if="['stopped', 'interrupted'].includes(aliasProof.state)"
+          type="primary"
+          secondary
+          :disabled="isBackgroundBusy"
+          @click="startAliasProof"
+        >继续只读证明</n-button>
+      </n-space>
+    </n-card>
 
     <n-space align="center" style="margin: 16px 0 10px;">
       <n-text strong>全服务器幽灵人物候选</n-text>
@@ -482,6 +542,30 @@
         </n-space>
       </n-card>
     </n-modal>
+
+    <n-modal v-model:show="aliasProofSamplesVisible" :mask-closable="!aliasProofSamplesLoading">
+      <n-card class="person-verify-card" :title="`只读证明样本：${aliasProofStateLabel(aliasProofSampleState)}`" closable @close="aliasProofSamplesVisible = false">
+        <n-alert type="info" style="margin-bottom: 12px;">
+          样本只读取 PostgreSQL 中已持久化的 proof items，不会访问 Emby 或执行删除。
+        </n-alert>
+        <n-data-table
+          :columns="aliasProofSampleColumns"
+          :data="aliasProofSamples"
+          :loading="aliasProofSamplesLoading"
+          :row-key="row => row.person_id"
+          :pagination="false"
+          :scroll-x="1050"
+        />
+        <n-pagination
+          v-if="aliasProofSamplesTotal > aliasProofSamplesPageSize"
+          :page="aliasProofSamplesPage"
+          :page-count="aliasProofSamplesPageCount"
+          :page-size="aliasProofSamplesPageSize"
+          style="margin-top: 12px;justify-content:flex-end;"
+          @update:page="fetchAliasProofSamples"
+        />
+      </n-card>
+    </n-modal>
   </n-layout>
 </template>
 
@@ -557,13 +641,28 @@ const previewSamplesItems = ref([]);
 const previewSamplesPage = ref(1);
 const previewSamplesPageSize = 5;
 const previewSamplesTotal = ref(0);
+const aliasProof = ref(null);
+const aliasProofSamplesVisible = ref(false);
+const aliasProofSamplesLoading = ref(false);
+const aliasProofSampleState = ref('');
+const aliasProofSamples = ref([]);
+const aliasProofSamplesPage = ref(1);
+const aliasProofSamplesPageSize = 20;
+const aliasProofSamplesTotal = ref(0);
 let safeCleanupPollTimer = null;
+let aliasProofPollTimer = null;
 const pagination = { pageSize: 30, showSizePicker: true, pageSizes: [20, 30, 50, 100] };
 
 const currentAction = computed(() => props.taskStatus?.current_action || '');
 const isBackgroundBusy = computed(() => Boolean(props.taskStatus?.is_running));
 const isScanRunning = computed(() => isBackgroundBusy.value && currentAction.value.includes('扫描幽灵人物'));
 const isDeleteRunning = computed(() => isBackgroundBusy.value && currentAction.value.includes('删除') && currentAction.value.includes('幽灵人物'));
+const isAliasProofRunning = computed(() => isBackgroundBusy.value && currentAction.value.includes('Alias Orphan'));
+const aliasProofStates = computed(() => aliasProof.value?.states || []);
+const aliasProofSamplesPageCount = computed(() => Math.max(
+  1,
+  Math.ceil(aliasProofSamplesTotal.value / aliasProofSamplesPageSize),
+));
 const previewStateRows = computed(() => (
   buildPersonCleanupPreviewRows(safeCleanupJob.value?.preview_summary)
 ));
@@ -724,6 +823,35 @@ const providerIdText = (providerIds) => {
   const labels = Object.entries(normalized).map(([key, value]) => `${key}: ${value}`);
   return labels.length ? labels.join(' / ') : '无';
 };
+
+const aliasProofStateLabel = (state) => ({
+  pending: '等待核验',
+  checking: '正在核验',
+  verified_alias_orphan: '已通过只读 alias orphan 证明',
+  linked: '当前仍有关联',
+  protected: '命中保护合同',
+  identity_unavailable: '外部身份不足',
+  identity_not_found: '未找到在用同身份人物',
+  identity_ambiguous: '同身份人物不唯一',
+  people_unavailable: 'People 无法完整核验',
+  invalid_response: 'Emby 响应异常',
+  connection_failed: '连接失败',
+  candidate_changed: '候选身份已变化',
+  failed_safe: '失败关闭',
+}[state] || '其他状态');
+
+const aliasProofSampleColumns = [
+  { title: 'Person ID', key: 'person_id', minWidth: 130 },
+  { title: '人物', key: 'person_name', minWidth: 150 },
+  {
+    title: '外部 ID', key: 'candidate_provider_ids', minWidth: 180,
+    render: (row) => providerIdText(row.candidate_provider_ids),
+  },
+  { title: 'proof state', key: 'proof_state', minWidth: 180 },
+  { title: '在用同身份 Person', key: 'matched_live_person_id', minWidth: 150, render: (row) => row.matched_live_person_id || '-' },
+  { title: '查询 / 精确关联', key: 'counts', minWidth: 130, render: (row) => `${row.query_count || 0} / ${row.exact_reference_count || 0}` },
+  { title: '原因', key: 'error', minWidth: 250, render: (row) => row.error || '-' },
+];
 
 const previewSampleColumns = [
   {
@@ -937,6 +1065,71 @@ const scanCandidates = async () => {
   }
 };
 
+const fetchAliasProof = async () => {
+  try {
+    const response = await axios.get('/api/person-cleanup/alias-proof-runs/latest');
+    aliasProof.value = response.data.proof || null;
+    scheduleAliasProofPoll();
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法读取 Alias Orphan 只读证明状态');
+  }
+};
+
+const scheduleAliasProofPoll = () => {
+  if (aliasProofPollTimer) window.clearTimeout(aliasProofPollTimer);
+  if (!aliasProof.value || !['running', 'stop_requested'].includes(aliasProof.value.state)) return;
+  aliasProofPollTimer = window.setTimeout(fetchAliasProof, 1200);
+};
+
+const startAliasProof = async () => {
+  try {
+    const resumable = ['stopped', 'interrupted'].includes(aliasProof.value?.state);
+    await axios.post('/api/person-cleanup/alias-proof-runs', {
+      proof_id: resumable ? aliasProof.value.proof_id : null,
+    });
+    message.success('Alias Orphan 只读证明已提交；本版本不会删除人物');
+    window.setTimeout(fetchAliasProof, 500);
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法启动 Alias Orphan 只读证明');
+  }
+};
+
+const stopAliasProof = async () => {
+  if (!aliasProof.value?.proof_id) return;
+  try {
+    await axios.post(`/api/person-cleanup/alias-proof-runs/${encodeURIComponent(aliasProof.value.proof_id)}/stop`);
+    aliasProof.value = { ...aliasProof.value, state: 'stop_requested' };
+    scheduleAliasProofPoll();
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法停止只读证明');
+  }
+};
+
+const fetchAliasProofSamples = async (page = 1) => {
+  if (!aliasProof.value?.proof_id || !aliasProofSampleState.value) return;
+  aliasProofSamplesLoading.value = true;
+  try {
+    const response = await axios.get(
+      `/api/person-cleanup/alias-proof-runs/${encodeURIComponent(aliasProof.value.proof_id)}/items`,
+      { params: { state: aliasProofSampleState.value, page, page_size: aliasProofSamplesPageSize } },
+    );
+    aliasProofSamples.value = response.data.items || [];
+    aliasProofSamplesPage.value = response.data.page || page;
+    aliasProofSamplesTotal.value = response.data.total || 0;
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法读取只读证明样本');
+  } finally {
+    aliasProofSamplesLoading.value = false;
+  }
+};
+
+const openAliasProofSamples = async (state) => {
+  aliasProofSampleState.value = state;
+  aliasProofSamplesPage.value = 1;
+  aliasProofSamplesVisible.value = true;
+  await fetchAliasProofSamples(1);
+};
+
 const confirmDelete = () => {
   const selectedNames = candidates.value
     .filter((item) => selectedIds.value.includes(item.person_id))
@@ -1117,10 +1310,12 @@ onMounted(() => {
   fetchCandidates();
   fetchProtectedLibraries();
   fetchLatestSafeCleanupJob();
+  fetchAliasProof();
 });
 
 onBeforeUnmount(() => {
   if (safeCleanupPollTimer) window.clearTimeout(safeCleanupPollTimer);
+  if (aliasProofPollTimer) window.clearTimeout(aliasProofPollTimer);
 });
 </script>
 

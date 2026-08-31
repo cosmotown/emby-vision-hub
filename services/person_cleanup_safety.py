@@ -391,6 +391,143 @@ def candidate_fingerprint(candidate: Dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def classify_alias_orphan_proof(
+    candidate: Dict[str, Any],
+    current_candidate: Optional[Dict[str, Any]],
+    candidate_detail: Optional[Dict[str, Any]],
+    normal_referenced_person_ids: Iterable[str],
+    identity_index: Dict[tuple[str, str], Iterable[str]],
+    person_details: Dict[str, Dict[str, Any]],
+    reference_result: Optional[Dict[str, Any]],
+    protection_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Classify one alias proof without granting any deletion permission.
+
+    The caller must build complete normal-library and Person snapshots first.
+    This function deliberately treats every malformed or changing input as a
+    terminal fail-closed result.
+    """
+    person_id = str(candidate.get('person_id') or candidate.get('Id') or '').strip()
+    base = {
+        'proof_state': 'failed_safe',
+        'matched_live_person_id': None,
+        'matched_live_provider_ids': {},
+        'query_count': 0,
+        'exact_reference_count': 0,
+        'error': None,
+    }
+    if not person_id or candidate.get('verification_status') != 'identity_alias_only':
+        return {**base, 'error': '候选不是 identity_alias_only，拒绝只读证明'}
+    if not current_candidate or candidate_fingerprint(current_candidate) != candidate_fingerprint(candidate):
+        return {**base, 'proof_state': 'candidate_changed', 'error': '候选身份在证明期间发生变化'}
+    if person_id in {str(value) for value in normal_referenced_person_ids}:
+        return {**base, 'proof_state': 'linked', 'error': '普通媒体库 People 仍引用当前 Person ID'}
+    if protection_reason:
+        return {**base, 'proof_state': 'protected', 'error': str(protection_reason)}
+    if not isinstance(candidate_detail, dict):
+        return {**base, 'proof_state': 'invalid_response', 'error': '当前 Person detail 不可核验'}
+    if (
+        str(candidate_detail.get('Id') or '').strip() != person_id
+        or candidate_detail.get('Type') != 'Person'
+        or not str(candidate_detail.get('Name') or '').strip()
+        or not isinstance(candidate_detail.get('ProviderIds'), dict)
+    ):
+        return {**base, 'proof_state': 'invalid_response', 'error': '当前 Person detail 身份不完整'}
+    detail_candidate = {
+        'person_id': person_id,
+        'person_name': candidate_detail.get('Name'),
+        'provider_ids_json': candidate_detail.get('ProviderIds'),
+    }
+    if candidate_fingerprint(detail_candidate) != candidate_fingerprint(candidate):
+        return {**base, 'proof_state': 'candidate_changed', 'error': 'Emby Person detail 与候选指纹不一致'}
+
+    reference_status = classify_reference_check(reference_result)
+    if reference_status != 'identity_alias_only':
+        mapped = {
+            'linked': 'linked',
+            'people_unavailable': 'people_unavailable',
+            'connection_failed': 'connection_failed',
+            'invalid_response': 'invalid_response',
+            'protected_library_alias': 'protected',
+            'protected_library_unverifiable': 'protected',
+        }.get(reference_status, 'failed_safe')
+        return {**base, 'proof_state': mapped, 'error': f'当前关联核验状态为 {reference_status}'}
+    query_count = reference_result.get('query_count')
+    exact_count = reference_result.get('count')
+    unverified_items = reference_result.get('unverified_items') or []
+    if (
+        not isinstance(query_count, int) or isinstance(query_count, bool) or query_count <= 0
+        or exact_count != 0
+        or not isinstance(unverified_items, list) or unverified_items
+    ):
+        return {
+            **base,
+            'proof_state': 'people_unavailable',
+            'query_count': query_count if isinstance(query_count, int) else 0,
+            'exact_reference_count': exact_count if isinstance(exact_count, int) else 0,
+            'error': 'PersonIds 命中作品未能全部完成精确 People 核验',
+        }
+
+    try:
+        identities = canonical_person_provider_identities(
+            candidate_detail.get('ProviderIds'), strict=True,
+        )
+    except ValueError as exc:
+        return {
+            **base, 'proof_state': 'identity_unavailable',
+            'query_count': query_count, 'exact_reference_count': exact_count,
+            'error': str(exc),
+        }
+    if not identities:
+        return {
+            **base, 'proof_state': 'identity_unavailable',
+            'query_count': query_count, 'exact_reference_count': exact_count,
+            'error': '缺少可用的 TMDb/IMDb/豆瓣身份',
+        }
+
+    matching_ids = set()
+    for identity in identities:
+        matching_ids.update(str(value) for value in identity_index.get(identity, ()) if value)
+    matching_ids.discard(person_id)
+    if not matching_ids:
+        return {
+            **base, 'proof_state': 'identity_not_found',
+            'query_count': query_count, 'exact_reference_count': exact_count,
+            'error': '未找到其他同 canonical provider identity 的 Person',
+        }
+    if len(matching_ids) != 1:
+        return {
+            **base, 'proof_state': 'identity_ambiguous',
+            'query_count': query_count, 'exact_reference_count': exact_count,
+            'error': f'找到 {len(matching_ids)} 个其他同身份 Person',
+        }
+    matched_id = next(iter(matching_ids))
+    matched_detail = person_details.get(matched_id)
+    if not isinstance(matched_detail, dict):
+        return {
+            **base, 'proof_state': 'identity_not_found',
+            'query_count': query_count, 'exact_reference_count': exact_count,
+            'error': '同身份 Person detail 不完整',
+        }
+    if matched_id not in {str(value) for value in normal_referenced_person_ids}:
+        return {
+            **base, 'proof_state': 'identity_not_found',
+            'matched_live_person_id': matched_id,
+            'matched_live_provider_ids': matched_detail.get('ProviderIds') or {},
+            'query_count': query_count, 'exact_reference_count': exact_count,
+            'error': '唯一同身份 Person 未被普通媒体库真实 People 引用',
+        }
+    return {
+        **base,
+        'proof_state': 'verified_alias_orphan',
+        'matched_live_person_id': matched_id,
+        'matched_live_provider_ids': matched_detail.get('ProviderIds') or {},
+        'query_count': query_count,
+        'exact_reference_count': exact_count,
+        'error': None,
+    }
+
+
 def is_explicit_verified_orphan(candidate: Dict[str, Any], snapshot_generation: int) -> bool:
     """Only an explicit orphan result from the current protection snapshot is selectable."""
     try:

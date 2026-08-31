@@ -1,6 +1,8 @@
 # tasks/actors.py
 # 演员相关任务模块
 
+import hashlib
+import json
 import time
 import logging
 from collections import defaultdict
@@ -20,6 +22,7 @@ from services.person_cleanup_safety import (
     build_person_name_protection_keys,
     candidate_fingerprint,
     canonical_person_provider_identities,
+    classify_alias_orphan_proof,
     classify_reference_check,
     find_ghost_candidates,
     is_explicit_verified_orphan,
@@ -31,6 +34,8 @@ logger = logging.getLogger(__name__)
 
 PERSON_ALIAS_SCAN_WORKERS = 4
 PERSON_ALIAS_SCAN_CLAIM_LIMIT = 4
+PERSON_ALIAS_PROOF_WORKERS = 4
+PERSON_ALIAS_PROOF_CLAIM_LIMIT = 4
 
 def _scan_protected_library_people(processor, protected_libraries, batch_size: int = 500):
     """Build a complete protected snapshot or raise without marking it ready."""
@@ -492,6 +497,316 @@ def task_scan_ghost_actor_candidates(processor):
                 logger.error('持久化只读 alias scan 暂停状态失败', exc_info=True)
         logger.error(f"执行 '{task_name}' 失败: {exc}", exc_info=True)
         task_manager.update_status_from_thread(-1, f"扫描失败: {exc}")
+        raise
+
+
+def _alias_proof_snapshot_hash(value) -> str:
+    return hashlib.sha256(
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    ).hexdigest()
+
+
+def _alias_proof_protection_hash(contract, root_contract) -> str:
+    """Bind every protection fact that can reject alias-orphan evidence."""
+    roots = sorted(
+        (
+            str(root.get('library_id') or ''),
+            str(root.get('library_name') or ''),
+            str(root.get('style') or ''),
+            str(root.get('path') or ''),
+        )
+        for root in (root_contract.get('roots') or ())
+    )
+    return _alias_proof_snapshot_hash({
+        'generation': int(contract['generation']),
+        'person_ids': sorted(str(value) for value in contract.get('person_ids') or ()),
+        'name_keys': sorted(str(value) for value in contract.get('name_keys') or ()),
+        'provider_identities': sorted(
+            (str(provider), str(provider_id))
+            for provider, provider_id in (contract.get('provider_identities') or ())
+        ),
+        'alias_statuses': sorted(
+            (str(person_id), str(status))
+            for person_id, status in (contract.get('alias_statuses') or {}).items()
+        ),
+        'selected_library_ids': sorted(
+            str(value) for value in (root_contract.get('selected_library_ids') or ())
+        ),
+        'root_contract_complete': bool(root_contract.get('complete')),
+        'roots': roots,
+    })
+
+
+def _build_alias_proof_snapshots(processor):
+    """Build all global GET-only evidence before any item can be verified."""
+    generation = person_cleanup_db.require_ready_protection_snapshot()
+    contract = person_cleanup_db.get_protection_contract()
+    if int(contract['generation']) != int(generation):
+        raise RuntimeError('保护快照 generation 不一致')
+
+    libraries = emby.get_all_libraries_with_paths_strict(
+        processor.emby_url,
+        processor.emby_api_key,
+    )
+    library_ids = {
+        str(library.get('info', {}).get('Id') or '').strip()
+        for library in libraries or []
+        if str(library.get('info', {}).get('Id') or '').strip()
+    }
+    if not library_ids:
+        raise RuntimeError('无法读取完整媒体库列表')
+    protected_libraries = person_cleanup_db.list_protected_libraries()
+    for protected_library in protected_libraries:
+        if (
+            protected_library.get('snapshot_state') != 'ready'
+            or int(protected_library.get('snapshot_generation') or -1) != int(generation)
+        ):
+            raise RuntimeError('至少一个受保护媒体库 snapshot 未在当前 generation 就绪')
+    protected_ids = {
+        str(item.get('library_id') or '').strip()
+        for item in protected_libraries
+        if str(item.get('library_id') or '').strip()
+    }
+    if not protected_ids.issubset(library_ids):
+        raise RuntimeError('至少一个受保护媒体库已无法精确读取')
+    root_contract = build_protected_library_root_contract(libraries, protected_libraries)
+    if protected_ids and not root_contract.get('complete'):
+        raise RuntimeError('受保护媒体库 root contract 不完整')
+
+    normal_scan = emby.get_referenced_person_ids_strict(
+        processor.emby_url,
+        processor.emby_api_key,
+        sorted(library_ids - protected_ids),
+        require_person_names=True,
+    )
+    if normal_scan is None:
+        raise RuntimeError('普通媒体库 People snapshot 不完整')
+    normal_ids = {str(value) for value in normal_scan['person_ids']}
+
+    person_details = emby.get_all_person_details_snapshot_strict(
+        processor.emby_url,
+        processor.emby_api_key,
+    )
+    if person_details is None:
+        raise RuntimeError('全量 Person identity snapshot 不完整')
+    identity_index = defaultdict(set)
+    identity_rows = []
+    for person_id, detail in sorted(person_details.items()):
+        try:
+            identities = canonical_person_provider_identities(
+                detail.get('ProviderIds'), strict=True,
+            )
+        except ValueError:
+            identities = set()
+        for provider, provider_id in sorted(identities):
+            identity_index[(provider, provider_id)].add(person_id)
+            identity_rows.append((provider, provider_id, person_id))
+
+    normal_hash = _alias_proof_snapshot_hash(sorted(normal_ids))
+    person_hash = _alias_proof_snapshot_hash([
+        (
+            person_id,
+            str(detail.get('Name') or ''),
+            detail.get('ProviderIds') or {},
+        )
+        for person_id, detail in sorted(person_details.items())
+    ])
+    if person_cleanup_db.require_ready_protection_snapshot() != generation:
+        raise RuntimeError('保护快照 generation 在全局 snapshot 构建期间漂移')
+    return {
+        'generation': generation,
+        'contract': contract,
+        'root_contract': root_contract,
+        'protection_hash': _alias_proof_protection_hash(contract, root_contract),
+        'normal_ids': normal_ids,
+        'person_details': person_details,
+        'identity_index': dict(identity_index),
+        'normal_hash': normal_hash,
+        'person_hash': person_hash,
+        'identity_count': len(identity_rows),
+    }
+
+
+def _check_alias_orphan_proof_candidate(processor, proof_item, snapshots):
+    person_id = str(proof_item.get('person_id') or '')
+    candidates = person_cleanup_db.get_candidates_by_ids(
+        [person_id], include_protected=True,
+    )
+    current = candidates[0] if candidates else None
+    candidate = {
+        'person_id': person_id,
+        'person_name': proof_item.get('person_name'),
+        'provider_ids_json': proof_item.get('candidate_provider_ids') or {},
+        'verification_status': 'identity_alias_only',
+    }
+    current_details = emby.get_person_details_strict(
+        processor.emby_url,
+        processor.emby_api_key,
+        [person_id],
+        batch_size=1,
+    )
+    detail = current_details.get(person_id) if current_details else None
+    references = emby.get_person_media_references(
+        processor.emby_url,
+        processor.emby_api_key,
+        person_id,
+        limit=1,
+        person_name=(detail or {}).get('Name') or candidate.get('person_name'),
+        protected_root_contract=snapshots['root_contract'],
+        user_id=getattr(processor, 'emby_user_id', None),
+        detail_workers=1,
+    )
+    refreshed_candidates = person_cleanup_db.get_candidates_by_ids(
+        [person_id], include_protected=True,
+    )
+    current = refreshed_candidates[0] if refreshed_candidates else None
+    protection_reason = (
+        person_cleanup_db.candidate_protection_reason(current, snapshots['contract'])
+        if current else None
+    )
+    return classify_alias_orphan_proof(
+        candidate,
+        current,
+        detail,
+        snapshots['normal_ids'],
+        snapshots['identity_index'],
+        snapshots['person_details'],
+        references,
+        protection_reason=protection_reason,
+    )
+
+
+def task_alias_orphan_readonly_proof(processor, proof_id=None):
+    """Run a persistent GET-only alias-orphan proof; never mutates Emby."""
+    task_manager.update_status_from_thread(0, 'Alias Orphan 只读证明：构建完整快照...')
+    active_proof_id = str(proof_id or '').strip() or None
+    try:
+        snapshots = _build_alias_proof_snapshots(processor)
+        candidates = person_cleanup_db.list_alias_proof_candidates()
+        if active_proof_id:
+            run = person_cleanup_db.resume_alias_proof_run(
+                active_proof_id,
+                snapshots['generation'],
+                snapshots['protection_hash'],
+                snapshots['normal_hash'],
+                snapshots['person_hash'],
+            )
+            person_cleanup_db.requeue_changed_alias_proof_items(
+                active_proof_id,
+                person_cleanup_db.list_candidates_raw(),
+            )
+            run = person_cleanup_db.get_alias_proof_run(active_proof_id) or run
+        else:
+            run = person_cleanup_db.create_alias_proof_run(
+                snapshots['generation'],
+                snapshots['protection_hash'],
+                snapshots['normal_hash'],
+                snapshots['person_hash'],
+                candidates,
+            )
+            active_proof_id = str(run['proof_id'])
+
+        total = int(run.get('candidate_total') or 0)
+        with ThreadPoolExecutor(
+            max_workers=PERSON_ALIAS_PROOF_WORKERS,
+            thread_name_prefix='person-alias-proof',
+        ) as executor:
+            while True:
+                if (
+                    processor.is_stop_requested()
+                    or person_cleanup_db.alias_proof_stop_requested(active_proof_id)
+                ):
+                    person_cleanup_db.stop_alias_proof_run(active_proof_id)
+                    task_manager.update_status_from_thread(
+                        100,
+                        'Alias Orphan 只读证明已中止；已完成结果保留，未完成项可继续。',
+                    )
+                    return
+                if person_cleanup_db.require_ready_protection_snapshot() != snapshots['generation']:
+                    person_cleanup_db.fail_alias_proof_run(
+                        active_proof_id,
+                        '保护快照 generation 漂移，全部证明结果已失败关闭',
+                        stale=True,
+                    )
+                    return
+
+                claimed = person_cleanup_db.claim_alias_proof_items(
+                    active_proof_id,
+                    limit=PERSON_ALIAS_PROOF_CLAIM_LIMIT,
+                )
+                if not claimed:
+                    final_snapshots = _build_alias_proof_snapshots(processor)
+                    if (
+                        final_snapshots['generation'] != snapshots['generation']
+                        or final_snapshots['protection_hash'] != snapshots['protection_hash']
+                        or final_snapshots['normal_hash'] != snapshots['normal_hash']
+                        or final_snapshots['person_hash'] != snapshots['person_hash']
+                    ):
+                        person_cleanup_db.fail_alias_proof_run(
+                            active_proof_id,
+                            'Emby/保护快照在证明期间发生变化，全部证明结果已失败关闭',
+                            stale=True,
+                        )
+                        return
+                    final = person_cleanup_db.complete_alias_proof_run(
+                        active_proof_id,
+                        snapshots['generation'],
+                    )
+                    task_manager.update_status_from_thread(
+                        100,
+                        f"Alias Orphan 只读证明完成：{final.get('checked_count', 0)}/{total}；"
+                        f"verified_alias_orphan {final.get('verified_alias_orphan_count', 0)}。"
+                        '本版本不会删除人物。',
+                    )
+                    return
+
+                futures = {
+                    executor.submit(
+                        _check_alias_orphan_proof_candidate,
+                        processor,
+                        item,
+                        snapshots,
+                    ): item
+                    for item in claimed
+                }
+                for future in as_completed(futures):
+                    item = futures[future]
+                    try:
+                        outcome = future.result()
+                    except Exception as exc:
+                        logger.error(
+                            'Alias Orphan 只读证明失败 person_id=%s error=%s',
+                            item.get('person_id'), type(exc).__name__,
+                        )
+                        outcome = {
+                            'proof_state': 'failed_safe',
+                            'error': f'只读证明异常: {type(exc).__name__}',
+                        }
+                    person_cleanup_db.finish_alias_proof_item(
+                        active_proof_id,
+                        item['person_id'],
+                        outcome,
+                    )
+                current = person_cleanup_db.get_alias_proof_run(active_proof_id) or {}
+                checked = int(current.get('checked_count') or 0)
+                progress = int((checked / max(1, total)) * 100)
+                task_manager.update_status_from_thread(
+                    progress,
+                    f"Alias Orphan 只读证明 {checked}/{total}；"
+                    f"通过 {current.get('verified_alias_orphan_count', 0)}；"
+                    '仅分类，不删除人物。',
+                )
+    except Exception as exc:
+        if active_proof_id:
+            try:
+                person_cleanup_db.fail_alias_proof_run(
+                    active_proof_id,
+                    str(exc),
+                    stale='generation' in str(exc).lower(),
+                )
+            except Exception:
+                logger.error('持久化 Alias Orphan proof 失败状态异常', exc_info=True)
+        task_manager.update_status_from_thread(-1, f'Alias Orphan 只读证明失败: {exc}')
         raise
 
 

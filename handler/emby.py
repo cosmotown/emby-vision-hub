@@ -748,6 +748,7 @@ def get_referenced_person_ids_strict(
     library_ids: List[str],
     batch_size: int = 500,
     capture_library_ids: Optional[Iterable[str]] = None,
+    require_person_names: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Page every library and fail closed if any media/person reference request fails."""
     referenced_person_ids = set()
@@ -825,6 +826,13 @@ def get_referenced_person_ids_strict(
                     if not person_id:
                         logger.error(
                             '严格扫描媒体库 %s 时项目 %s 含无法识别的人物 ID',
+                            library_id,
+                            item_id,
+                        )
+                        return None
+                    if require_person_names and not str(person.get('Name') or '').strip():
+                        logger.error(
+                            '严格扫描媒体库 %s 时项目 %s 含缺少 Name 的人物',
                             library_id,
                             item_id,
                         )
@@ -907,6 +915,76 @@ def get_person_details_strict(
         except Exception as exc:
             logger.error('严格读取保护人物详情失败: %s', type(exc).__name__)
             return None
+    return details
+
+
+def get_all_person_details_snapshot_strict(
+    base_url: str,
+    api_key: str,
+    batch_size: int = 500,
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Read one complete, stable, GET-only snapshot of every Emby Person."""
+    if not base_url or not api_key:
+        return None
+    api_url = f"{base_url.rstrip('/')}/Items"
+    safe_batch_size = max(1, min(int(batch_size), 500))
+    start_index = 0
+    expected_total = None
+    details = {}
+    while True:
+        try:
+            response = emby_client.get(
+                api_url,
+                headers={'X-Emby-Token': api_key},
+                params={
+                    'IncludeItemTypes': 'Person',
+                    'Recursive': 'true',
+                    'Fields': 'ProviderIds,Name,Type',
+                    'StartIndex': start_index,
+                    'Limit': safe_batch_size,
+                    'EnableTotalRecordCount': 'true',
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get('Items'), list):
+                raise ValueError('全量 Person snapshot 响应格式异常')
+            total = payload.get('TotalRecordCount')
+            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+                raise ValueError('全量 Person snapshot 缺少有效 TotalRecordCount')
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise ValueError('全量 Person snapshot 分页期间 TotalRecordCount 漂移')
+            items = payload['Items']
+            if not items:
+                if start_index < expected_total:
+                    raise ValueError('全量 Person snapshot 分页提前结束')
+                break
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ValueError('全量 Person snapshot 含非法项目')
+                person_id = str(item.get('Id') or '').strip()
+                if not person_id or person_id in details:
+                    raise ValueError('全量 Person snapshot Person ID 缺失或重复')
+                if item.get('Type') != 'Person':
+                    raise ValueError('全量 Person snapshot Type 不匹配')
+                if not str(item.get('Name') or '').strip():
+                    raise ValueError('全量 Person snapshot Name 缺失')
+                if not isinstance(item.get('ProviderIds'), dict):
+                    raise ValueError('全量 Person snapshot ProviderIds 不可核验')
+                details[person_id] = item
+            start_index += len(items)
+            if start_index >= expected_total:
+                break
+            if len(items) < safe_batch_size:
+                raise ValueError('全量 Person snapshot 分页长度不足')
+        except Exception as exc:
+            logger.error('严格读取全量 Person snapshot 失败: %s', type(exc).__name__)
+            return None
+    if len(details) != int(expected_total or 0):
+        return None
     return details
 
 # ✨✨✨ 刷新Emby元数据 ✨✨✨
@@ -2170,6 +2248,57 @@ def get_all_libraries_with_paths(base_url: str, api_key: str) -> List[Dict[str, 
     except Exception as e:
         logger.error(f"实时获取媒体库路径时发生错误: {e}", exc_info=True)
         return []
+
+
+def get_all_libraries_with_paths_strict(
+    base_url: str,
+    api_key: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """Read every VirtualFolder exactly once or fail the readonly proof closed."""
+    if not base_url or not api_key:
+        return None
+    try:
+        response = emby_client.get(
+            f"{base_url.rstrip('/')}/Library/VirtualFolders",
+            headers={'X-Emby-Token': api_key},
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise ValueError('VirtualFolders 响应不是列表')
+        libraries = []
+        seen_ids = set()
+        for folder in payload:
+            if not isinstance(folder, dict):
+                raise ValueError('VirtualFolders 含非法媒体库')
+            library_id = str(folder.get('ItemId') or '').strip()
+            library_name = str(folder.get('Name') or '').strip()
+            locations = folder.get('Locations')
+            if not library_id or library_id in seen_ids or not library_name:
+                raise ValueError('VirtualFolders 媒体库身份缺失或重复')
+            if (
+                not isinstance(locations, list)
+                or not locations
+                or any(not isinstance(path, str) or not path.strip() for path in locations)
+            ):
+                raise ValueError('VirtualFolders 媒体库 Locations 不完整')
+            seen_ids.add(library_id)
+            libraries.append({
+                'info': {
+                    'Name': library_name,
+                    'Id': library_id,
+                    'Guid': folder.get('Guid'),
+                    'CollectionType': folder.get('CollectionType'),
+                },
+                'paths': list(locations),
+            })
+        if not libraries:
+            raise ValueError('VirtualFolders 未返回任何可核验媒体库')
+        return libraries
+    except Exception as exc:
+        logger.error('严格读取全部媒体库失败: %s', type(exc).__name__)
+        return None
 
 # --- 定位媒体库 ---
 def get_library_root_for_item(item_id: str, base_url: str, api_key: str, user_id: str) -> Optional[Dict[str, Any]]:

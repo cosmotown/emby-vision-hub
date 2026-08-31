@@ -2,6 +2,27 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.22",
+        "published_at": "2026-08-31T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.22",
+        "changelog": """## Person Cleanup Alias Orphan 只读证明
+
+- 新增 `identity_alias_only` 人物的严格只读重复幽灵证明；仅当完整普通媒体库 People 引用快照、完整保护合同、完整 Person canonical identity 快照、当前 exact Person detail、realtime PersonIds + People 精确核验、唯一同 provider identity 的 live Person、candidate fingerprint，以及起止全局 snapshot hash 全部一致时，才标记为 `verified_alias_orphan`。
+- `verified_alias_orphan` 仅为只读证据状态，不会获得人物删除资格，也不会进入安全清理、确认 token、legacy delete 或 `DeletePerson` 执行链。
+- 新增 proof 持久化、checkpoint / resume、进程重启恢复、snapshot drift 失败关闭、4-worker 有界 GET 并发、分类统计和持久化样本查看。
+- proof 运行前、恢复时和完成时都会绑定保护 generation、保护 ID/姓名/provider identity、持久 alias、保护媒体库 roots、普通媒体库引用和 Person canonical identity 的确定性快照。
+- Emby 访问严格保持只读，仅使用 VirtualFolders、Items、PersonIds、People 和 exact item detail GET。
+
+### 安全边界
+
+- 本版本不删除 Person，不改变 Person 删除资格，不调用 `DeletePerson`。
+- 不修改 Emby People、Person、ProviderIds 或 Name；Alias Proof 的 Emby mutation 数为 0。
+- 现有删除资格仍只授予当前保护快照下、candidate fingerprint 一致并通过 realtime orphan precheck 的 `verification_status == orphan`。
+
+""",
+    },
+
+    {
         "version": "v7.2.21",
         "published_at": "2026-08-30T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.21",

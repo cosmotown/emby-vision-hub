@@ -597,6 +597,78 @@ def init_db():
                 """)
 
                 cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS person_cleanup_stale_index_runs (
+                        run_id TEXT PRIMARY KEY,
+                        forensic_generation BIGSERIAL UNIQUE,
+                        source_proof_id TEXT NOT NULL REFERENCES person_cleanup_alias_proof_runs(proof_id),
+                        source_proof_hash TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        snapshot_generation BIGINT NOT NULL,
+                        protection_hash TEXT NOT NULL,
+                        normal_people_relationship_hash TEXT NOT NULL,
+                        person_snapshot_hash TEXT NOT NULL,
+                        candidate_total INTEGER NOT NULL DEFAULT 0,
+                        checked_count INTEGER NOT NULL DEFAULT 0,
+                        verified_signature_count INTEGER NOT NULL DEFAULT 0,
+                        stable_signature_count INTEGER NOT NULL DEFAULT 0,
+                        stop_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                        started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        completed_at TIMESTAMP WITH TIME ZONE,
+                        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        last_error TEXT
+                    )
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_stale_index_runs
+                    ADD COLUMN IF NOT EXISTS source_proof_hash
+                    TEXT NOT NULL DEFAULT ''
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS person_cleanup_stale_index_items (
+                        run_id TEXT NOT NULL REFERENCES person_cleanup_stale_index_runs(run_id) ON DELETE CASCADE,
+                        person_id TEXT NOT NULL,
+                        person_name TEXT,
+                        candidate_fingerprint TEXT NOT NULL,
+                        provider_ids JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        source_proof_state TEXT NOT NULL,
+                        forensic_state TEXT NOT NULL DEFAULT 'pending',
+                        identity_signal TEXT,
+                        people_signal TEXT,
+                        query_count INTEGER NOT NULL DEFAULT 0,
+                        actual_people_count INTEGER NOT NULL DEFAULT 0,
+                        same_name_other_count INTEGER NOT NULL DEFAULT 0,
+                        different_name_people_count INTEGER NOT NULL DEFAULT 0,
+                        identity_owner_count INTEGER NOT NULL DEFAULT 0,
+                        stable_pass_count INTEGER NOT NULL DEFAULT 0,
+                        error TEXT,
+                        checked_at TIMESTAMP WITH TIME ZONE,
+                        PRIMARY KEY (run_id, person_id)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_person_cleanup_stale_index_runs_state
+                    ON person_cleanup_stale_index_runs (state, updated_at DESC)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_person_cleanup_stale_index_items_claim
+                    ON person_cleanup_stale_index_items (run_id, forensic_state, person_id)
+                """)
+                cursor.execute("""
+                    UPDATE person_cleanup_stale_index_runs
+                    SET state = 'interrupted', updated_at = NOW(),
+                        last_error = COALESCE(last_error, '进程重启，等待人工继续只读取证')
+                    WHERE state IN ('running', 'stop_requested')
+                """)
+                cursor.execute("""
+                    UPDATE person_cleanup_stale_index_items items
+                    SET forensic_state = 'pending', error = NULL
+                    FROM person_cleanup_stale_index_runs runs
+                    WHERE items.run_id = runs.run_id
+                      AND runs.state = 'interrupted'
+                      AND items.forensic_state = 'checking'
+                """)
+
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS person_cleanup_jobs (
                         job_id TEXT PRIMARY KEY,
                         state TEXT NOT NULL,

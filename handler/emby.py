@@ -749,12 +749,14 @@ def get_referenced_person_ids_strict(
     batch_size: int = 500,
     capture_library_ids: Optional[Iterable[str]] = None,
     require_person_names: bool = False,
+    capture_item_people: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Page every library and fail closed if any media/person reference request fails."""
     referenced_person_ids = set()
     people_by_library = {}
     capture_ids = {str(library_id) for library_id in (capture_library_ids or []) if library_id}
     media_count = 0
+    item_people = {}
     api_url = f"{base_url.rstrip('/')}/Items"
 
     for library_id in library_ids:
@@ -816,6 +818,9 @@ def get_referenced_person_ids_strict(
                 if not item_id or item_id in seen_item_ids:
                     return None
                 seen_item_ids.add(item_id)
+                if capture_item_people and item_id in item_people:
+                    logger.error('严格 People relationship snapshot 出现重复项目 %s', item_id)
+                    return None
                 if 'People' not in item or not isinstance(item.get('People'), list):
                     logger.error('严格扫描媒体库 %s 时项目 %s 的 People 不可核验', library_id, item_id)
                     return None
@@ -840,6 +845,25 @@ def get_referenced_person_ids_strict(
                     referenced_person_ids.add(person_id)
                     if library_people is not None:
                         library_people[person_id] = person.get('Name') or ''
+                if capture_item_people:
+                    item_type = str(item.get('Type') or '').strip()
+                    if not item_type:
+                        logger.error(
+                            '严格 People relationship snapshot 项目 %s 缺少 Type', item_id,
+                        )
+                        return None
+                    item_people[item_id] = {
+                        'item_id': item_id,
+                        'item_type': item_type,
+                        'library_id': normalized_library_id,
+                        'people': tuple(sorted(
+                            (
+                                str(person.get('Id') or '').strip(),
+                                str(person.get('Name') or '').strip(),
+                            )
+                            for person in item['People']
+                        )),
+                    }
 
             start_index += len(items)
             if start_index >= int(expected_total or 0):
@@ -855,7 +879,88 @@ def get_referenced_person_ids_strict(
         'person_ids': referenced_person_ids,
         'people_by_library': people_by_library,
         'media_count': media_count,
+        'item_people': item_people,
     }
+
+
+def get_person_media_query_items_strict(
+    base_url: str,
+    api_key: str,
+    person_id: str,
+    batch_size: int = 200,
+) -> Optional[List[Dict[str, Any]]]:
+    """Read every current PersonIds hit with stable strict pagination.
+
+    Returned People fields are diagnostic only.  Stale-index forensic binds
+    actual normal-library relationships to its immutable full snapshot by
+    exact item ID instead of trusting this targeted response.
+    """
+    normalized_person_id = str(person_id or '').strip()
+    if not base_url or not api_key or not normalized_person_id:
+        return None
+    safe_batch_size = max(1, min(int(batch_size), 500))
+    api_url = f"{base_url.rstrip('/')}/Items"
+    expected_total = None
+    start_index = 0
+    seen_item_ids = set()
+    result = []
+    while True:
+        try:
+            response = emby_client.get(
+                api_url,
+                headers={'X-Emby-Token': api_key},
+                params={
+                    'PersonIds': normalized_person_id,
+                    'Recursive': 'true',
+                    'IncludeItemTypes': 'Movie,Series,Episode,Video,MusicVideo',
+                    'Fields': 'People,Path,SeriesName',
+                    'StartIndex': start_index,
+                    'Limit': safe_batch_size,
+                    'EnableTotalRecordCount': 'true',
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get('Items'), list):
+                raise ValueError('PersonIds forensic 响应格式异常')
+            total = payload.get('TotalRecordCount')
+            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+                raise ValueError('PersonIds forensic 缺少有效 TotalRecordCount')
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise ValueError('PersonIds forensic 分页期间 TotalRecordCount 漂移')
+            items = payload['Items']
+            if not items:
+                if start_index < expected_total:
+                    raise ValueError('PersonIds forensic 分页提前结束')
+                break
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ValueError('PersonIds forensic 含非法项目')
+                item_id = str(item.get('Id') or '').strip()
+                if not item_id or item_id in seen_item_ids:
+                    raise ValueError('PersonIds forensic 项目 ID 缺失或重复')
+                item_type = str(item.get('Type') or '').strip()
+                if item_type not in {'Movie', 'Series', 'Episode', 'Video', 'MusicVideo'}:
+                    raise ValueError('PersonIds forensic 项目 Type 不匹配')
+                seen_item_ids.add(item_id)
+                result.append(item)
+            start_index += len(items)
+            if start_index >= expected_total:
+                break
+            if len(items) < safe_batch_size:
+                raise ValueError('PersonIds forensic 分页长度不足')
+        except Exception as exc:
+            logger.error(
+                '严格读取 PersonIds forensic 失败 person_id=%s error=%s',
+                normalized_person_id, type(exc).__name__,
+            )
+            return None
+    if len(result) != int(expected_total or 0):
+        return None
+    return result
 
 
 def get_person_details_strict(
@@ -916,6 +1021,52 @@ def get_person_details_strict(
             logger.error('严格读取保护人物详情失败: %s', type(exc).__name__)
             return None
     return details
+
+
+def get_person_detail_forensic_strict(
+    base_url: str,
+    api_key: str,
+    person_id: str,
+) -> Dict[str, Any]:
+    """Distinguish an exact missing Person from an unreadable response."""
+    normalized_id = str(person_id or '').strip()
+    if not base_url or not api_key or not normalized_id:
+        return {'status': 'failed_safe', 'detail': None}
+    try:
+        response = emby_client.get(
+            f"{base_url.rstrip('/')}/Items",
+            headers={'X-Emby-Token': api_key},
+            params={
+                'Ids': normalized_id,
+                'Fields': 'ProviderIds,Name,Type',
+                'EnableTotalRecordCount': 'false',
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get('Items'), list):
+            raise ValueError('Person forensic detail 响应格式异常')
+        items = payload['Items']
+        if not items:
+            return {'status': 'person_missing', 'detail': None}
+        if len(items) != 1 or not isinstance(items[0], dict):
+            raise ValueError('Person forensic detail 不是唯一项目')
+        detail = items[0]
+        if (
+            str(detail.get('Id') or '').strip() != normalized_id
+            or detail.get('Type') != 'Person'
+            or not str(detail.get('Name') or '').strip()
+            or not isinstance(detail.get('ProviderIds'), dict)
+        ):
+            raise ValueError('Person forensic detail 身份不完整')
+        return {'status': 'ok', 'detail': detail}
+    except Exception as exc:
+        logger.error(
+            '严格读取 Person forensic detail 失败 person_id=%s error=%s',
+            normalized_id, type(exc).__name__,
+        )
+        return {'status': 'failed_safe', 'detail': None}
 
 
 def get_all_person_details_snapshot_strict(

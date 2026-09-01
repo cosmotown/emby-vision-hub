@@ -30,6 +30,15 @@
             Alias Orphan 只读证明
           </n-button>
           <n-button
+            type="info"
+            secondary
+            :loading="isStaleIndexRunning"
+            :disabled="isBackgroundBusy && !isStaleIndexRunning"
+            @click="startStaleIndex"
+          >
+            Stale Index 只读取证
+          </n-button>
+          <n-button
             type="warning"
             :loading="safeCleanupJob?.state === 'previewing'"
             :disabled="isBackgroundBusy || protectionSnapshot.state !== 'ready'"
@@ -194,6 +203,64 @@
           :disabled="isBackgroundBusy"
           @click="startAliasProof"
         >继续只读证明</n-button>
+      </n-space>
+    </n-card>
+
+    <n-card v-if="staleIndexRun" size="small" title="Stale Index 只读取证" style="margin-bottom: 16px;">
+      <n-alert type="warning" style="margin-bottom: 12px;">
+        该结果仅证明当前 PersonIds 索引与实际 People 关系不一致，不代表本版本允许删除人物。
+        verified_stale_index_signature 与 stable_stale_index_signature 均为只读证据状态。
+      </n-alert>
+      <n-descriptions bordered :column="2" label-placement="left">
+        <n-descriptions-item label="状态">{{ staleIndexRun.state }}</n-descriptions-item>
+        <n-descriptions-item label="取证 generation">
+          {{ staleIndexRun.forensic_generation || '-' }}
+        </n-descriptions-item>
+        <n-descriptions-item label="source proof">
+          identity_not_found / {{ staleIndexRun.source_proof_id || '-' }}
+        </n-descriptions-item>
+        <n-descriptions-item label="进度">
+          {{ staleIndexRun.checked_count || 0 }} / {{ staleIndexRun.candidate_total || 0 }}
+        </n-descriptions-item>
+        <n-descriptions-item label="取证 signature">
+          {{ staleIndexRun.verified_signature_count || 0 }}
+        </n-descriptions-item>
+        <n-descriptions-item label="两次独立稳定证明">
+          {{ staleIndexRun.stable_signature_count || 0 }}
+        </n-descriptions-item>
+      </n-descriptions>
+      <n-list v-if="staleIndexRows.length" bordered style="margin-top: 12px;">
+        <n-list-item v-for="row in staleIndexRows" :key="`${row.dimension}:${row.state}`">
+          <n-space justify="space-between" align="center">
+            <span>{{ staleIndexStateLabel(row.state) }}（{{ row.state }}）</span>
+            <n-space align="center">
+              <n-text>{{ row.count }}</n-text>
+              <n-button
+                v-if="!['pending', 'checking'].includes(row.state) && row.count"
+                size="small"
+                tertiary
+                @click="openStaleIndexSamples(row)"
+              >查看样本</n-button>
+            </n-space>
+          </n-space>
+        </n-list-item>
+      </n-list>
+      <n-alert v-if="staleIndexRun.last_error" type="warning" style="margin-top: 12px;">
+        {{ staleIndexRun.last_error }}
+      </n-alert>
+      <n-space justify="end" style="margin-top: 12px;">
+        <n-button
+          v-if="['running', 'stop_requested'].includes(staleIndexRun.state)"
+          type="warning"
+          @click="stopStaleIndex"
+        >安全停止</n-button>
+        <n-button
+          v-if="['stopped', 'interrupted'].includes(staleIndexRun.state)"
+          type="primary"
+          secondary
+          :disabled="isBackgroundBusy"
+          @click="startStaleIndex"
+        >继续只读取证</n-button>
       </n-space>
     </n-card>
 
@@ -566,6 +633,26 @@
         />
       </n-card>
     </n-modal>
+
+    <n-modal v-model:show="staleIndexSamplesVisible" :mask-closable="!staleIndexSamplesLoading">
+      <n-card class="person-verify-card" :title="`Stale Index 样本：${staleIndexStateLabel(staleIndexSampleState)}`" closable @close="staleIndexSamplesVisible = false">
+        <n-data-table
+          :columns="staleIndexSampleColumns"
+          :data="staleIndexSamples"
+          :loading="staleIndexSamplesLoading"
+          :pagination="false"
+          :scroll-x="1100"
+        />
+        <n-pagination
+          v-if="staleIndexSamplesTotal > staleIndexSamplesPageSize"
+          :page="staleIndexSamplesPage"
+          :page-count="staleIndexSamplesPageCount"
+          :page-size="staleIndexSamplesPageSize"
+          style="margin-top: 12px; justify-content: flex-end;"
+          @update:page="fetchStaleIndexSamples"
+        />
+      </n-card>
+    </n-modal>
   </n-layout>
 </template>
 
@@ -649,8 +736,18 @@ const aliasProofSamples = ref([]);
 const aliasProofSamplesPage = ref(1);
 const aliasProofSamplesPageSize = 20;
 const aliasProofSamplesTotal = ref(0);
+const staleIndexRun = ref(null);
+const staleIndexSamplesVisible = ref(false);
+const staleIndexSamplesLoading = ref(false);
+const staleIndexSampleState = ref('');
+const staleIndexSampleDimension = ref('forensic_state');
+const staleIndexSamples = ref([]);
+const staleIndexSamplesPage = ref(1);
+const staleIndexSamplesPageSize = 20;
+const staleIndexSamplesTotal = ref(0);
 let safeCleanupPollTimer = null;
 let aliasProofPollTimer = null;
+let staleIndexPollTimer = null;
 const pagination = { pageSize: 30, showSizePicker: true, pageSizes: [20, 30, 50, 100] };
 
 const currentAction = computed(() => props.taskStatus?.current_action || '');
@@ -658,10 +755,26 @@ const isBackgroundBusy = computed(() => Boolean(props.taskStatus?.is_running));
 const isScanRunning = computed(() => isBackgroundBusy.value && currentAction.value.includes('扫描幽灵人物'));
 const isDeleteRunning = computed(() => isBackgroundBusy.value && currentAction.value.includes('删除') && currentAction.value.includes('幽灵人物'));
 const isAliasProofRunning = computed(() => isBackgroundBusy.value && currentAction.value.includes('Alias Orphan'));
+const isStaleIndexRunning = computed(() => isBackgroundBusy.value && currentAction.value.includes('Stale Index'));
 const aliasProofStates = computed(() => aliasProof.value?.states || []);
 const aliasProofSamplesPageCount = computed(() => Math.max(
   1,
   Math.ceil(aliasProofSamplesTotal.value / aliasProofSamplesPageSize),
+));
+const staleIndexRows = computed(() => [
+  ...(staleIndexRun.value?.states || []).map((row) => ({
+    state: row.forensic_state, count: row.count, dimension: 'forensic_state',
+  })),
+  ...(staleIndexRun.value?.identity_signals || []).map((row) => ({
+    state: row.signal, count: row.count, dimension: 'identity_signal',
+  })),
+  ...(staleIndexRun.value?.people_signals || []).map((row) => ({
+    state: row.signal, count: row.count, dimension: 'people_signal',
+  })),
+]);
+const staleIndexSamplesPageCount = computed(() => Math.max(
+  1,
+  Math.ceil(staleIndexSamplesTotal.value / staleIndexSamplesPageSize),
 ));
 const previewStateRows = computed(() => (
   buildPersonCleanupPreviewRows(safeCleanupJob.value?.preview_summary)
@@ -851,6 +964,42 @@ const aliasProofSampleColumns = [
   { title: '在用同身份 Person', key: 'matched_live_person_id', minWidth: 150, render: (row) => row.matched_live_person_id || '-' },
   { title: '查询 / 精确关联', key: 'counts', minWidth: 130, render: (row) => `${row.query_count || 0} / ${row.exact_reference_count || 0}` },
   { title: '原因', key: 'error', minWidth: 250, render: (row) => row.error || '-' },
+];
+
+const staleIndexStateLabel = (state) => ({
+  pending: '等待取证',
+  checking: '正在取证',
+  verified_stale_index_signature: '单次陈旧索引 signature',
+  stable_stale_index_signature: '两次独立稳定 signature',
+  query_disappeared: 'PersonIds 查询已自行消失',
+  linked: '当前 actual People 已重新关联',
+  protected: '命中保护合同',
+  people_unavailable: 'People 无法完整核验',
+  candidate_changed: 'candidate fingerprint 已变化',
+  person_missing: '当前 Person 已不存在',
+  identity_owner_live: '当前出现同身份在用 Person',
+  failed_safe: '失败关闭',
+  stale_index_no_identity_owner: '没有其他 canonical identity owner',
+  stale_index_identity_owner_not_live: '同身份 owner 也未被实际引用',
+  stale_index_same_name_other_person: '查询作品实际引用同名其他 Person',
+  stale_index_different_people: '查询作品实际引用不同人物',
+  stale_index_no_actual_people: '查询作品实际 People 为空',
+}[state] || '其他状态');
+
+const staleIndexSampleColumns = [
+  { title: 'Person ID', key: 'person_id', minWidth: 130 },
+  { title: '人物', key: 'person_name', minWidth: 150 },
+  {
+    title: '外部 ID', key: 'provider_ids', minWidth: 180,
+    render: (row) => providerIdText(row.provider_ids),
+  },
+  { title: '取证状态', key: 'forensic_state', minWidth: 190 },
+  { title: '身份信号', key: 'identity_signal', minWidth: 190, render: (row) => row.identity_signal || '-' },
+  { title: 'People 信号', key: 'people_signal', minWidth: 210, render: (row) => row.people_signal || '-' },
+  { title: '查询项', key: 'query_count', width: 90 },
+  { title: '实际 People', key: 'actual_people_count', width: 110 },
+  { title: '稳定次数', key: 'stable_pass_count', width: 100 },
+  { title: '原因', key: 'error', minWidth: 260, render: (row) => row.error || '-' },
 ];
 
 const previewSampleColumns = [
@@ -1130,6 +1279,79 @@ const openAliasProofSamples = async (state) => {
   await fetchAliasProofSamples(1);
 };
 
+const fetchStaleIndex = async () => {
+  try {
+    const response = await axios.get('/api/person-cleanup/stale-index-runs/latest');
+    staleIndexRun.value = response.data.run || null;
+    scheduleStaleIndexPoll();
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法读取 Stale Index 只读取证状态');
+  }
+};
+
+const scheduleStaleIndexPoll = () => {
+  if (staleIndexPollTimer) window.clearTimeout(staleIndexPollTimer);
+  if (!staleIndexRun.value || !['running', 'stop_requested'].includes(staleIndexRun.value.state)) return;
+  staleIndexPollTimer = window.setTimeout(fetchStaleIndex, 1200);
+};
+
+const startStaleIndex = async () => {
+  try {
+    const resumable = ['stopped', 'interrupted'].includes(staleIndexRun.value?.state);
+    await axios.post('/api/person-cleanup/stale-index-runs', {
+      run_id: resumable ? staleIndexRun.value.run_id : null,
+    });
+    message.success('Stale Index 只读取证已提交；不会修改或删除人物');
+    window.setTimeout(fetchStaleIndex, 500);
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法启动 Stale Index 只读取证');
+  }
+};
+
+const stopStaleIndex = async () => {
+  if (!staleIndexRun.value?.run_id) return;
+  try {
+    await axios.post(`/api/person-cleanup/stale-index-runs/${encodeURIComponent(staleIndexRun.value.run_id)}/stop`);
+    staleIndexRun.value = { ...staleIndexRun.value, state: 'stop_requested' };
+    scheduleStaleIndexPoll();
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法停止 Stale Index 只读取证');
+  }
+};
+
+const fetchStaleIndexSamples = async (page = 1) => {
+  if (!staleIndexRun.value?.run_id || !staleIndexSampleState.value) return;
+  staleIndexSamplesLoading.value = true;
+  try {
+    const response = await axios.get(
+      `/api/person-cleanup/stale-index-runs/${encodeURIComponent(staleIndexRun.value.run_id)}/items`,
+      {
+        params: {
+          state: staleIndexSampleState.value,
+          dimension: staleIndexSampleDimension.value,
+          page,
+          page_size: staleIndexSamplesPageSize,
+        },
+      },
+    );
+    staleIndexSamples.value = response.data.items || [];
+    staleIndexSamplesPage.value = response.data.page || page;
+    staleIndexSamplesTotal.value = response.data.total || 0;
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法读取 Stale Index 持久化样本');
+  } finally {
+    staleIndexSamplesLoading.value = false;
+  }
+};
+
+const openStaleIndexSamples = async (row) => {
+  staleIndexSampleState.value = row.state;
+  staleIndexSampleDimension.value = row.dimension;
+  staleIndexSamplesPage.value = 1;
+  staleIndexSamplesVisible.value = true;
+  await fetchStaleIndexSamples(1);
+};
+
 const confirmDelete = () => {
   const selectedNames = candidates.value
     .filter((item) => selectedIds.value.includes(item.person_id))
@@ -1311,11 +1533,13 @@ onMounted(() => {
   fetchProtectedLibraries();
   fetchLatestSafeCleanupJob();
   fetchAliasProof();
+  fetchStaleIndex();
 });
 
 onBeforeUnmount(() => {
   if (safeCleanupPollTimer) window.clearTimeout(safeCleanupPollTimer);
   if (aliasProofPollTimer) window.clearTimeout(aliasProofPollTimer);
+  if (staleIndexPollTimer) window.clearTimeout(staleIndexPollTimer);
 });
 </script>
 

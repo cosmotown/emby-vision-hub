@@ -528,6 +528,192 @@ def classify_alias_orphan_proof(
     }
 
 
+def classify_stale_index_forensic(
+    source_item: Dict[str, Any],
+    current_candidate: Optional[Dict[str, Any]],
+    candidate_detail_result: Optional[Dict[str, Any]],
+    normal_referenced_person_ids: Iterable[str],
+    normal_item_people: Dict[str, Dict[str, Any]],
+    identity_index: Dict[tuple[str, str], Iterable[str]],
+    query_items: Optional[List[Dict[str, Any]]],
+    root_contract: Optional[Dict[str, Any]],
+    protection_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Classify a stale PersonIds signature without granting deletion rights."""
+    person_id = str(source_item.get('person_id') or '').strip()
+    base = {
+        'forensic_state': 'failed_safe',
+        'identity_signal': None,
+        'people_signal': None,
+        'query_count': 0,
+        'actual_people_count': 0,
+        'same_name_other_count': 0,
+        'different_name_people_count': 0,
+        'identity_owner_count': 0,
+        'error': None,
+    }
+    if source_item.get('source_proof_state') != 'identity_not_found' or not person_id:
+        return {**base, 'error': '历史 source 不是 identity_not_found'}
+    if not current_candidate:
+        return {
+            **base, 'forensic_state': 'candidate_changed',
+            'error': '当前 candidate 已不存在',
+        }
+    if candidate_fingerprint(current_candidate) != str(
+        source_item.get('candidate_fingerprint') or ''
+    ):
+        return {
+            **base, 'forensic_state': 'candidate_changed',
+            'error': 'candidate fingerprint 与历史 proof source 不一致',
+        }
+    if person_id in {str(value) for value in normal_referenced_person_ids}:
+        return {**base, 'forensic_state': 'linked', 'error': '当前 normal People 已引用候选'}
+    if protection_reason:
+        return {**base, 'forensic_state': 'protected', 'error': str(protection_reason)}
+    detail_status = (
+        candidate_detail_result.get('status')
+        if isinstance(candidate_detail_result, dict) else None
+    )
+    if detail_status == 'person_missing':
+        return {**base, 'forensic_state': 'person_missing', 'error': '当前 Person detail 不存在'}
+    if detail_status != 'ok':
+        return {**base, 'forensic_state': 'failed_safe', 'error': '当前 Person detail 无法读取'}
+    candidate_detail = candidate_detail_result.get('detail')
+    if (
+        not isinstance(candidate_detail, dict)
+        or
+        str(candidate_detail.get('Id') or '').strip() != person_id
+        or candidate_detail.get('Type') != 'Person'
+        or not str(candidate_detail.get('Name') or '').strip()
+        or not isinstance(candidate_detail.get('ProviderIds'), dict)
+    ):
+        return {**base, 'forensic_state': 'failed_safe', 'error': '当前 Person detail 不完整'}
+    detail_candidate = {
+        'person_id': person_id,
+        'person_name': candidate_detail.get('Name'),
+        'provider_ids_json': candidate_detail.get('ProviderIds'),
+    }
+    if candidate_fingerprint(detail_candidate) != candidate_fingerprint(current_candidate):
+        return {
+            **base, 'forensic_state': 'candidate_changed',
+            'error': 'Emby Person detail 与当前 candidate fingerprint 不一致',
+        }
+    if query_items is None:
+        return {**base, 'forensic_state': 'failed_safe', 'error': 'PersonIds 查询失败'}
+    if not query_items:
+        return {**base, 'forensic_state': 'query_disappeared', 'error': None}
+
+    actual_people = {}
+    for query_item in query_items:
+        if not isinstance(query_item, dict):
+            return {**base, 'forensic_state': 'failed_safe', 'error': 'PersonIds 查询含非法项目'}
+        protected_match = match_item_to_protected_library(query_item, root_contract)
+        if protected_match:
+            return {
+                **base,
+                'forensic_state': 'protected',
+                'query_count': len(query_items),
+                'error': 'PersonIds 命中 selected protected library',
+            }
+        item_id = str(query_item.get('Id') or '').strip()
+        relationship = normal_item_people.get(item_id)
+        if not isinstance(relationship, dict):
+            return {
+                **base,
+                'forensic_state': 'failed_safe',
+                'query_count': len(query_items),
+                'error': f'query item {item_id or "<missing>"} 无法绑定当前 normal snapshot',
+            }
+        people = relationship.get('people')
+        if not isinstance(people, (tuple, list)):
+            return {
+                **base,
+                'forensic_state': 'people_unavailable',
+                'query_count': len(query_items),
+                'error': 'query item People snapshot 不完整',
+            }
+        for row in people:
+            if (
+                not isinstance(row, (tuple, list)) or len(row) != 2
+                or not str(row[0] or '').strip() or not str(row[1] or '').strip()
+            ):
+                return {
+                    **base,
+                    'forensic_state': 'people_unavailable',
+                    'query_count': len(query_items),
+                    'error': 'query item People row 不完整',
+                }
+            actual_id = str(row[0]).strip()
+            actual_name = str(row[1]).strip()
+            actual_people[actual_id] = actual_name
+
+    if person_id in actual_people:
+        return {
+            **base,
+            'forensic_state': 'linked',
+            'query_count': len(query_items),
+            'actual_people_count': len(actual_people),
+            'error': 'query item actual People 仍包含候选 Person ID',
+        }
+
+    try:
+        identities = canonical_person_provider_identities(
+            candidate_detail.get('ProviderIds'), strict=True,
+        )
+    except ValueError as exc:
+        return {**base, 'forensic_state': 'candidate_changed', 'error': str(exc)}
+    if not identities:
+        return {
+            **base, 'forensic_state': 'candidate_changed',
+            'error': '当前 candidate 已无 canonical identity',
+        }
+    identity_owners = set()
+    for identity in identities:
+        identity_owners.update(
+            str(value) for value in identity_index.get(identity, ()) if value
+        )
+    identity_owners.discard(person_id)
+    normal_ids = {str(value) for value in normal_referenced_person_ids}
+    if identity_owners.intersection(normal_ids):
+        return {
+            **base,
+            'forensic_state': 'identity_owner_live',
+            'query_count': len(query_items),
+            'actual_people_count': len(actual_people),
+            'identity_owner_count': len(identity_owners),
+            'error': '当前已出现同 canonical identity 的在用 Person，请重新运行 Alias Proof',
+        }
+
+    candidate_name = normalize_person_name(candidate_detail.get('Name'))
+    same_name_ids = {
+        actual_id for actual_id, actual_name in actual_people.items()
+        if normalize_person_name(actual_name) == candidate_name
+    }
+    different_name_ids = set(actual_people) - same_name_ids
+    identity_signal = (
+        'stale_index_identity_owner_not_live'
+        if identity_owners else 'stale_index_no_identity_owner'
+    )
+    if same_name_ids:
+        people_signal = 'stale_index_same_name_other_person'
+    elif actual_people:
+        people_signal = 'stale_index_different_people'
+    else:
+        people_signal = 'stale_index_no_actual_people'
+    return {
+        **base,
+        'forensic_state': 'verified_stale_index_signature',
+        'identity_signal': identity_signal,
+        'people_signal': people_signal,
+        'query_count': len(query_items),
+        'actual_people_count': len(actual_people),
+        'same_name_other_count': len(same_name_ids),
+        'different_name_people_count': len(different_name_ids),
+        'identity_owner_count': len(identity_owners),
+        'error': None,
+    }
+
+
 def is_explicit_verified_orphan(candidate: Dict[str, Any], snapshot_generation: int) -> bool:
     """Only an explicit orphan result from the current protection snapshot is selectable."""
     try:

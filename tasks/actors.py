@@ -24,6 +24,7 @@ from services.person_cleanup_safety import (
     canonical_person_provider_identities,
     classify_alias_orphan_proof,
     classify_reference_check,
+    classify_stale_index_forensic,
     find_ghost_candidates,
     is_explicit_verified_orphan,
     person_name_protection_keys,
@@ -36,6 +37,8 @@ PERSON_ALIAS_SCAN_WORKERS = 4
 PERSON_ALIAS_SCAN_CLAIM_LIMIT = 4
 PERSON_ALIAS_PROOF_WORKERS = 4
 PERSON_ALIAS_PROOF_CLAIM_LIMIT = 4
+PERSON_STALE_INDEX_WORKERS = 4
+PERSON_STALE_INDEX_CLAIM_LIMIT = 4
 
 def _scan_protected_library_people(processor, protected_libraries, batch_size: int = 500):
     """Build a complete protected snapshot or raise without marking it ready."""
@@ -537,6 +540,22 @@ def _alias_proof_protection_hash(contract, root_contract) -> str:
     })
 
 
+def _stale_index_relationship_hash(item_people) -> str:
+    """Hash exact item ownership and People facts independent of traversal order."""
+    return _alias_proof_snapshot_hash([
+        (
+            str(item_id),
+            str(relationship.get('item_type') or ''),
+            str(relationship.get('library_id') or ''),
+            sorted(
+                (str(person_id), str(person_name))
+                for person_id, person_name in (relationship.get('people') or ())
+            ),
+        )
+        for item_id, relationship in sorted(item_people.items())
+    ])
+
+
 def _build_alias_proof_snapshots(processor):
     """Build all global GET-only evidence before any item can be verified."""
     generation = person_cleanup_db.require_ready_protection_snapshot()
@@ -811,6 +830,283 @@ def task_alias_orphan_readonly_proof(processor, proof_id=None):
             except Exception:
                 logger.error('持久化 Alias Orphan proof 失败状态异常', exc_info=True)
         task_manager.update_status_from_thread(-1, f'Alias Orphan 只读证明失败: {exc}')
+        raise
+
+
+def _build_stale_index_forensic_snapshots(processor):
+    """Build immutable global GET-only evidence for one forensic run."""
+    generation = person_cleanup_db.require_ready_protection_snapshot()
+    contract = person_cleanup_db.get_protection_contract()
+    if int(contract['generation']) != int(generation):
+        raise RuntimeError('保护快照 generation 不一致')
+    protected_libraries = person_cleanup_db.list_protected_libraries()
+    for protected_library in protected_libraries:
+        if (
+            protected_library.get('snapshot_state') != 'ready'
+            or int(protected_library.get('snapshot_generation') or -1) != int(generation)
+        ):
+            raise RuntimeError('至少一个受保护媒体库 snapshot 未在当前 generation 就绪')
+    protected_ids = {
+        str(item.get('library_id') or '').strip()
+        for item in protected_libraries
+        if str(item.get('library_id') or '').strip()
+    }
+    try:
+        libraries = emby.get_all_libraries_with_paths_strict(
+            processor.emby_url,
+            processor.emby_api_key,
+            required_library_ids=protected_ids,
+        )
+    except emby.StrictVirtualFoldersError as exc:
+        raise RuntimeError(f'Stale Index 取证无法启动：VirtualFolder {exc}') from exc
+    library_ids = {
+        str(library.get('info', {}).get('Id') or '').strip()
+        for library in libraries or []
+        if str(library.get('info', {}).get('Id') or '').strip()
+    }
+    if not library_ids or not protected_ids.issubset(library_ids):
+        raise RuntimeError('严格 physical library 列表不完整')
+    root_contract = build_protected_library_root_contract(libraries, protected_libraries)
+    if protected_ids and not root_contract.get('complete'):
+        raise RuntimeError('受保护媒体库 root contract 不完整')
+
+    normal_scan = emby.get_referenced_person_ids_strict(
+        processor.emby_url,
+        processor.emby_api_key,
+        sorted(library_ids - protected_ids),
+        require_person_names=True,
+        capture_item_people=True,
+    )
+    if normal_scan is None:
+        raise RuntimeError('normal People relationship snapshot 不完整')
+    normal_ids = {str(value) for value in normal_scan['person_ids']}
+    item_people = normal_scan.get('item_people')
+    if not isinstance(item_people, dict):
+        raise RuntimeError('normal item People relationship snapshot 缺失')
+
+    person_details = emby.get_all_person_details_snapshot_strict(
+        processor.emby_url,
+        processor.emby_api_key,
+    )
+    if person_details is None:
+        raise RuntimeError('全量 Person identity snapshot 不完整')
+    identity_index = defaultdict(set)
+    for person_id, detail in sorted(person_details.items()):
+        try:
+            identities = canonical_person_provider_identities(
+                detail.get('ProviderIds'), strict=True,
+            )
+        except ValueError:
+            identities = set()
+        for identity in identities:
+            identity_index[identity].add(person_id)
+
+    normal_people_relationship_hash = _stale_index_relationship_hash(item_people)
+    person_hash = _alias_proof_snapshot_hash([
+        (person_id, str(detail.get('Name') or ''), detail.get('ProviderIds') or {})
+        for person_id, detail in sorted(person_details.items())
+    ])
+    if person_cleanup_db.require_ready_protection_snapshot() != generation:
+        raise RuntimeError('保护快照 generation 在全局 snapshot 构建期间漂移')
+    return {
+        'generation': generation,
+        'contract': contract,
+        'root_contract': root_contract,
+        'protection_hash': _alias_proof_protection_hash(contract, root_contract),
+        'normal_ids': normal_ids,
+        'item_people': item_people,
+        'normal_people_relationship_hash': normal_people_relationship_hash,
+        'person_details': person_details,
+        'person_hash': person_hash,
+        'identity_index': dict(identity_index),
+        'media_count': int(normal_scan.get('media_count') or 0),
+    }
+
+
+def _check_stale_index_forensic_candidate(processor, source_item, snapshots):
+    person_id = str(source_item.get('person_id') or '').strip()
+    current_rows = person_cleanup_db.get_candidates_by_ids(
+        [person_id], include_protected=True,
+    )
+    current = current_rows[0] if current_rows else None
+    detail_result = emby.get_person_detail_forensic_strict(
+        processor.emby_url,
+        processor.emby_api_key,
+        person_id,
+    )
+    query_items = emby.get_person_media_query_items_strict(
+        processor.emby_url,
+        processor.emby_api_key,
+        person_id,
+    )
+    refreshed_rows = person_cleanup_db.get_candidates_by_ids(
+        [person_id], include_protected=True,
+    )
+    current = refreshed_rows[0] if refreshed_rows else None
+    protection_reason = (
+        person_cleanup_db.candidate_protection_reason(current, snapshots['contract'])
+        if current else None
+    )
+    return classify_stale_index_forensic(
+        source_item,
+        current,
+        detail_result,
+        snapshots['normal_ids'],
+        snapshots['item_people'],
+        snapshots['identity_index'],
+        query_items,
+        snapshots['root_contract'],
+        protection_reason=protection_reason,
+    )
+
+
+def task_stale_index_readonly_forensic(processor, run_id=None):
+    """Run persistent stale PersonIds forensic using Emby GET only."""
+    task_manager.update_status_from_thread(0, 'Stale Index 只读取证：构建完整关系快照...')
+    active_run_id = str(run_id or '').strip() or None
+    try:
+        existing_run = person_cleanup_db.get_stale_index_run(active_run_id) if active_run_id else None
+        if active_run_id and not existing_run:
+            raise RuntimeError('Stale Index 只读取证任务不存在')
+        source = (
+            {'proof_id': existing_run['source_proof_id']}
+            if existing_run else person_cleanup_db.get_latest_completed_alias_proof_source()
+        )
+        if not source:
+            raise RuntimeError('没有 completed Alias Proof 可作为 identity_not_found source')
+        snapshots = _build_stale_index_forensic_snapshots(processor)
+        if active_run_id:
+            run = person_cleanup_db.resume_stale_index_run(
+                active_run_id,
+                snapshots['generation'],
+                snapshots['protection_hash'],
+                snapshots['normal_people_relationship_hash'],
+                snapshots['person_hash'],
+            )
+            person_cleanup_db.requeue_changed_stale_index_items(
+                active_run_id,
+                person_cleanup_db.list_candidates_raw(),
+            )
+            run = person_cleanup_db.get_stale_index_run(active_run_id) or run
+        else:
+            run = person_cleanup_db.create_stale_index_run(
+                source['proof_id'],
+                snapshots['generation'],
+                snapshots['protection_hash'],
+                snapshots['normal_people_relationship_hash'],
+                snapshots['person_hash'],
+            )
+            active_run_id = str(run['run_id'])
+        total = int(run.get('candidate_total') or 0)
+
+        with ThreadPoolExecutor(
+            max_workers=PERSON_STALE_INDEX_WORKERS,
+            thread_name_prefix='person-stale-index',
+        ) as executor:
+            while True:
+                if (
+                    processor.is_stop_requested()
+                    or person_cleanup_db.stale_index_stop_requested(active_run_id)
+                ):
+                    person_cleanup_db.stop_stale_index_run(active_run_id)
+                    task_manager.update_status_from_thread(
+                        100,
+                        'Stale Index 只读取证已中止；已完成结果保留，未完成项可继续。',
+                    )
+                    return
+                if person_cleanup_db.require_ready_protection_snapshot() != snapshots['generation']:
+                    person_cleanup_db.fail_stale_index_run(
+                        active_run_id,
+                        '保护快照 generation 漂移，全部 signature 已失败关闭',
+                        stale=True,
+                    )
+                    return
+                claimed = person_cleanup_db.claim_stale_index_items(
+                    active_run_id,
+                    limit=PERSON_STALE_INDEX_CLAIM_LIMIT,
+                )
+                if not claimed:
+                    if person_cleanup_db.stale_index_stop_requested(active_run_id):
+                        person_cleanup_db.stop_stale_index_run(active_run_id)
+                        return
+                    final_snapshots = _build_stale_index_forensic_snapshots(processor)
+                    if (
+                        final_snapshots['generation'] != snapshots['generation']
+                        or final_snapshots['protection_hash'] != snapshots['protection_hash']
+                        or final_snapshots['normal_people_relationship_hash']
+                           != snapshots['normal_people_relationship_hash']
+                        or final_snapshots['person_hash'] != snapshots['person_hash']
+                    ):
+                        person_cleanup_db.fail_stale_index_run(
+                            active_run_id,
+                            '全局 relationship/protection/Person snapshot 漂移，全部 signature 已失败关闭',
+                            stale=True,
+                        )
+                        return
+                    final = person_cleanup_db.complete_stale_index_run(
+                        active_run_id,
+                        snapshots['generation'],
+                        snapshots['protection_hash'],
+                        snapshots['normal_people_relationship_hash'],
+                        snapshots['person_hash'],
+                    )
+                    task_manager.update_status_from_thread(
+                        100,
+                        f"Stale Index 只读取证完成：{final.get('checked_count', 0)}/{total}；"
+                        f"signature {final.get('verified_signature_count', 0)}；"
+                        f"stable {final.get('stable_signature_count', 0)}。"
+                        '仅取证，不删除人物。',
+                    )
+                    return
+
+                futures = {
+                    executor.submit(
+                        _check_stale_index_forensic_candidate,
+                        processor,
+                        item,
+                        snapshots,
+                    ): item
+                    for item in claimed
+                }
+                for future in as_completed(futures):
+                    item = futures[future]
+                    try:
+                        outcome = future.result()
+                    except Exception as exc:
+                        logger.error(
+                            'Stale Index 只读取证失败 person_id=%s error=%s',
+                            item.get('person_id'), type(exc).__name__,
+                        )
+                        outcome = {
+                            'forensic_state': 'failed_safe',
+                            'error': f'只读取证异常: {type(exc).__name__}',
+                        }
+                    person_cleanup_db.finish_stale_index_item(
+                        active_run_id,
+                        item['person_id'],
+                        outcome,
+                    )
+                current = person_cleanup_db.get_stale_index_run(active_run_id) or {}
+                checked = int(current.get('checked_count') or 0)
+                progress = int((checked / max(1, total)) * 100)
+                task_manager.update_status_from_thread(
+                    progress,
+                    f"Stale Index 只读取证 {checked}/{total}；"
+                    f"signature {current.get('verified_signature_count', 0)}；"
+                    f"stable {current.get('stable_signature_count', 0)}；"
+                    'GET-only，不删除人物。',
+                )
+    except Exception as exc:
+        if active_run_id:
+            try:
+                person_cleanup_db.fail_stale_index_run(
+                    active_run_id,
+                    str(exc),
+                    stale='snapshot' in str(exc).lower() or 'generation' in str(exc).lower(),
+                )
+            except Exception:
+                logger.error('持久化 Stale Index forensic 失败状态异常', exc_info=True)
+        task_manager.update_status_from_thread(-1, f'Stale Index 只读取证失败: {exc}')
         raise
 
 

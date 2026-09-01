@@ -46,6 +46,23 @@ ALIAS_PROOF_REJECTED_STATES = {
     'linked', 'identity_unavailable', 'identity_not_found', 'identity_ambiguous',
 }
 
+STALE_INDEX_FORENSIC_STATES = {
+    'verified_stale_index_signature',
+    'stable_stale_index_signature',
+    'query_disappeared',
+    'linked',
+    'protected',
+    'people_unavailable',
+    'candidate_changed',
+    'person_missing',
+    'identity_owner_live',
+    'failed_safe',
+}
+STALE_INDEX_SIGNATURE_STATES = {
+    'verified_stale_index_signature',
+    'stable_stale_index_signature',
+}
+
 def _exclude_protected_candidates(candidates: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     protected_ids = get_protected_person_ids()
     protected_ids.update(get_protected_alias_statuses())
@@ -958,6 +975,711 @@ def get_alias_proof_summary(proof_id: str) -> Dict[str, Any]:
     run['items_total'] = sum(int(row['count']) for row in states)
     run['consistent'] = run['items_total'] == int(run.get('candidate_total') or 0)
     return run
+
+
+def get_latest_completed_alias_proof_source() -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT runs.*
+                FROM person_cleanup_alias_proof_runs runs
+                WHERE runs.state = 'completed'
+                  AND runs.checked_count = runs.candidate_total
+                ORDER BY runs.completed_at DESC NULLS LAST, runs.proof_id DESC
+                LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+
+def _require_complete_alias_proof_source(cursor, source_proof_id: str) -> Dict[str, Any]:
+    """Lock and validate the immutable Alias Proof source contract."""
+    cursor.execute(
+        """
+        SELECT state, candidate_total, checked_count,
+               verified_alias_orphan_count, protected_count,
+               rejected_count, failed_count
+        FROM person_cleanup_alias_proof_runs
+        WHERE proof_id = %s
+        FOR SHARE
+        """,
+        (str(source_proof_id),),
+    )
+    source = cursor.fetchone()
+    if not source or source['state'] != 'completed':
+        raise RuntimeError('Alias Proof source 不是 completed')
+    cursor.execute(
+        """
+        SELECT COUNT(*)::INTEGER AS items_total,
+               COUNT(*) FILTER (
+                   WHERE proof_state IN ('pending', 'checking')
+               )::INTEGER AS pending,
+               COUNT(*) FILTER (
+                   WHERE NOT (proof_state = ANY(%s))
+               )::INTEGER AS unknown,
+               COUNT(*) FILTER (
+                   WHERE proof_state = 'identity_not_found'
+               )::INTEGER AS source_total,
+               COUNT(*) FILTER (
+                   WHERE proof_state = 'verified_alias_orphan'
+               )::INTEGER AS verified_count,
+               COUNT(*) FILTER (
+                   WHERE proof_state = 'protected'
+               )::INTEGER AS protected_count,
+               COUNT(*) FILTER (
+                   WHERE proof_state = ANY(%s)
+               )::INTEGER AS rejected_count,
+               COUNT(*) FILTER (
+                   WHERE proof_state = ANY(%s)
+               )::INTEGER AS failed_count
+        FROM person_cleanup_alias_proof_items
+        WHERE proof_id = %s
+        """,
+        (
+            sorted(ALIAS_PROOF_STATES | {'pending', 'checking'}),
+            sorted(ALIAS_PROOF_REJECTED_STATES),
+            sorted(ALIAS_PROOF_FAILED_STATES),
+            str(source_proof_id),
+        ),
+    )
+    counts = cursor.fetchone()
+    expected = int(source['candidate_total'] or 0)
+    if (
+        int(source['checked_count'] or 0) != expected
+        or int(counts['items_total'] or 0) != expected
+        or int(counts['pending'] or 0)
+        or int(counts['unknown'] or 0)
+        or int(counts['verified_count'] or 0)
+           != int(source['verified_alias_orphan_count'] or 0)
+        or int(counts['protected_count'] or 0) != int(source['protected_count'] or 0)
+        or int(counts['rejected_count'] or 0) != int(source['rejected_count'] or 0)
+        or int(counts['failed_count'] or 0) != int(source['failed_count'] or 0)
+    ):
+        raise RuntimeError('Alias Proof source summary 不完整或不一致')
+    cursor.execute(
+        """
+        SELECT person_id, person_name, candidate_fingerprint,
+               candidate_provider_ids, proof_state
+        FROM person_cleanup_alias_proof_items
+        WHERE proof_id = %s
+        ORDER BY person_id ASC
+        """,
+        (str(source_proof_id),),
+    )
+    source_rows = [dict(row) for row in cursor.fetchall()]
+    source_hash = hashlib.sha256(json.dumps(
+        source_rows,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')).hexdigest()
+    return {
+        'candidate_total': expected,
+        'source_total': int(counts['source_total'] or 0),
+        'source_proof_hash': source_hash,
+    }
+
+
+def create_stale_index_run(
+    source_proof_id: str,
+    snapshot_generation: int,
+    protection_hash: str,
+    normal_people_relationship_hash: str,
+    person_snapshot_hash: str,
+) -> Dict[str, Any]:
+    """Create a new GET-only run from completed identity_not_found evidence."""
+    run_id = str(uuid.uuid4())
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            source = _require_complete_alias_proof_source(cursor, source_proof_id)
+            source_total = source['source_total']
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_index_runs
+                SET state = 'superseded', completed_at = COALESCE(completed_at, NOW()),
+                    updated_at = NOW()
+                WHERE state IN ('running', 'stopped', 'interrupted', 'stop_requested')
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO person_cleanup_stale_index_runs (
+                    run_id, source_proof_id, source_proof_hash, state, snapshot_generation,
+                    protection_hash, normal_people_relationship_hash,
+                    person_snapshot_hash, candidate_total
+                ) VALUES (%s, %s, %s, 'running', %s, %s, %s, %s, %s)
+                """,
+                (
+                    run_id, str(source_proof_id), source['source_proof_hash'],
+                    int(snapshot_generation),
+                    str(protection_hash), str(normal_people_relationship_hash),
+                    str(person_snapshot_hash), source_total,
+                ),
+            )
+            cursor.execute(
+                """
+                INSERT INTO person_cleanup_stale_index_items (
+                    run_id, person_id, person_name, candidate_fingerprint,
+                    provider_ids, source_proof_state, forensic_state
+                )
+                SELECT %s, person_id, person_name, candidate_fingerprint,
+                       candidate_provider_ids, proof_state, 'pending'
+                FROM person_cleanup_alias_proof_items
+                WHERE proof_id = %s AND proof_state = 'identity_not_found'
+                ORDER BY person_id ASC
+                """,
+                (run_id, str(source_proof_id)),
+            )
+            if cursor.rowcount != source_total:
+                raise RuntimeError('identity_not_found source 项目复制不完整')
+    return get_stale_index_run(run_id)
+
+
+def get_stale_index_run(run_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            if run_id:
+                cursor.execute(
+                    "SELECT * FROM person_cleanup_stale_index_runs WHERE run_id = %s",
+                    (str(run_id),),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT * FROM person_cleanup_stale_index_runs
+                    ORDER BY forensic_generation DESC, run_id DESC LIMIT 1
+                    """
+                )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+
+def resume_stale_index_run(
+    run_id: str,
+    snapshot_generation: int,
+    protection_hash: str,
+    normal_people_relationship_hash: str,
+    person_snapshot_hash: str,
+) -> Dict[str, Any]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT source_proof_id, source_proof_hash
+                FROM person_cleanup_stale_index_runs
+                WHERE run_id = %s AND state IN ('stopped', 'interrupted')
+                FOR UPDATE
+                """,
+                (str(run_id),),
+            )
+            existing = cursor.fetchone()
+            if not existing:
+                raise RuntimeError('取证 run 当前不可继续')
+            source = _require_complete_alias_proof_source(
+                cursor, existing['source_proof_id'],
+            )
+            if source['source_proof_hash'] != existing['source_proof_hash']:
+                raise RuntimeError('Alias Proof source 已变化，不能继续旧 run')
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_index_runs
+                SET state = 'running', stop_requested = FALSE, last_error = NULL,
+                    updated_at = NOW()
+                WHERE run_id = %s
+                  AND state IN ('stopped', 'interrupted')
+                  AND snapshot_generation = %s
+                  AND protection_hash = %s
+                  AND normal_people_relationship_hash = %s
+                  AND person_snapshot_hash = %s
+                RETURNING run_id
+                """,
+                (
+                    str(run_id), int(snapshot_generation), str(protection_hash),
+                    str(normal_people_relationship_hash), str(person_snapshot_hash),
+                ),
+            )
+            if not cursor.fetchone():
+                raise RuntimeError('取证 snapshot 已变化，不能继续旧 run')
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_index_items
+                SET forensic_state = 'pending', error = NULL
+                WHERE run_id = %s AND forensic_state = 'checking'
+                """,
+                (str(run_id),),
+            )
+    return get_stale_index_run(run_id)
+
+
+def requeue_changed_stale_index_items(
+    run_id: str,
+    current_candidates: Iterable[Dict[str, Any]],
+) -> int:
+    current = {
+        str(item.get('person_id') or ''): item
+        for item in current_candidates if str(item.get('person_id') or '')
+    }
+    changed = 0
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT person_id, candidate_fingerprint, forensic_state
+                FROM person_cleanup_stale_index_items
+                WHERE run_id = %s AND forensic_state NOT IN ('pending', 'checking')
+                """,
+                (str(run_id),),
+            )
+            for row in cursor.fetchall():
+                candidate = current.get(str(row['person_id']))
+                matches = bool(
+                    candidate
+                    and candidate_fingerprint(candidate) == row['candidate_fingerprint']
+                )
+                should_requeue = (
+                    (not matches and row['forensic_state'] != 'candidate_changed')
+                    or (matches and row['forensic_state'] == 'candidate_changed')
+                )
+                if not should_requeue:
+                    continue
+                cursor.execute(
+                    """
+                    UPDATE person_cleanup_stale_index_items
+                    SET forensic_state = 'pending', identity_signal = NULL,
+                        people_signal = NULL, query_count = 0,
+                        actual_people_count = 0, same_name_other_count = 0,
+                        different_name_people_count = 0, identity_owner_count = 0,
+                        stable_pass_count = 0, error = NULL, checked_at = NULL
+                    WHERE run_id = %s AND person_id = %s
+                    """,
+                    (str(run_id), str(row['person_id'])),
+                )
+                changed += cursor.rowcount
+            _refresh_stale_index_run_counts(cursor, run_id)
+    return changed
+
+
+def claim_stale_index_items(run_id: str, limit: int = 4) -> List[Dict[str, Any]]:
+    safe_limit = max(1, min(int(limit), 4))
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT state, stop_requested FROM person_cleanup_stale_index_runs
+                WHERE run_id = %s FOR UPDATE
+                """,
+                (str(run_id),),
+            )
+            run = cursor.fetchone()
+            if not run or run['state'] != 'running' or run['stop_requested']:
+                return []
+            cursor.execute(
+                """
+                WITH claimed AS (
+                    SELECT person_id FROM person_cleanup_stale_index_items
+                    WHERE run_id = %s AND forensic_state = 'pending'
+                    ORDER BY person_id ASC
+                    FOR UPDATE SKIP LOCKED LIMIT %s
+                )
+                UPDATE person_cleanup_stale_index_items items
+                SET forensic_state = 'checking', error = NULL
+                FROM claimed
+                WHERE items.run_id = %s AND items.person_id = claimed.person_id
+                RETURNING items.*
+                """,
+                (str(run_id), safe_limit, str(run_id)),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
+def _refresh_stale_index_run_counts(cursor, run_id: str) -> None:
+    cursor.execute(
+        """
+        UPDATE person_cleanup_stale_index_runs runs
+        SET checked_count = counts.checked_count,
+            verified_signature_count = counts.verified_count,
+            stable_signature_count = counts.stable_count,
+            updated_at = NOW()
+        FROM (
+            SELECT
+                COUNT(*) FILTER (WHERE forensic_state NOT IN ('pending', 'checking'))::INTEGER AS checked_count,
+                COUNT(*) FILTER (WHERE forensic_state = ANY(%s))::INTEGER AS verified_count,
+                COUNT(*) FILTER (WHERE forensic_state = 'stable_stale_index_signature')::INTEGER AS stable_count
+            FROM person_cleanup_stale_index_items WHERE run_id = %s
+        ) counts
+        WHERE runs.run_id = %s
+        """,
+        (sorted(STALE_INDEX_SIGNATURE_STATES), str(run_id), str(run_id)),
+    )
+
+
+def finish_stale_index_item(
+    run_id: str,
+    person_id: str,
+    outcome: Dict[str, Any],
+) -> bool:
+    state = str(outcome.get('forensic_state') or '')
+    if state not in STALE_INDEX_FORENSIC_STATES:
+        raise ValueError(f'不支持的 stale-index forensic 状态: {state}')
+    stable_pass_count = int(state == 'verified_stale_index_signature')
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT forensic_generation FROM person_cleanup_stale_index_runs
+                WHERE run_id = %s AND state IN ('running', 'stop_requested')
+                FOR UPDATE
+                """,
+                (str(run_id),),
+            )
+            current_run = cursor.fetchone()
+            if not current_run:
+                return False
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_index_items
+                SET forensic_state = %s, identity_signal = %s, people_signal = %s,
+                    query_count = %s, actual_people_count = %s,
+                    same_name_other_count = %s,
+                    different_name_people_count = %s, identity_owner_count = %s,
+                    stable_pass_count = %s, error = %s, checked_at = NOW()
+                WHERE run_id = %s AND person_id = %s AND forensic_state = 'checking'
+                RETURNING person_id
+                """,
+                (
+                    state, outcome.get('identity_signal'), outcome.get('people_signal'),
+                    max(0, int(outcome.get('query_count') or 0)),
+                    max(0, int(outcome.get('actual_people_count') or 0)),
+                    max(0, int(outcome.get('same_name_other_count') or 0)),
+                    max(0, int(outcome.get('different_name_people_count') or 0)),
+                    max(0, int(outcome.get('identity_owner_count') or 0)),
+                    stable_pass_count,
+                    str(outcome.get('error'))[:4000] if outcome.get('error') else None,
+                    str(run_id), str(person_id),
+                ),
+            )
+            if not cursor.fetchone():
+                return False
+            _refresh_stale_index_run_counts(cursor, run_id)
+    return True
+
+
+def request_stale_index_stop(run_id: str) -> bool:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_index_runs
+                SET stop_requested = TRUE, state = 'stop_requested', updated_at = NOW()
+                WHERE run_id = %s AND state = 'running' RETURNING run_id
+                """,
+                (str(run_id),),
+            )
+            return bool(cursor.fetchone())
+
+
+def stale_index_stop_requested(run_id: str) -> bool:
+    run = get_stale_index_run(run_id)
+    return bool(not run or run.get('stop_requested') or run.get('state') != 'running')
+
+
+def stop_stale_index_run(run_id: str) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_index_items SET forensic_state = 'pending', error = NULL
+                WHERE run_id = %s AND forensic_state = 'checking'
+                """,
+                (str(run_id),),
+            )
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_index_runs
+                SET state = 'stopped', stop_requested = FALSE, updated_at = NOW()
+                WHERE run_id = %s AND state IN ('running', 'stop_requested')
+                """,
+                (str(run_id),),
+            )
+
+
+def fail_stale_index_run(run_id: str, error: str, stale: bool = False) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_index_items
+                SET forensic_state = 'failed_safe', stable_pass_count = 0,
+                    error = %s, checked_at = NOW()
+                WHERE run_id = %s
+                  AND forensic_state IN ('pending', 'checking',
+                    'verified_stale_index_signature', 'stable_stale_index_signature')
+                """,
+                (str(error)[:4000], str(run_id)),
+            )
+            _refresh_stale_index_run_counts(cursor, run_id)
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_index_runs
+                SET state = %s, completed_at = NOW(), updated_at = NOW(),
+                    last_error = %s, verified_signature_count = 0,
+                    stable_signature_count = 0
+                WHERE run_id = %s
+                """,
+                ('stale' if stale else 'failed', str(error)[:4000], str(run_id)),
+            )
+
+
+def complete_stale_index_run(
+    run_id: str,
+    snapshot_generation: int,
+    protection_hash: str,
+    normal_people_relationship_hash: str,
+    person_snapshot_hash: str,
+) -> Dict[str, Any]:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT forensic_generation, source_proof_id, source_proof_hash, state,
+                       snapshot_generation, protection_hash,
+                       normal_people_relationship_hash, person_snapshot_hash
+                FROM person_cleanup_stale_index_runs
+                WHERE run_id = %s
+                FOR UPDATE
+                """,
+                (str(run_id),),
+            )
+            current_run = cursor.fetchone()
+            if (
+                not current_run or current_run['state'] != 'running'
+                or int(current_run['snapshot_generation']) != int(snapshot_generation)
+                or current_run['protection_hash'] != str(protection_hash)
+                or current_run['normal_people_relationship_hash']
+                   != str(normal_people_relationship_hash)
+                or current_run['person_snapshot_hash'] != str(person_snapshot_hash)
+            ):
+                raise RuntimeError('stale-index forensic run 状态或 snapshot hash 已变化')
+            source = _require_complete_alias_proof_source(
+                cursor, current_run['source_proof_id'],
+            )
+            if source['source_proof_hash'] != current_run['source_proof_hash']:
+                raise RuntimeError('Alias Proof source 已变化，禁止完成 stale-index run')
+            cursor.execute(
+                """
+                SELECT generation, snapshot_state FROM person_cleanup_protection_state
+                WHERE singleton = TRUE
+                """
+            )
+            protection = cursor.fetchone()
+            if (
+                not protection or protection['snapshot_state'] != 'ready'
+                or int(protection['generation']) != int(snapshot_generation)
+            ):
+                raise RuntimeError('保护快照 generation 已漂移')
+            cursor.execute(
+                """
+                SELECT runs.candidate_total, runs.checked_count,
+                       COUNT(items.person_id)::INTEGER AS items_total,
+                       COUNT(items.person_id) FILTER (
+                         WHERE items.forensic_state IN ('pending', 'checking')
+                       )::INTEGER AS pending,
+                       COUNT(items.person_id) FILTER (
+                         WHERE NOT (items.forensic_state = ANY(%s))
+                       )::INTEGER AS unknown
+                FROM person_cleanup_stale_index_runs runs
+                LEFT JOIN person_cleanup_stale_index_items items ON items.run_id = runs.run_id
+                WHERE runs.run_id = %s
+                GROUP BY runs.candidate_total, runs.checked_count
+                """,
+                (sorted(STALE_INDEX_FORENSIC_STATES | {'pending', 'checking'}), str(run_id)),
+            )
+            counts = cursor.fetchone()
+            if not counts:
+                raise RuntimeError('stale-index forensic run 不存在')
+            expected = int(counts['candidate_total'] or 0)
+            if (
+                int(counts['pending'] or 0) or int(counts['unknown'] or 0)
+                or int(counts['items_total'] or 0) != expected
+                or int(counts['checked_count'] or 0) != expected
+            ):
+                raise RuntimeError('stale-index forensic 项目状态或计数不完整')
+            cursor.execute(
+                """
+                SELECT run_id, source_proof_id, source_proof_hash
+                FROM person_cleanup_stale_index_runs
+                WHERE state = 'completed' AND forensic_generation < %s
+                ORDER BY forensic_generation DESC
+                LIMIT 1
+                """,
+                (int(current_run['forensic_generation']),),
+            )
+            previous_run = cursor.fetchone()
+            if previous_run:
+                try:
+                    previous_source = _require_complete_alias_proof_source(
+                        cursor, previous_run['source_proof_id'],
+                    )
+                except RuntimeError:
+                    previous_run = None
+                else:
+                    if previous_source['source_proof_hash'] != previous_run['source_proof_hash']:
+                        previous_run = None
+            if previous_run:
+                cursor.execute(
+                    """
+                    UPDATE person_cleanup_stale_index_items current_items
+                    SET forensic_state = 'stable_stale_index_signature',
+                        stable_pass_count = 2
+                    FROM person_cleanup_stale_index_items previous_items
+                    WHERE current_items.run_id = %s
+                      AND current_items.forensic_state = 'verified_stale_index_signature'
+                      AND current_items.stable_pass_count = 1
+                      AND previous_items.run_id = %s
+                      AND previous_items.person_id = current_items.person_id
+                      AND previous_items.candidate_fingerprint = current_items.candidate_fingerprint
+                      AND previous_items.forensic_state = ANY(%s)
+                      AND previous_items.stable_pass_count >= 1
+                    """,
+                    (
+                        str(run_id), str(previous_run['run_id']),
+                        sorted(STALE_INDEX_SIGNATURE_STATES),
+                    ),
+                )
+            _refresh_stale_index_run_counts(cursor, run_id)
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_index_runs
+                SET state = 'completed', completed_at = NOW(), updated_at = NOW()
+                WHERE run_id = %s AND state = 'running'
+                  AND snapshot_generation = %s AND checked_count = candidate_total
+                  AND protection_hash = %s
+                  AND normal_people_relationship_hash = %s
+                  AND person_snapshot_hash = %s
+                RETURNING run_id
+                """,
+                (
+                    str(run_id), int(snapshot_generation), str(protection_hash),
+                    str(normal_people_relationship_hash), str(person_snapshot_hash),
+                ),
+            )
+            if not cursor.fetchone():
+                raise RuntimeError('stale-index forensic run 状态已变化')
+    return get_stale_index_run(run_id)
+
+
+def get_stale_index_summary(run_id: str) -> Dict[str, Any]:
+    run = get_stale_index_run(run_id)
+    if not run:
+        raise KeyError('stale-index forensic run 不存在')
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT forensic_state, COUNT(*)::INTEGER AS count
+                FROM person_cleanup_stale_index_items WHERE run_id = %s
+                GROUP BY forensic_state ORDER BY count DESC, forensic_state ASC
+                """,
+                (str(run_id),),
+            )
+            states = [dict(row) for row in cursor.fetchall()]
+            cursor.execute(
+                """
+                SELECT identity_signal AS signal, COUNT(*)::INTEGER AS count
+                FROM person_cleanup_stale_index_items
+                WHERE run_id = %s AND identity_signal IS NOT NULL
+                GROUP BY identity_signal ORDER BY count DESC, identity_signal ASC
+                """,
+                (str(run_id),),
+            )
+            identity_signals = [dict(row) for row in cursor.fetchall()]
+            cursor.execute(
+                """
+                SELECT people_signal AS signal, COUNT(*)::INTEGER AS count
+                FROM person_cleanup_stale_index_items
+                WHERE run_id = %s AND people_signal IS NOT NULL
+                GROUP BY people_signal ORDER BY count DESC, people_signal ASC
+                """,
+                (str(run_id),),
+            )
+            people_signals = [dict(row) for row in cursor.fetchall()]
+            cursor.execute(
+                """
+                SELECT query_count AS value, COUNT(*)::INTEGER AS count
+                FROM person_cleanup_stale_index_items
+                WHERE run_id = %s AND forensic_state NOT IN ('pending', 'checking')
+                GROUP BY query_count ORDER BY query_count ASC
+                """,
+                (str(run_id),),
+            )
+            query_distribution = [dict(row) for row in cursor.fetchall()]
+            cursor.execute(
+                """
+                SELECT actual_people_count AS value, COUNT(*)::INTEGER AS count
+                FROM person_cleanup_stale_index_items
+                WHERE run_id = %s AND forensic_state NOT IN ('pending', 'checking')
+                GROUP BY actual_people_count ORDER BY actual_people_count ASC
+                """,
+                (str(run_id),),
+            )
+            people_distribution = [dict(row) for row in cursor.fetchall()]
+    run.update({
+        'states': states,
+        'identity_signals': identity_signals,
+        'people_signals': people_signals,
+        'query_count_distribution': query_distribution,
+        'actual_people_count_distribution': people_distribution,
+        'items_total': sum(int(row['count']) for row in states),
+    })
+    run['consistent'] = run['items_total'] == int(run.get('candidate_total') or 0)
+    return run
+
+
+def list_stale_index_items(
+    run_id: str,
+    value: str,
+    *,
+    dimension: str = 'forensic_state',
+    page: int = 1,
+    page_size: int = 20,
+) -> Dict[str, Any]:
+    columns = {
+        'forensic_state': 'forensic_state',
+        'identity_signal': 'identity_signal',
+        'people_signal': 'people_signal',
+    }
+    column = columns.get(str(dimension))
+    if not column:
+        raise ValueError('不支持的 stale-index sample dimension')
+    safe_page = max(1, int(page))
+    safe_size = max(1, min(100, int(page_size)))
+    offset = (safe_page - 1) * safe_size
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"SELECT COUNT(*)::INTEGER AS total FROM person_cleanup_stale_index_items "
+                f"WHERE run_id = %s AND {column} = %s",
+                (str(run_id), str(value)),
+            )
+            total = int(cursor.fetchone()['total'] or 0)
+            cursor.execute(
+                f"""
+                SELECT person_id, person_name, provider_ids, source_proof_state,
+                       forensic_state, identity_signal, people_signal,
+                       query_count, actual_people_count, same_name_other_count,
+                       different_name_people_count, identity_owner_count,
+                       stable_pass_count, error, checked_at
+                FROM person_cleanup_stale_index_items
+                WHERE run_id = %s AND {column} = %s
+                ORDER BY person_name ASC NULLS LAST, person_id ASC
+                LIMIT %s OFFSET %s
+                """,
+                (str(run_id), str(value), safe_size, offset),
+            )
+            items = [dict(row) for row in cursor.fetchall()]
+    return {'items': items, 'total': total, 'page': safe_page, 'page_size': safe_size}
 
 
 def list_candidates() -> List[Dict[str, Any]]:

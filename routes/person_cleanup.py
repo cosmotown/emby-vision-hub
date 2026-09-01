@@ -21,6 +21,7 @@ from tasks.actors import (
     task_execute_safe_person_cleanup,
     task_preview_safe_person_cleanup,
     task_scan_ghost_actor_candidates,
+    task_stale_index_readonly_forensic,
 )
 
 
@@ -174,6 +175,91 @@ def get_alias_orphan_proof_items(proof_id):
 def stop_alias_orphan_proof(proof_id):
     if not person_cleanup_db.request_alias_proof_stop(proof_id):
         return jsonify({'error': '只读证明未运行或状态已变化'}), 409
+    return jsonify({'message': '已请求安全停止；当前 bounded GET 将完成后停止'})
+
+
+@person_cleanup_bp.route('/stale-index-runs', methods=['POST'])
+@admin_required
+@task_lock_required
+@processor_ready_required
+def start_stale_index_forensic():
+    payload = request.get_json(silent=True) or {}
+    run_id = str(payload.get('run_id') or '').strip() or None
+    if run_id:
+        run = person_cleanup_db.get_stale_index_run(run_id)
+        if not run:
+            return jsonify({'error': 'Stale Index 只读取证任务不存在'}), 404
+        if run.get('state') not in {'stopped', 'interrupted'}:
+            return jsonify({'error': '该 Stale Index 只读取证当前不可继续'}), 409
+    submitted = task_manager.submit_task(
+        task_stale_index_readonly_forensic,
+        'Stale Index 只读取证',
+        'media',
+        run_id,
+    )
+    if not submitted:
+        return jsonify({'error': 'Stale Index 只读取证提交失败，可能已有后台任务运行'}), 409
+    return jsonify({
+        'message': 'Stale Index 只读取证已提交；只执行 Emby GET，不会删除人物',
+        'run_id': run_id,
+    }), 202
+
+
+def _stale_index_response(run_id=None):
+    run = person_cleanup_db.get_stale_index_summary(run_id) if run_id else None
+    if run is None:
+        latest = person_cleanup_db.get_stale_index_run()
+        if latest:
+            run = person_cleanup_db.get_stale_index_summary(latest['run_id'])
+    return run
+
+
+@person_cleanup_bp.route('/stale-index-runs/latest', methods=['GET'])
+@admin_required
+def get_latest_stale_index_forensic():
+    try:
+        return jsonify({'run': _stale_index_response()})
+    except KeyError:
+        return jsonify({'run': None})
+
+
+@person_cleanup_bp.route('/stale-index-runs/<run_id>', methods=['GET'])
+@admin_required
+def get_stale_index_forensic(run_id):
+    try:
+        return jsonify({'run': person_cleanup_db.get_stale_index_summary(run_id)})
+    except KeyError:
+        return jsonify({'error': 'Stale Index 只读取证任务不存在'}), 404
+
+
+@person_cleanup_bp.route('/stale-index-runs/<run_id>/items', methods=['GET'])
+@admin_required
+def get_stale_index_forensic_items(run_id):
+    if not person_cleanup_db.get_stale_index_run(run_id):
+        return jsonify({'error': 'Stale Index 只读取证任务不存在'}), 404
+    value = str(request.args.get('state') or '').strip()
+    dimension = str(request.args.get('dimension') or 'forensic_state').strip()
+    if not value:
+        return jsonify({'error': 'state 不能为空'}), 400
+    try:
+        page = int(request.args.get('page', 1))
+        page_size = int(request.args.get('page_size', 20))
+        return jsonify(person_cleanup_db.list_stale_index_items(
+            run_id,
+            value,
+            dimension=dimension,
+            page=page,
+            page_size=page_size,
+        ))
+    except (TypeError, ValueError) as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
+@person_cleanup_bp.route('/stale-index-runs/<run_id>/stop', methods=['POST'])
+@admin_required
+def stop_stale_index_forensic(run_id):
+    if not person_cleanup_db.request_stale_index_stop(run_id):
+        return jsonify({'error': 'Stale Index 只读取证未运行或状态已变化'}), 409
     return jsonify({'message': '已请求安全停止；当前 bounded GET 将完成后停止'})
 
 

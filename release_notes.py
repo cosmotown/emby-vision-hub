@@ -2,6 +2,28 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.24",
+        "published_at": "2026-09-02T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.24",
+        "changelog": """## Person Cleanup Stale Index Orphan 只读取证
+
+- 新增对 Alias Orphan proof 中 `identity_not_found` 人物的进一步只读分析：PersonIds 查询仍命中媒体，但当前完整 actual People 关系中已不存在该 Person ID。
+- 构建完整的普通媒体库 item-to-People 关系快照、保护合同和 Person identity 快照；每位候选使用 exact Person detail GET 与严格 PersonIds 核验。
+- PersonIds query item 必须全部绑定到固定 People 快照，任一项目缺失、归属不明、保护库命中、People 不完整或计数不一致都会失败关闭。
+- 使用确定性 snapshot hashes、起止 drift validation、PostgreSQL checkpoint/resume 和 4-worker 有界 GET 并发。
+- 每次运行固定 Alias Proof `source_proof_id` 与 `source_proof_hash`，仅接受完整、已完成且状态为 `identity_not_found` 的 source proof。
+- 只有两个连续、独立且完整完成的 forensic generation 在同一人物与 fingerprint 下均得到 stale-index signature，才能形成 stable signature；中间任何非 signature 结果都会中断稳定链。
+
+### 安全边界
+
+- `verified_stale_index_signature` 和 `stable_stale_index_signature` 都只是只读取证，不获得人物删除资格。
+- 本版本不删除 Person、不改变现有删除资格、不调用 `DeletePerson`。
+- 不修改 Emby People、Person、ProviderIds 或 Name；Stale Index forensic 的 Emby mutation 数为 0。
+
+""",
+    },
+
+    {
         "version": "v7.2.23",
         "published_at": "2026-08-31T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.23",

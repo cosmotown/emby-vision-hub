@@ -2,6 +2,28 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.25",
+        "published_at": "2026-09-03T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.25",
+        "changelog": """## Stale Index snapshot drift 诊断增强
+
+- Generation、Protection、Normal People relationship、Person identity 与 Source Alias Proof drift 现在分别诊断，不再合并为一个笼统错误。
+- 增加 relationship 变化统计以及最多 20 个脱敏样本，包括媒体新增/移除、People、Type 与媒体库归属变化。
+- 增加 Person identity 变化统计以及最多 20 个脱敏样本，包括 Person 新增/移除、Name 与 ProviderIds 变化。
+- 增加 protection component 与 source proof 变化摘要，并在 stale 页面展示只读漂移诊断。
+- 旧版本产生且没有诊断字段的 stale 记录会明确显示为无法判断具体漂移来源，不会伪装为 snapshot 未变化。
+- 诊断摘要计算或持久化失败不会影响原始 snapshot hash 判定，也不会阻止失败关闭。
+
+### 安全边界
+
+- 本版本仅增加可观测性，不降低任何 fail-closed 条件。
+- 任何原本会导致 stale 的变化仍然会使 `run=stale`、全部 signature 失效且 `stable_pass_count=0`。
+- Stale Index forensic 的 Emby mutation 数仍为 0；Person 删除资格没有变化。
+
+""",
+    },
+
+    {
         "version": "v7.2.24",
         "published_at": "2026-09-02T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.24",

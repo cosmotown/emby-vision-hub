@@ -1,5 +1,6 @@
 import json
 import hashlib
+import logging
 import secrets
 import uuid
 from typing import Any, Dict, Iterable, List, Optional
@@ -12,6 +13,9 @@ from services.person_cleanup_safety import (
     is_explicit_verified_orphan,
     person_name_protection_keys,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 VERIFICATION_STATES = {
@@ -1082,6 +1086,54 @@ def _require_complete_alias_proof_source(cursor, source_proof_id: str) -> Dict[s
     }
 
 
+def get_alias_proof_source_diagnostic(source_proof_id: str) -> Dict[str, Any]:
+    """Read the current source hash and completeness without mutating the proof."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT proof_id FROM person_cleanup_alias_proof_runs WHERE proof_id = %s",
+                (str(source_proof_id),),
+            )
+            if not cursor.fetchone():
+                return {
+                    'complete': False,
+                    'source_proof_hash': None,
+                    'error': 'Alias Proof source 不存在',
+                }
+            cursor.execute(
+                """
+                SELECT person_id, person_name, candidate_fingerprint,
+                       candidate_provider_ids, proof_state
+                FROM person_cleanup_alias_proof_items
+                WHERE proof_id = %s
+                ORDER BY person_id ASC
+                """,
+                (str(source_proof_id),),
+            )
+            source_rows = [dict(row) for row in cursor.fetchall()]
+            source_hash = hashlib.sha256(json.dumps(
+                source_rows,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')).hexdigest()
+            try:
+                complete = _require_complete_alias_proof_source(
+                    cursor, source_proof_id,
+                )
+            except RuntimeError as exc:
+                return {
+                    'complete': False,
+                    'source_proof_hash': source_hash,
+                    'error': str(exc),
+                }
+            return {
+                'complete': True,
+                'source_proof_hash': complete['source_proof_hash'],
+                'error': None,
+            }
+
+
 def create_stale_index_run(
     source_proof_id: str,
     snapshot_generation: int,
@@ -1405,7 +1457,88 @@ def stop_stale_index_run(run_id: str) -> None:
             )
 
 
-def fail_stale_index_run(run_id: str, error: str, stale: bool = False) -> None:
+def _persist_stale_index_diagnostics(cursor, run_id: str, diagnostics: Dict[str, Any]) -> None:
+    cursor.execute(
+        """
+        UPDATE person_cleanup_stale_index_runs
+        SET final_snapshot_generation = %s,
+            final_protection_hash = %s,
+            final_normal_people_relationship_hash = %s,
+            final_person_snapshot_hash = %s,
+            final_source_proof_hash = %s,
+            drift_generation = %s,
+            drift_protection = %s,
+            drift_normal_relationship = %s,
+            drift_person = %s,
+            drift_source_proof = %s,
+            normal_relationship_drift_summary = %s::jsonb,
+            person_drift_summary = %s::jsonb,
+            protection_drift_summary = %s::jsonb,
+            source_proof_drift_summary = %s::jsonb,
+            updated_at = NOW()
+        WHERE run_id = %s
+        """,
+        (
+            diagnostics.get('final_snapshot_generation'),
+            diagnostics.get('final_protection_hash'),
+            diagnostics.get('final_normal_people_relationship_hash'),
+            diagnostics.get('final_person_snapshot_hash'),
+            diagnostics.get('final_source_proof_hash'),
+            bool(diagnostics.get('drift_generation')),
+            bool(diagnostics.get('drift_protection')),
+            bool(diagnostics.get('drift_normal_relationship')),
+            bool(diagnostics.get('drift_person')),
+            bool(diagnostics.get('drift_source_proof')),
+            json.dumps(
+                diagnostics.get('normal_relationship_drift_summary') or {},
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                diagnostics.get('person_drift_summary') or {},
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                diagnostics.get('protection_drift_summary') or {},
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                diagnostics.get('source_proof_drift_summary') or {},
+                ensure_ascii=False,
+            ),
+            str(run_id),
+        ),
+    )
+
+
+def record_stale_index_final_diagnostics(
+    run_id: str,
+    diagnostics: Dict[str, Any],
+) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT state FROM person_cleanup_stale_index_runs
+                WHERE run_id = %s FOR UPDATE
+                """,
+                (str(run_id),),
+            )
+            run = cursor.fetchone()
+            if not run or run['state'] != 'running':
+                raise RuntimeError('stale-index forensic run 状态已变化')
+            _persist_stale_index_diagnostics(cursor, run_id, diagnostics)
+
+
+def fail_stale_index_run(
+    run_id: str,
+    error: str,
+    stale: bool = False,
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> None:
+    # The fail-closed transition is authoritative. Diagnostic persistence is
+    # deliberately attempted only after that transition commits, so a JSON or
+    # schema/write problem in observability can never leave a drifted run live
+    # or preserve signature eligibility.
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -1429,6 +1562,17 @@ def fail_stale_index_run(run_id: str, error: str, stale: bool = False) -> None:
                 WHERE run_id = %s
                 """,
                 ('stale' if stale else 'failed', str(error)[:4000], str(run_id)),
+            )
+    if diagnostics is not None:
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    _persist_stale_index_diagnostics(cursor, run_id, diagnostics)
+        except Exception:
+            logger.error(
+                'Stale Index 已失败关闭，但持久化 drift diagnostics 失败 run_id=%s',
+                str(run_id),
+                exc_info=True,
             )
 
 

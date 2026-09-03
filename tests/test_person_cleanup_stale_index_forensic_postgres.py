@@ -2,6 +2,7 @@ import logging
 import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 
 import config_manager
 import constants
@@ -472,6 +473,170 @@ class StaleIndexForensicPostgresTests(unittest.TestCase):
                     person_cleanup_db.complete_stale_index_run(
                         run['run_id'], self.generation, *changed,
                     )
+
+    def test_stale_diagnostics_are_persisted_and_all_signatures_fail_closed(self):
+        proof, _ = self.create_source(count=2)
+        run = self.create_run(proof['proof_id'])
+        for item in person_cleanup_db.claim_stale_index_items(run['run_id'], 4):
+            person_cleanup_db.finish_stale_index_item(
+                run['run_id'], item['person_id'],
+                {'forensic_state': 'verified_stale_index_signature'},
+            )
+        diagnostics = {
+            'final_snapshot_generation': self.generation,
+            'final_protection_hash': 'protection',
+            'final_normal_people_relationship_hash': 'changed-relationships',
+            'final_person_snapshot_hash': 'changed-persons',
+            'final_source_proof_hash': run['source_proof_hash'],
+            'drift_generation': False,
+            'drift_protection': False,
+            'drift_normal_relationship': True,
+            'drift_person': True,
+            'drift_source_proof': False,
+            'normal_relationship_drift_summary': {
+                'added_item_count': 1,
+                'samples': [{'item_id': 'm1', 'change_type': 'added'}],
+            },
+            'person_drift_summary': {
+                'person_added_count': 1,
+                'samples': [{'person_id': 'p-new', 'change_type': 'added'}],
+            },
+            'protection_drift_summary': {'protected_ids_changed': False},
+            'source_proof_drift_summary': {'source_proof_changed': False},
+        }
+        person_cleanup_db.fail_stale_index_run(
+            run['run_id'], 'precise drift', stale=True, diagnostics=diagnostics,
+        )
+        persisted = person_cleanup_db.get_stale_index_summary(run['run_id'])
+        self.assertEqual(persisted['state'], 'stale')
+        self.assertTrue(persisted['drift_normal_relationship'])
+        self.assertTrue(persisted['drift_person'])
+        self.assertEqual(
+            persisted['normal_relationship_drift_summary']['added_item_count'], 1,
+        )
+        self.assertEqual(persisted['verified_signature_count'], 0)
+        self.assertEqual(persisted['stable_signature_count'], 0)
+        self.assertEqual(persisted['states'], [
+            {'forensic_state': 'failed_safe', 'count': 2},
+        ])
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)::INTEGER AS count
+                    FROM person_cleanup_stale_index_items
+                    WHERE run_id = %s AND stable_pass_count <> 0
+                    """,
+                    (run['run_id'],),
+                )
+                self.assertEqual(cursor.fetchone()['count'], 0)
+
+    def test_diagnostic_persistence_failure_cannot_block_stale_transition(self):
+        proof, _ = self.create_source()
+        run = self.create_run(proof['proof_id'])
+        item = person_cleanup_db.claim_stale_index_items(run['run_id'], 1)[0]
+        person_cleanup_db.finish_stale_index_item(
+            run['run_id'], item['person_id'],
+            {'forensic_state': 'verified_stale_index_signature'},
+        )
+        with patch.object(
+            person_cleanup_db,
+            '_persist_stale_index_diagnostics',
+            side_effect=RuntimeError('diagnostic write failed'),
+        ):
+            person_cleanup_db.fail_stale_index_run(
+                run['run_id'],
+                'snapshot drift',
+                stale=True,
+                diagnostics={'drift_person': True},
+            )
+        persisted = person_cleanup_db.get_stale_index_summary(run['run_id'])
+        self.assertEqual(persisted['state'], 'stale')
+        self.assertEqual(persisted['verified_signature_count'], 0)
+        self.assertEqual(persisted['stable_signature_count'], 0)
+        self.assertEqual(persisted['states'], [
+            {'forensic_state': 'failed_safe', 'count': 1},
+        ])
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)::INTEGER AS count
+                    FROM person_cleanup_stale_index_items
+                    WHERE run_id = %s AND stable_pass_count <> 0
+                    """,
+                    (run['run_id'],),
+                )
+                self.assertEqual(cursor.fetchone()['count'], 0)
+
+    def test_unchanged_final_diagnostics_survive_completed_run(self):
+        proof, _ = self.create_source()
+        run = self.create_run(proof['proof_id'])
+        item = person_cleanup_db.claim_stale_index_items(run['run_id'], 1)[0]
+        person_cleanup_db.finish_stale_index_item(
+            run['run_id'], item['person_id'], {'forensic_state': 'linked'},
+        )
+        diagnostics = {
+            'final_snapshot_generation': self.generation,
+            'final_protection_hash': 'protection',
+            'final_normal_people_relationship_hash': 'relationships',
+            'final_person_snapshot_hash': 'persons',
+            'final_source_proof_hash': run['source_proof_hash'],
+            'drift_generation': False,
+            'drift_protection': False,
+            'drift_normal_relationship': False,
+            'drift_person': False,
+            'drift_source_proof': False,
+            'normal_relationship_drift_summary': {},
+            'person_drift_summary': {},
+            'protection_drift_summary': {},
+            'source_proof_drift_summary': {'source_proof_changed': False},
+        }
+        person_cleanup_db.record_stale_index_final_diagnostics(
+            run['run_id'], diagnostics,
+        )
+        completed = self.complete_run(run['run_id'])
+        self.assertEqual(completed['state'], 'completed')
+        self.assertEqual(completed['final_person_snapshot_hash'], 'persons')
+        self.assertFalse(completed['drift_person'])
+
+    def test_source_diagnostic_reports_changed_rows_and_incomplete_state(self):
+        proof, _ = self.create_source()
+        initial = person_cleanup_db.get_alias_proof_source_diagnostic(
+            proof['proof_id'],
+        )
+        self.assertTrue(initial['complete'])
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE person_cleanup_alias_proof_items
+                    SET person_name = 'Changed source row'
+                    WHERE proof_id = %s
+                    """,
+                    (proof['proof_id'],),
+                )
+        changed = person_cleanup_db.get_alias_proof_source_diagnostic(
+            proof['proof_id'],
+        )
+        self.assertTrue(changed['complete'])
+        self.assertNotEqual(
+            changed['source_proof_hash'], initial['source_proof_hash'],
+        )
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE person_cleanup_alias_proof_runs
+                    SET state = 'failed' WHERE proof_id = %s
+                    """,
+                    (proof['proof_id'],),
+                )
+        incomplete = person_cleanup_db.get_alias_proof_source_diagnostic(
+            proof['proof_id'],
+        )
+        self.assertFalse(incomplete['complete'])
+        self.assertIn('不是 completed', incomplete['error'])
 
     def test_migration_is_additive_idempotent_and_interrupts_running_work(self):
         proof, _ = self.create_source()

@@ -39,6 +39,7 @@ PERSON_ALIAS_PROOF_WORKERS = 4
 PERSON_ALIAS_PROOF_CLAIM_LIMIT = 4
 PERSON_STALE_INDEX_WORKERS = 4
 PERSON_STALE_INDEX_CLAIM_LIMIT = 4
+PERSON_STALE_INDEX_DRIFT_SAMPLE_LIMIT = 20
 
 def _scan_protected_library_people(processor, protected_libraries, batch_size: int = 500):
     """Build a complete protected snapshot or raise without marking it ready."""
@@ -511,6 +512,13 @@ def _alias_proof_snapshot_hash(value) -> str:
 
 def _alias_proof_protection_hash(contract, root_contract) -> str:
     """Bind every protection fact that can reject alias-orphan evidence."""
+    return _alias_proof_snapshot_hash(
+        _stale_index_protection_components(contract, root_contract)
+    )
+
+
+def _stale_index_protection_components(contract, root_contract):
+    """Return the exact protection facts covered by the global hash."""
     roots = sorted(
         (
             str(root.get('library_id') or ''),
@@ -520,7 +528,7 @@ def _alias_proof_protection_hash(contract, root_contract) -> str:
         )
         for root in (root_contract.get('roots') or ())
     )
-    return _alias_proof_snapshot_hash({
+    return {
         'generation': int(contract['generation']),
         'person_ids': sorted(str(value) for value in contract.get('person_ids') or ()),
         'name_keys': sorted(str(value) for value in contract.get('name_keys') or ()),
@@ -537,7 +545,7 @@ def _alias_proof_protection_hash(contract, root_contract) -> str:
         ),
         'root_contract_complete': bool(root_contract.get('complete')),
         'roots': roots,
-    })
+    }
 
 
 def _stale_index_relationship_hash(item_people) -> str:
@@ -554,6 +562,257 @@ def _stale_index_relationship_hash(item_people) -> str:
         )
         for item_id, relationship in sorted(item_people.items())
     ])
+
+
+def _stale_index_relationship_drift_summary(start_snapshots, final_snapshots):
+    """Summarize exact item/People drift without retaining paths or full snapshots."""
+    start_items = start_snapshots.get('item_people') or {}
+    final_items = final_snapshots.get('item_people') or {}
+    start_ids = set(start_items)
+    final_ids = set(final_items)
+    added_ids = sorted(final_ids - start_ids)
+    removed_ids = sorted(start_ids - final_ids)
+    changed_people = []
+    changed_types = []
+    changed_libraries = []
+    people_added_count = 0
+    people_removed_count = 0
+    people_name_changed_count = 0
+
+    def people_map(relationship):
+        return {
+            str(person_id): str(person_name)
+            for person_id, person_name in (relationship.get('people') or ())
+        }
+
+    for item_id in sorted(start_ids & final_ids):
+        before = start_items[item_id]
+        after = final_items[item_id]
+        if str(before.get('item_type') or '') != str(after.get('item_type') or ''):
+            changed_types.append(item_id)
+        if str(before.get('library_id') or '') != str(after.get('library_id') or ''):
+            changed_libraries.append(item_id)
+        before_people = tuple(before.get('people') or ())
+        after_people = tuple(after.get('people') or ())
+        if before_people != after_people:
+            changed_people.append(item_id)
+            before_map = people_map(before)
+            after_map = people_map(after)
+            before_person_ids = set(before_map)
+            after_person_ids = set(after_map)
+            people_added_count += len(after_person_ids - before_person_ids)
+            people_removed_count += len(before_person_ids - after_person_ids)
+            people_name_changed_count += sum(
+                before_map[person_id] != after_map[person_id]
+                for person_id in before_person_ids & after_person_ids
+            )
+
+    change_types = defaultdict(set)
+    for item_id in added_ids:
+        change_types[item_id].add('added')
+    for item_id in removed_ids:
+        change_types[item_id].add('removed')
+    for item_id in changed_people:
+        change_types[item_id].add('people_changed')
+    for item_id in changed_types:
+        change_types[item_id].add('type_changed')
+    for item_id in changed_libraries:
+        change_types[item_id].add('library_ownership_changed')
+    samples = []
+    for item_id in sorted(change_types)[:PERSON_STALE_INDEX_DRIFT_SAMPLE_LIMIT]:
+        before = start_items.get(item_id) or {}
+        after = final_items.get(item_id) or {}
+        samples.append({
+            'item_id': str(item_id),
+            'change_type': ','.join(sorted(change_types[item_id])),
+            'start_people_count': len(before.get('people') or ()),
+            'final_people_count': len(after.get('people') or ()),
+        })
+    return {
+        'start_media_count': int(start_snapshots.get('media_count') or len(start_items)),
+        'final_media_count': int(final_snapshots.get('media_count') or len(final_items)),
+        'added_item_count': len(added_ids),
+        'removed_item_count': len(removed_ids),
+        'changed_item_people_count': len(changed_people),
+        'changed_item_type_count': len(changed_types),
+        'changed_library_ownership_count': len(changed_libraries),
+        'people_added_count': people_added_count,
+        'people_removed_count': people_removed_count,
+        'people_name_changed_count': people_name_changed_count,
+        'samples': samples,
+    }
+
+
+def _stale_index_person_drift_summary(start_snapshots, final_snapshots):
+    """Summarize full Person ID/Name/ProviderIds drift with canonical identity samples."""
+    start_people = start_snapshots.get('person_details') or {}
+    final_people = final_snapshots.get('person_details') or {}
+    start_ids = set(start_people)
+    final_ids = set(final_people)
+    added_ids = sorted(final_ids - start_ids)
+    removed_ids = sorted(start_ids - final_ids)
+    name_changed = []
+    provider_changed = []
+
+    def raw_provider_ids(detail):
+        return json.dumps(
+            detail.get('ProviderIds') or {}, ensure_ascii=False,
+            sort_keys=True, separators=(',', ':'),
+        )
+
+    def canonical_identities(detail):
+        try:
+            identities = canonical_person_provider_identities(
+                detail.get('ProviderIds'), strict=True,
+            )
+        except ValueError:
+            identities = set()
+        return [f'{provider}:{provider_id}' for provider, provider_id in sorted(identities)]
+
+    for person_id in sorted(start_ids & final_ids):
+        before = start_people[person_id]
+        after = final_people[person_id]
+        if str(before.get('Name') or '') != str(after.get('Name') or ''):
+            name_changed.append(person_id)
+        if raw_provider_ids(before) != raw_provider_ids(after):
+            provider_changed.append(person_id)
+
+    change_types = defaultdict(set)
+    for person_id in added_ids:
+        change_types[person_id].add('added')
+    for person_id in removed_ids:
+        change_types[person_id].add('removed')
+    for person_id in name_changed:
+        change_types[person_id].add('name_changed')
+    for person_id in provider_changed:
+        change_types[person_id].add('provider_ids_changed')
+    samples = []
+    for person_id in sorted(change_types)[:PERSON_STALE_INDEX_DRIFT_SAMPLE_LIMIT]:
+        before = start_people.get(person_id) or {}
+        after = final_people.get(person_id) or {}
+        samples.append({
+            'person_id': str(person_id),
+            'change_type': ','.join(sorted(change_types[person_id])),
+            'old_provider_identities': canonical_identities(before),
+            'new_provider_identities': canonical_identities(after),
+        })
+    return {
+        'person_added_count': len(added_ids),
+        'person_removed_count': len(removed_ids),
+        'person_name_changed_count': len(name_changed),
+        'person_provider_ids_changed_count': len(provider_changed),
+        'samples': samples,
+    }
+
+
+def _stale_index_protection_drift_summary(start_snapshots, final_snapshots):
+    before = _stale_index_protection_components(
+        start_snapshots['contract'], start_snapshots['root_contract'],
+    )
+    after = _stale_index_protection_components(
+        final_snapshots['contract'], final_snapshots['root_contract'],
+    )
+    return {
+        'generation_changed': before['generation'] != after['generation'],
+        'protected_ids_changed': before['person_ids'] != after['person_ids'],
+        'protected_names_changed': before['name_keys'] != after['name_keys'],
+        'protected_provider_identities_changed': (
+            before['provider_identities'] != after['provider_identities']
+        ),
+        'persistent_aliases_changed': before['alias_statuses'] != after['alias_statuses'],
+        'selected_protected_libraries_changed': (
+            before['selected_library_ids'] != after['selected_library_ids']
+        ),
+        'root_contract_changed': (
+            before['root_contract_complete'] != after['root_contract_complete']
+            or before['roots'] != after['roots']
+        ),
+    }
+
+
+def _build_stale_index_drift_diagnostics(
+    start_snapshots,
+    final_snapshots,
+    start_source_proof_hash,
+    final_source,
+):
+    final_source_hash = final_source.get('source_proof_hash')
+    source_changed = (
+        not final_source.get('complete')
+        or final_source_hash != str(start_source_proof_hash or '')
+    )
+    diagnostics = {
+        'final_snapshot_generation': int(final_snapshots['generation']),
+        'final_protection_hash': str(final_snapshots['protection_hash']),
+        'final_normal_people_relationship_hash': str(
+            final_snapshots['normal_people_relationship_hash']
+        ),
+        'final_person_snapshot_hash': str(final_snapshots['person_hash']),
+        'final_source_proof_hash': (
+            str(final_source_hash) if final_source_hash is not None else None
+        ),
+        'drift_generation': (
+            int(final_snapshots['generation']) != int(start_snapshots['generation'])
+        ),
+        'drift_protection': (
+            final_snapshots['protection_hash'] != start_snapshots['protection_hash']
+        ),
+        'drift_normal_relationship': (
+            final_snapshots['normal_people_relationship_hash']
+            != start_snapshots['normal_people_relationship_hash']
+        ),
+        'drift_person': final_snapshots['person_hash'] != start_snapshots['person_hash'],
+        'drift_source_proof': source_changed,
+        'source_proof_drift_summary': {
+            'source_proof_changed': source_changed,
+            'source_proof_complete': bool(final_source.get('complete')),
+            'reason': final_source.get('error'),
+        },
+    }
+    diagnostics['has_drift'] = any(
+        diagnostics[key]
+        for key in (
+            'drift_generation', 'drift_protection', 'drift_normal_relationship',
+            'drift_person', 'drift_source_proof',
+        )
+    )
+
+    def diagnostic_summary(builder, *args):
+        try:
+            summary = builder(*args)
+            summary['available'] = True
+            return summary
+        except Exception as exc:
+            logger.error(
+                'Stale Index drift diagnostic summary 计算失败 kind=%s error=%s',
+                getattr(builder, '__name__', type(builder).__name__),
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return {
+                'available': False,
+                'error': type(exc).__name__,
+            }
+
+    # These summaries are display-only. Exact drift flags above are calculated
+    # first from the original full hashes and remain authoritative even when a
+    # summary cannot be produced.
+    diagnostics['normal_relationship_drift_summary'] = diagnostic_summary(
+        _stale_index_relationship_drift_summary,
+        start_snapshots,
+        final_snapshots,
+    )
+    diagnostics['person_drift_summary'] = diagnostic_summary(
+        _stale_index_person_drift_summary,
+        start_snapshots,
+        final_snapshots,
+    )
+    diagnostics['protection_drift_summary'] = diagnostic_summary(
+        _stale_index_protection_drift_summary,
+        start_snapshots,
+        final_snapshots,
+    )
+    return diagnostics
 
 
 def _build_alias_proof_snapshots(processor):
@@ -964,6 +1223,10 @@ def task_stale_index_readonly_forensic(processor, run_id=None):
     """Run persistent stale PersonIds forensic using Emby GET only."""
     task_manager.update_status_from_thread(0, 'Stale Index 只读取证：构建完整关系快照...')
     active_run_id = str(run_id or '').strip() or None
+    snapshots = None
+    final_snapshots = None
+    run = None
+    diagnostics = None
     try:
         existing_run = person_cleanup_db.get_stale_index_run(active_run_id) if active_run_id else None
         if active_run_id and not existing_run:
@@ -1015,10 +1278,21 @@ def task_stale_index_readonly_forensic(processor, run_id=None):
                     )
                     return
                 if person_cleanup_db.require_ready_protection_snapshot() != snapshots['generation']:
+                    final_snapshots = _build_stale_index_forensic_snapshots(processor)
+                    final_source = person_cleanup_db.get_alias_proof_source_diagnostic(
+                        run['source_proof_id'],
+                    )
+                    diagnostics = _build_stale_index_drift_diagnostics(
+                        snapshots,
+                        final_snapshots,
+                        run['source_proof_hash'],
+                        final_source,
+                    )
                     person_cleanup_db.fail_stale_index_run(
                         active_run_id,
                         '保护快照 generation 漂移，全部 signature 已失败关闭',
                         stale=True,
+                        diagnostics=diagnostics,
                     )
                     return
                 claimed = person_cleanup_db.claim_stale_index_items(
@@ -1030,19 +1304,38 @@ def task_stale_index_readonly_forensic(processor, run_id=None):
                         person_cleanup_db.stop_stale_index_run(active_run_id)
                         return
                     final_snapshots = _build_stale_index_forensic_snapshots(processor)
-                    if (
-                        final_snapshots['generation'] != snapshots['generation']
-                        or final_snapshots['protection_hash'] != snapshots['protection_hash']
-                        or final_snapshots['normal_people_relationship_hash']
-                           != snapshots['normal_people_relationship_hash']
-                        or final_snapshots['person_hash'] != snapshots['person_hash']
-                    ):
+                    final_source = person_cleanup_db.get_alias_proof_source_diagnostic(
+                        run['source_proof_id'],
+                    )
+                    diagnostics = _build_stale_index_drift_diagnostics(
+                        snapshots,
+                        final_snapshots,
+                        run['source_proof_hash'],
+                        final_source,
+                    )
+                    if diagnostics['has_drift']:
+                        changed = [
+                            label
+                            for key, label in (
+                                ('drift_generation', 'generation'),
+                                ('drift_protection', 'protection'),
+                                ('drift_normal_relationship', 'normal_relationship'),
+                                ('drift_person', 'person'),
+                                ('drift_source_proof', 'source_proof'),
+                            )
+                            if diagnostics[key]
+                        ]
                         person_cleanup_db.fail_stale_index_run(
                             active_run_id,
-                            '全局 relationship/protection/Person snapshot 漂移，全部 signature 已失败关闭',
+                            'Snapshot 漂移：' + ', '.join(changed)
+                            + '；全部 signature 已失败关闭',
                             stale=True,
+                            diagnostics=diagnostics,
                         )
                         return
+                    person_cleanup_db.record_stale_index_final_diagnostics(
+                        active_run_id, diagnostics,
+                    )
                     final = person_cleanup_db.complete_stale_index_run(
                         active_run_id,
                         snapshots['generation'],
@@ -1099,10 +1392,43 @@ def task_stale_index_readonly_forensic(processor, run_id=None):
     except Exception as exc:
         if active_run_id:
             try:
+                error_text = str(exc)
+                error_lower = error_text.lower()
+                stale_failure = any(
+                    marker in error_lower
+                    for marker in ('snapshot', 'generation', 'source')
+                )
+                if stale_failure and snapshots and run:
+                    try:
+                        final_snapshots = final_snapshots or _build_stale_index_forensic_snapshots(
+                            processor,
+                        )
+                        final_source = person_cleanup_db.get_alias_proof_source_diagnostic(
+                            run['source_proof_id'],
+                        )
+                        diagnostics = _build_stale_index_drift_diagnostics(
+                            snapshots,
+                            final_snapshots,
+                            run['source_proof_hash'],
+                            final_source,
+                        )
+                        if 'source' in error_lower:
+                            diagnostics['drift_source_proof'] = True
+                            diagnostics['has_drift'] = True
+                            diagnostics['source_proof_drift_summary'].update({
+                                'source_proof_changed': True,
+                                'reason': error_text,
+                            })
+                    except Exception:
+                        logger.error(
+                            'Stale Index 失败后的 drift diagnostics 重建失败',
+                            exc_info=True,
+                        )
                 person_cleanup_db.fail_stale_index_run(
                     active_run_id,
-                    str(exc),
-                    stale='snapshot' in str(exc).lower() or 'generation' in str(exc).lower(),
+                    error_text,
+                    stale=stale_failure,
+                    diagnostics=diagnostics,
                 )
             except Exception:
                 logger.error('持久化 Stale Index forensic 失败状态异常', exc_info=True)

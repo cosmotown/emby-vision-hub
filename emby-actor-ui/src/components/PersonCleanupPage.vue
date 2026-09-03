@@ -245,6 +245,143 @@
           </n-space>
         </n-list-item>
       </n-list>
+      <n-card
+        v-if="staleIndexRun.state === 'stale'"
+        size="small"
+        title="漂移诊断"
+        style="margin-top: 12px;"
+      >
+        <n-alert type="error" style="margin-bottom: 12px;">
+          这些变化导致本轮证据失败关闭；未降低任何安全条件，所有 signature 与 stable pass 均已清零。
+        </n-alert>
+        <template v-if="staleIndexRun.final_snapshot_generation !== null && staleIndexRun.final_snapshot_generation !== undefined">
+          <n-descriptions bordered :column="2" label-placement="left">
+          <n-descriptions-item label="Protection">
+            {{ driftLabel(staleIndexRun.drift_protection || staleIndexRun.drift_generation) }}
+          </n-descriptions-item>
+          <n-descriptions-item label="Normal People relationship">
+            {{ driftLabel(staleIndexRun.drift_normal_relationship) }}
+          </n-descriptions-item>
+          <n-descriptions-item label="Person identity">
+            {{ driftLabel(staleIndexRun.drift_person) }}
+          </n-descriptions-item>
+          <n-descriptions-item label="Source Alias Proof">
+            {{ driftLabel(staleIndexRun.drift_source_proof) }}
+          </n-descriptions-item>
+          <n-descriptions-item label="Protection 变化明细" :span="2">
+            {{ diagnosticSummaryUnavailable(staleIndexRun.protection_drift_summary)
+              || protectionDriftText(staleIndexRun.protection_drift_summary) }}
+          </n-descriptions-item>
+          <n-descriptions-item
+            v-if="diagnosticSummaryUnavailable(staleIndexRun.normal_relationship_drift_summary)"
+            label="关系变化摘要"
+            :span="2"
+          >
+            {{ diagnosticSummaryUnavailable(staleIndexRun.normal_relationship_drift_summary) }}
+          </n-descriptions-item>
+          <n-descriptions-item
+            v-if="diagnosticSummaryUnavailable(staleIndexRun.person_drift_summary)"
+            label="Person 变化摘要"
+            :span="2"
+          >
+            {{ diagnosticSummaryUnavailable(staleIndexRun.person_drift_summary) }}
+          </n-descriptions-item>
+          <n-descriptions-item
+            v-if="staleIndexRun.source_proof_drift_summary?.reason"
+            label="Source proof 原因"
+            :span="2"
+          >
+            {{ staleIndexRun.source_proof_drift_summary.reason }}
+          </n-descriptions-item>
+          </n-descriptions>
+
+          <n-descriptions bordered :column="2" label-placement="left" style="margin-top: 12px;">
+          <n-descriptions-item
+            v-if="staleIndexRun.normal_relationship_drift_summary?.available !== false"
+            label="媒体数量（起始 / 最终）"
+          >
+            {{ staleIndexRun.normal_relationship_drift_summary?.start_media_count || 0 }} /
+            {{ staleIndexRun.normal_relationship_drift_summary?.final_media_count || 0 }}
+          </n-descriptions-item>
+          <n-descriptions-item
+            v-if="staleIndexRun.normal_relationship_drift_summary?.available !== false"
+            label="媒体新增 / 删除"
+          >
+            {{ staleIndexRun.normal_relationship_drift_summary?.added_item_count || 0 }} /
+            {{ staleIndexRun.normal_relationship_drift_summary?.removed_item_count || 0 }}
+          </n-descriptions-item>
+          <n-descriptions-item
+            v-if="staleIndexRun.normal_relationship_drift_summary?.available !== false"
+            label="People / Type / 库归属变化"
+          >
+            {{ staleIndexRun.normal_relationship_drift_summary?.changed_item_people_count || 0 }} /
+            {{ staleIndexRun.normal_relationship_drift_summary?.changed_item_type_count || 0 }} /
+            {{ staleIndexRun.normal_relationship_drift_summary?.changed_library_ownership_count || 0 }}
+          </n-descriptions-item>
+          <n-descriptions-item
+            v-if="staleIndexRun.normal_relationship_drift_summary?.available !== false"
+            label="People 新增 / 移除 / 改名"
+          >
+            {{ staleIndexRun.normal_relationship_drift_summary?.people_added_count || 0 }} /
+            {{ staleIndexRun.normal_relationship_drift_summary?.people_removed_count || 0 }} /
+            {{ staleIndexRun.normal_relationship_drift_summary?.people_name_changed_count || 0 }}
+          </n-descriptions-item>
+          <n-descriptions-item
+            v-if="staleIndexRun.person_drift_summary?.available !== false"
+            label="Person 新增 / 移除"
+          >
+            {{ staleIndexRun.person_drift_summary?.person_added_count || 0 }} /
+            {{ staleIndexRun.person_drift_summary?.person_removed_count || 0 }}
+          </n-descriptions-item>
+          <n-descriptions-item
+            v-if="staleIndexRun.person_drift_summary?.available !== false"
+            label="Person Name / ProviderIds 变化"
+          >
+            {{ staleIndexRun.person_drift_summary?.person_name_changed_count || 0 }} /
+            {{ staleIndexRun.person_drift_summary?.person_provider_ids_changed_count || 0 }}
+          </n-descriptions-item>
+          </n-descriptions>
+
+          <n-collapse style="margin-top: 12px;">
+          <n-collapse-item
+            v-if="staleIndexRun.normal_relationship_drift_summary?.samples?.length"
+            title="关系变化样本（最多 20 条）"
+            name="relationship-drift-samples"
+          >
+            <n-list bordered>
+              <n-list-item
+                v-for="sample in staleIndexRun.normal_relationship_drift_summary.samples"
+                :key="`relationship:${sample.item_id}:${sample.change_type}`"
+              >
+                Item {{ sample.item_id }} · {{ sample.change_type }} · People
+                {{ sample.start_people_count }} → {{ sample.final_people_count }}
+              </n-list-item>
+            </n-list>
+          </n-collapse-item>
+          <n-collapse-item
+            v-if="staleIndexRun.person_drift_summary?.samples?.length"
+            title="Person 变化样本（最多 20 条）"
+            name="person-drift-samples"
+          >
+            <n-list bordered>
+              <n-list-item
+                v-for="sample in staleIndexRun.person_drift_summary.samples"
+                :key="`person:${sample.person_id}:${sample.change_type}`"
+              >
+                Person {{ sample.person_id }} · {{ sample.change_type }}
+                <span v-if="sample.old_provider_identities?.length || sample.new_provider_identities?.length">
+                  · identity {{ (sample.old_provider_identities || []).join(', ') || '无' }}
+                  → {{ (sample.new_provider_identities || []).join(', ') || '无' }}
+                </span>
+              </n-list-item>
+            </n-list>
+          </n-collapse-item>
+          </n-collapse>
+        </template>
+        <n-alert v-else type="warning">
+          该历史记录生成于漂移诊断功能之前，无法判断具体漂移来源；不会据此推断任何 snapshot 未变化。
+        </n-alert>
+      </n-card>
       <n-alert v-if="staleIndexRun.last_error" type="warning" style="margin-top: 12px;">
         {{ staleIndexRun.last_error }}
       </n-alert>
@@ -985,6 +1122,27 @@ const staleIndexStateLabel = (state) => ({
   stale_index_different_people: '查询作品实际引用不同人物',
   stale_index_no_actual_people: '查询作品实际 People 为空',
 }[state] || '其他状态');
+
+const driftLabel = (changed) => (changed ? '发生变化' : '未变化');
+
+const diagnosticSummaryUnavailable = (summary = {}) => (
+  summary?.available === false
+    ? `诊断摘要不可用（${summary?.error || 'unknown'}）；原始 snapshot drift 仍按失败关闭处理`
+    : ''
+);
+
+const protectionDriftText = (summary = {}) => {
+  const labels = [
+    ['generation_changed', 'generation'],
+    ['protected_ids_changed', 'protected IDs'],
+    ['protected_names_changed', 'protected names'],
+    ['protected_provider_identities_changed', 'protected provider identities'],
+    ['persistent_aliases_changed', 'persistent aliases'],
+    ['selected_protected_libraries_changed', 'selected protected libraries'],
+    ['root_contract_changed', 'root contract'],
+  ].filter(([key]) => summary?.[key]).map(([, label]) => label);
+  return labels.length ? labels.join('、') : '未检测到 protection component 变化';
+};
 
 const staleIndexSampleColumns = [
   { title: 'Person ID', key: 'person_id', minWidth: 130 },

@@ -607,6 +607,20 @@ def init_db():
                         protection_hash TEXT NOT NULL,
                         normal_people_relationship_hash TEXT NOT NULL,
                         person_snapshot_hash TEXT NOT NULL,
+                        final_snapshot_generation BIGINT,
+                        final_protection_hash TEXT,
+                        final_normal_people_relationship_hash TEXT,
+                        final_person_snapshot_hash TEXT,
+                        final_source_proof_hash TEXT,
+                        drift_generation BOOLEAN NOT NULL DEFAULT FALSE,
+                        drift_protection BOOLEAN NOT NULL DEFAULT FALSE,
+                        drift_normal_relationship BOOLEAN NOT NULL DEFAULT FALSE,
+                        drift_person BOOLEAN NOT NULL DEFAULT FALSE,
+                        drift_source_proof BOOLEAN NOT NULL DEFAULT FALSE,
+                        normal_relationship_drift_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        person_drift_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        protection_drift_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        source_proof_drift_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
                         candidate_total INTEGER NOT NULL DEFAULT 0,
                         checked_count INTEGER NOT NULL DEFAULT 0,
                         verified_signature_count INTEGER NOT NULL DEFAULT 0,
@@ -622,6 +636,23 @@ def init_db():
                     ALTER TABLE person_cleanup_stale_index_runs
                     ADD COLUMN IF NOT EXISTS source_proof_hash
                     TEXT NOT NULL DEFAULT ''
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_stale_index_runs
+                    ADD COLUMN IF NOT EXISTS final_snapshot_generation BIGINT,
+                    ADD COLUMN IF NOT EXISTS final_protection_hash TEXT,
+                    ADD COLUMN IF NOT EXISTS final_normal_people_relationship_hash TEXT,
+                    ADD COLUMN IF NOT EXISTS final_person_snapshot_hash TEXT,
+                    ADD COLUMN IF NOT EXISTS final_source_proof_hash TEXT,
+                    ADD COLUMN IF NOT EXISTS drift_generation BOOLEAN NOT NULL DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS drift_protection BOOLEAN NOT NULL DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS drift_normal_relationship BOOLEAN NOT NULL DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS drift_person BOOLEAN NOT NULL DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS drift_source_proof BOOLEAN NOT NULL DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS normal_relationship_drift_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    ADD COLUMN IF NOT EXISTS person_drift_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    ADD COLUMN IF NOT EXISTS protection_drift_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    ADD COLUMN IF NOT EXISTS source_proof_drift_summary JSONB NOT NULL DEFAULT '{}'::jsonb
                 """)
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS person_cleanup_stale_index_items (

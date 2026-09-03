@@ -289,6 +289,14 @@ class StaleIndexSnapshotTests(unittest.TestCase):
         first = {
             'generation': 7, 'protection_hash': 'guard',
             'normal_people_relationship_hash': 'people-1', 'person_hash': 'person',
+            'contract': {
+                'generation': 7, 'person_ids': set(), 'name_keys': set(),
+                'provider_identities': set(), 'alias_statuses': {},
+            },
+            'root_contract': {
+                'complete': True, 'selected_library_ids': set(), 'roots': (),
+            },
+            'item_people': {}, 'person_details': {}, 'media_count': 0,
         }
         for key, changed_value in (
             ('normal_people_relationship_hash', 'people-2'),
@@ -306,6 +314,12 @@ class StaleIndexSnapshotTests(unittest.TestCase):
                 ), patch.object(
                     actors.person_cleanup_db, 'create_stale_index_run', return_value={
                         'run_id': 'run', 'candidate_total': 0, 'checked_count': 0,
+                        'source_proof_id': 'source', 'source_proof_hash': 'source-hash',
+                    },
+                ), patch.object(
+                    actors.person_cleanup_db, 'get_alias_proof_source_diagnostic',
+                    return_value={
+                        'complete': True, 'source_proof_hash': 'source-hash', 'error': None,
                     },
                 ), patch.object(
                     actors.person_cleanup_db, 'stale_index_stop_requested', return_value=False,
@@ -324,6 +338,61 @@ class StaleIndexSnapshotTests(unittest.TestCase):
                 fail_run.assert_called_once()
                 self.assertTrue(fail_run.call_args.kwargs['stale'])
                 complete_run.assert_not_called()
+
+    def test_source_race_after_final_read_is_persisted_as_source_drift(self):
+        snapshot = {
+            'generation': 7, 'protection_hash': 'guard',
+            'normal_people_relationship_hash': 'people', 'person_hash': 'person',
+            'contract': {
+                'generation': 7, 'person_ids': set(), 'name_keys': set(),
+                'provider_identities': set(), 'alias_statuses': {},
+            },
+            'root_contract': {
+                'complete': True, 'selected_library_ids': set(), 'roots': (),
+            },
+            'item_people': {}, 'person_details': {}, 'media_count': 0,
+        }
+        processor = SimpleNamespace(is_stop_requested=lambda: False)
+        with patch.object(
+            actors.person_cleanup_db, 'get_latest_completed_alias_proof_source',
+            return_value={'proof_id': 'source'},
+        ), patch.object(
+            actors, '_build_stale_index_forensic_snapshots',
+            side_effect=[snapshot, snapshot],
+        ), patch.object(
+            actors.person_cleanup_db, 'create_stale_index_run', return_value={
+                'run_id': 'run', 'candidate_total': 0, 'checked_count': 0,
+                'source_proof_id': 'source', 'source_proof_hash': 'source-hash',
+            },
+        ), patch.object(
+            actors.person_cleanup_db, 'get_alias_proof_source_diagnostic',
+            side_effect=[
+                {'complete': True, 'source_proof_hash': 'source-hash', 'error': None},
+                {'complete': False, 'source_proof_hash': 'changed', 'error': 'source failed'},
+            ],
+        ), patch.object(
+            actors.person_cleanup_db, 'stale_index_stop_requested', return_value=False,
+        ), patch.object(
+            actors.person_cleanup_db, 'require_ready_protection_snapshot', return_value=7,
+        ), patch.object(
+            actors.person_cleanup_db, 'claim_stale_index_items', return_value=[],
+        ), patch.object(
+            actors.person_cleanup_db, 'record_stale_index_final_diagnostics',
+        ), patch.object(
+            actors.person_cleanup_db, 'complete_stale_index_run',
+            side_effect=RuntimeError('Alias Proof source 已变化'),
+        ), patch.object(
+            actors.person_cleanup_db, 'fail_stale_index_run',
+        ) as fail_run, patch.object(
+            actors.task_manager, 'update_status_from_thread',
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'source 已变化'):
+                actors.task_stale_index_readonly_forensic(processor)
+        fail_run.assert_called_once()
+        self.assertTrue(fail_run.call_args.kwargs['stale'])
+        self.assertTrue(
+            fail_run.call_args.kwargs['diagnostics']['drift_source_proof'],
+        )
 
     def test_task_worker_count_is_bounded_to_four(self):
         self.assertEqual(actors.PERSON_STALE_INDEX_WORKERS, 4)

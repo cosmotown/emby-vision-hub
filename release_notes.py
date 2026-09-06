@@ -2,6 +2,28 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.26",
+        "published_at": "2026-09-06T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.26",
+        "changelog": """## Stable Stale Index Safe Delete Canary
+
+- 只接受连续两次独立 completed forensic generation 中的 `stable_stale_index_signature`，并在 Preview、Confirm 和每位人物删除前重新验证证据。
+- 明确排除 same-name stale Person；单个 job 后端硬限制最多 100 人，按确定性顺序串行处理。
+- Preview 全程只读。用户明确确认后，每个 job 最多执行一次管理员认证 POST，并用 GET 严格验证管理员身份与 session 绑定。
+- 管理员认证不允许回退到 server API key；登录 timeout、连接中断、崩溃或结果不确定时不会自动重新登录。
+- DeletePerson 串行提交；每位 Person 的 `post_reserved + post_attempts=1` 必须先持久化提交，才允许发送唯一一次 mutation。
+- timeout、崩溃、restart、重复 worker 或不确定响应都不会重放 DeletePerson；mutation job 不支持重启续删。
+- DeletePerson 后执行 exact Person readback；最终 Protection 和全量 People relationship 必须完全不变，Person snapshot 只能精确减少 confirmed deleted IDs。
+
+### 真实隔离验收边界
+
+- Emby 4.9.5.x 与神医 Pro 3.0.0.51 隔离环境中，已通过真实管理员登录、认证会话验证、DB reserve 先于 mutation、真实 DeletePerson、exact missing 回读、relationship 不变、Person expected-diff 以及 restart 不重放验收。
+- 真实删除对象为一次性 synthetic ghost；stale-index 正向资格触发由确定性 fixture 覆盖，本版不声称完成了全链真实 stale-index 删除 E2E。
+
+""",
+    },
+
+    {
         "version": "v7.2.25",
         "published_at": "2026-09-03T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.25",

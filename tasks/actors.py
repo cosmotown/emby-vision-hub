@@ -27,6 +27,7 @@ from services.person_cleanup_safety import (
     classify_stale_index_forensic,
     find_ghost_candidates,
     is_explicit_verified_orphan,
+    match_item_to_protected_library,
     person_name_protection_keys,
     reference_check_failure_message,
 )
@@ -40,6 +41,7 @@ PERSON_ALIAS_PROOF_CLAIM_LIMIT = 4
 PERSON_STALE_INDEX_WORKERS = 4
 PERSON_STALE_INDEX_CLAIM_LIMIT = 4
 PERSON_STALE_INDEX_DRIFT_SAMPLE_LIMIT = 20
+PERSON_STALE_DELETE_CANARY_LIMIT = 100
 
 def _scan_protected_library_people(processor, protected_libraries, batch_size: int = 500):
     """Build a complete protected snapshot or raise without marking it ready."""
@@ -1179,6 +1181,7 @@ def _build_stale_index_forensic_snapshots(processor):
         'person_hash': person_hash,
         'identity_index': dict(identity_index),
         'media_count': int(normal_scan.get('media_count') or 0),
+        'libraries': libraries,
     }
 
 
@@ -1217,6 +1220,399 @@ def _check_stale_index_forensic_candidate(processor, source_item, snapshots):
         snapshots['root_contract'],
         protection_reason=protection_reason,
     )
+
+
+def _build_stale_delete_canary_snapshot(processor):
+    """Canary-only strengthening; never refresh/write protected snapshots."""
+    snapshot = _build_stale_index_forensic_snapshots(processor)
+    selected = person_cleanup_db.list_protected_libraries()
+    realtime = _scan_protected_library_people(processor, selected)
+    contract = snapshot['contract']
+    for library in realtime.values():
+        contract['name_keys'].update(build_person_name_protection_keys(library['all_person_names']))
+        for person in library['people']:
+            contract['person_ids'].add(person['person_id'])
+            contract['provider_identities'].update(canonical_person_provider_identities(
+                person['provider_ids'], strict=True,
+            ))
+    libraries = snapshot['libraries']
+    all_roots = build_protected_library_root_contract(libraries, [
+        {'library_id': library['info']['Id'], 'library_name': library['info']['Name']}
+        for library in libraries
+    ])
+    if not all_roots['complete']:
+        raise person_cleanup_db.CanarySafetyError('protection_drift', '完整媒体库 root contract 不可核验')
+    snapshot['all_roots'] = all_roots
+    # Bind all roots too: changing a normal root must not evade preview binding.
+    snapshot['protection_hash'] = _alias_proof_snapshot_hash({
+        'contract': _alias_proof_protection_hash(contract, all_roots),
+        # Keep realtime evidence separate: union with persisted protection must
+        # not hide a removal/change in the current protected library snapshot.
+        'realtime_protected': [
+            (library_id, int(facts['media_count']), sorted(facts['all_person_names']),
+             sorted(facts['people'], key=lambda person: person['person_id']))
+            for library_id, facts in sorted(realtime.items())
+        ],
+    })
+    snapshot['person_details'] = {
+        str(person_id): {key: detail.get(key) for key in ('Id', 'Type', 'Name', 'ProviderIds')}
+        for person_id, detail in snapshot['person_details'].items()
+    }
+    if person_cleanup_db.require_ready_protection_snapshot() != snapshot['generation']:
+        raise person_cleanup_db.CanarySafetyError('protection_drift', '保护 generation 已变化')
+    return snapshot
+
+
+def _check_stale_delete_canary_candidate(processor, source_item, snapshot):
+    """Exact fresh media DTOs, not cached relationship facts, authorize a canary."""
+    person_id = source_item['person_id']
+    query = emby.get_person_media_query_items_strict(processor.emby_url, processor.emby_api_key, person_id)
+    if query is None:
+        raise person_cleanup_db.CanarySafetyError('failed_safe', 'PersonIds GET 不完整')
+    if not query:
+        raise person_cleanup_db.CanarySafetyError('query_disappeared', 'PersonIds query 已消失')
+    seen = set()
+    for hit in query:
+        item_id = str(hit.get('Id') or '')
+        relationship = snapshot['item_people'].get(item_id)
+        if not item_id or item_id in seen:
+            raise person_cleanup_db.CanarySafetyError('failed_safe', 'query ID 缺失或重复')
+        seen.add(item_id)
+        owner = match_item_to_protected_library(hit, snapshot['all_roots'])
+        if not owner or not relationship or owner['protected_library_id'] != relationship['library_id']:
+            raise person_cleanup_db.CanarySafetyError('protected', 'query 无法绑定 exact normal library')
+        try:
+            response = emby.emby_client.get(
+                f"{processor.emby_url.rstrip('/')}/Items/{item_id}",
+                headers={'X-Emby-Token': processor.emby_api_key},
+                params={'Fields': 'People,Path'}, timeout=30, allow_redirects=False,
+            )
+            if response.status_code != 200:
+                raise ValueError('HTTP failure')
+            detail = response.json()
+            people = detail.get('People')
+            if (not isinstance(people, list) or not people or
+                    any(not isinstance(p, dict) or not p.get('Id') or not p.get('Name') for p in people)):
+                raise ValueError('People unavailable')
+            actual = tuple(sorted((str(p['Id']).strip(), str(p['Name']).strip()) for p in people))
+            if person_id in {p[0] for p in actual}:
+                raise person_cleanup_db.CanarySafetyError('linked', 'fresh exact People 已引用 candidate')
+            if (str(detail.get('Id')) != item_id or detail.get('Type') != relationship['item_type']
+                    or match_item_to_protected_library(detail, snapshot['all_roots']) != owner
+                    or actual != tuple(relationship['people'])):
+                raise person_cleanup_db.CanarySafetyError('relationship_drift', 'exact query item relationship 已变化')
+        except person_cleanup_db.CanarySafetyError:
+            raise
+        except Exception:
+            raise person_cleanup_db.CanarySafetyError('people_unavailable', 'exact query item People 无法完整核验') from None
+    # Refresh candidate and Person identity after media GETs. No second PersonIds
+    # request: classify precisely the same query items whose current DTOs we read.
+    rows = person_cleanup_db.get_candidates_by_ids([person_id], include_protected=True)
+    current = rows[0] if rows else None
+    detail = emby.get_person_detail_forensic_strict(processor.emby_url, processor.emby_api_key, person_id)
+    protection = person_cleanup_db.candidate_protection_reason(current, snapshot['contract']) if current else None
+    return classify_stale_index_forensic(
+        source_item, current, detail, snapshot['normal_ids'], snapshot['item_people'],
+        snapshot['identity_index'], query, snapshot['root_contract'], protection_reason=protection,
+    )
+
+
+def _stale_delete_canary_source_item(item):
+    return {
+        'person_id': str(item.get('person_id') or ''),
+        'person_name': item.get('person_name'),
+        'provider_ids': item.get('provider_ids') or {},
+        'candidate_fingerprint': str(item.get('candidate_fingerprint') or ''),
+        'source_proof_state': 'identity_not_found',
+    }
+
+
+def _stale_delete_canary_result_ready(result):
+    return bool(
+        isinstance(result, dict)
+        and result.get('forensic_state') == 'verified_stale_index_signature'
+        and result.get('identity_signal') == 'stale_index_no_identity_owner'
+        and result.get('people_signal') == 'stale_index_different_people'
+        and int(result.get('query_count') or 0) > 0
+        and int(result.get('actual_people_count') or 0) > 0
+        and int(result.get('same_name_other_count') or 0) == 0
+        and int(result.get('identity_owner_count') or 0) == 0
+    )
+
+
+def _stale_delete_canary_snapshot_equal(left, right):
+    return bool(
+        int(left.get('generation') or -1) == int(right.get('generation') or -2)
+        and left.get('protection_hash') == right.get('protection_hash')
+        and left.get('normal_people_relationship_hash')
+            == right.get('normal_people_relationship_hash')
+        and left.get('person_hash') == right.get('person_hash')
+        and left.get('item_people') == right.get('item_people')
+        and left.get('person_details') == right.get('person_details')
+    )
+
+
+def task_preview_stale_delete_canary(processor, job_id):
+    """Build a fixed GET-only Canary preview from two completed stable runs."""
+    try:
+        person_cleanup_db.validate_stale_delete_canary_chain(job_id)
+        admin_context = emby.ensure_admin_delete_context(processor.emby_url, processor.emby_api_key, job_id)
+        person_cleanup_db.bind_stale_delete_canary_admin_context(job_id, admin_context.binding_hash)
+        task_manager.update_status_from_thread(0, 'Stale Index Canary：构建完整只读快照...')
+        start_snapshot = _build_stale_delete_canary_snapshot(processor)
+        person_cleanup_db.set_stale_delete_canary_preview_snapshot(job_id, start_snapshot)
+        items = person_cleanup_db.list_stale_delete_canary_items(job_id)
+        total = len(items)
+        if total < 1 or total > PERSON_STALE_DELETE_CANARY_LIMIT:
+            raise RuntimeError('Canary 样本必须为 1 到 100，禁止空任务或越过硬上限')
+        for index, item in enumerate(items, start=1):
+            if processor.is_stop_requested() or person_cleanup_db.stale_delete_canary_stop_requested(job_id):
+                person_cleanup_db.fail_stale_delete_canary_job(
+                    job_id, 'stopped', 'Canary preview 已在人物边界停止；不得继续旧任务',
+                )
+                return
+            try:
+                result = _check_stale_delete_canary_candidate(
+                    processor, _stale_delete_canary_source_item(item), start_snapshot,
+                )
+            except person_cleanup_db.CanarySafetyError as exc:
+                result = {'forensic_state': exc.state, 'error': str(exc)}
+            ready = _stale_delete_canary_result_ready(result)
+            person_cleanup_db.mark_stale_delete_canary_preview_item(
+                job_id,
+                item['person_id'],
+                'canary_delete_ready' if ready else 'preflight_rejected',
+                evidence=result,
+                error=None if ready else (result.get('error') or '当前证据不满足 Canary 删除合同'),
+            )
+            task_manager.update_status_from_thread(
+                int(index * 90 / max(1, total)),
+                f'Stale Index Canary 预览 {index}/{total}',
+            )
+        person_cleanup_db.validate_stale_delete_canary_chain(job_id)
+        final_snapshot = _build_stale_delete_canary_snapshot(processor)
+        if not _stale_delete_canary_snapshot_equal(start_snapshot, final_snapshot):
+            raise RuntimeError('Canary preview 全局 snapshot 在预览期间漂移')
+        person_cleanup_db.finish_stale_delete_canary_preview(job_id)
+        task_manager.update_status_from_thread(100, 'Stale Index Canary 预览完成，等待独立确认')
+    except Exception as exc:
+        message = str(exc) if isinstance(exc, (person_cleanup_db.CanarySafetyError, emby.AdminDeleteContextError)) else f'Canary 预览中止: {type(exc).__name__}'
+        logger.error('Stale Index Canary 预览失败: %s', message)
+        try:
+            person_cleanup_db.fail_stale_delete_canary_job(
+                job_id, 'preview_failed', message,
+            )
+        except Exception:
+            logger.error('持久化 Canary preview 失败状态异常', exc_info=True)
+        raise RuntimeError(message) from None
+
+
+def _stop_stale_delete_canary_at_boundary(job_id, items, start_index, message):
+    for item in items[start_index:]:
+        person_cleanup_db.finish_stale_delete_canary_item(
+            job_id, item['person_id'], 'stopped_before_start', error=message,
+        )
+    person_cleanup_db.fail_stale_delete_canary_job(job_id, 'stopped', message)
+
+
+def task_execute_stale_delete_canary(processor, job_id):
+    """Delete at most 100 fixed stable signatures, serially and at most once."""
+    execution_snapshot = None
+    # A losing execution request returns without reading Emby OR changing the
+    # winner's persistent state. Startup interruption never permits takeover.
+    if not person_cleanup_db.claim_stale_delete_canary_execution(job_id):
+        return
+    try:
+        chain = person_cleanup_db.validate_stale_delete_canary_chain(job_id)
+        job = chain['job']
+        admin_context = emby.ensure_admin_delete_context(processor.emby_url, processor.emby_api_key, job_id)
+        person_cleanup_db.bind_stale_delete_canary_admin_context(job_id, admin_context.binding_hash, execution=True)
+        admin_context = emby.authenticate_canary_admin_once(admin_context,
+            before_submit=lambda: person_cleanup_db.reserve_stale_delete_canary_admin_auth(job_id))
+        person_cleanup_db.verify_stale_delete_canary_admin_auth(job_id, admin_context.user_id, admin_context.binding_hash)
+        task_manager.update_status_from_thread(0, 'Stale Index Canary：执行前重建完整快照...')
+        execution_snapshot = _build_stale_delete_canary_snapshot(processor)
+        for current_key, preview_key, state in (
+            ('generation', 'preview_snapshot_generation', 'protection_drift'),
+            ('protection_hash', 'preview_protection_hash', 'protection_drift'),
+            ('normal_people_relationship_hash', 'preview_relationship_hash', 'relationship_drift'),
+            ('person_hash', 'preview_person_hash', 'person_snapshot_drift'),
+        ):
+            if execution_snapshot[current_key] != job[preview_key]:
+                raise person_cleanup_db.CanarySafetyError(state, 'Canary execution preflight 与 preview snapshot 不一致')
+        person_cleanup_db.start_stale_delete_canary_job(job_id, execution_snapshot)
+        items = person_cleanup_db.list_stale_delete_canary_items(job_id, ready_only=True)
+        if not items or len(items) > PERSON_STALE_DELETE_CANARY_LIMIT:
+            raise RuntimeError('Canary ready 项目为空或超过后端硬上限')
+
+        confirmed_ids = set()
+        for index, item in enumerate(items):
+            if processor.is_stop_requested() or person_cleanup_db.stale_delete_canary_stop_requested(job_id):
+                _stop_stale_delete_canary_at_boundary(
+                    job_id, items, index,
+                    'Canary 已在人物边界停止；未开始项目不会继续，任务不可 resume',
+                )
+                return
+
+            result = {}
+            transport = {}
+            def before_submit():
+                nonlocal result
+                if processor.is_stop_requested() or person_cleanup_db.stale_delete_canary_stop_requested(job_id):
+                    raise person_cleanup_db.CanarySafetyError('stopped', '提交前收到停止请求')
+                person_cleanup_db.validate_stale_delete_canary_chain(job_id)
+                fresh = _build_stale_delete_canary_snapshot(processor)
+                expected_people = {key: value for key, value in execution_snapshot['person_details'].items()
+                                   if key not in confirmed_ids}
+                if fresh['protection_hash'] != execution_snapshot['protection_hash']:
+                    raise person_cleanup_db.CanarySafetyError('protection_drift', '删除前 protection 已变化')
+                if fresh['normal_people_relationship_hash'] != execution_snapshot['normal_people_relationship_hash']:
+                    raise person_cleanup_db.CanarySafetyError('relationship_drift', '删除前 relationship 已变化')
+                if fresh['person_details'] != expected_people:
+                    raise person_cleanup_db.CanarySafetyError('person_snapshot_drift', '删除前 Person snapshot 非预期变化')
+                result = _check_stale_delete_canary_candidate(processor, _stale_delete_canary_source_item(item), fresh)
+                if not _stale_delete_canary_result_ready(result):
+                    state = result.get('forensic_state')
+                    raise person_cleanup_db.CanarySafetyError(
+                        state if state in person_cleanup_db.STALE_DELETE_CANARY_TERMINAL_STATES else 'failed_safe',
+                        result.get('error') or '删除前证据失效',
+                    )
+                # The context manager commits BEFORE this returns. Commit
+                # failure/uncertainty propagates and the transport sends no POST.
+                emby.verify_canary_admin_session(admin_context, lost=True)
+                if not person_cleanup_db.reserve_stale_delete_canary_attempt(job_id, item['person_id']):
+                    raise person_cleanup_db.CanarySafetyError('delete_ambiguous', '已有尝试或状态改变，禁止提交')
+                return True
+            outcome = emby.delete_person_custom_api_outcome(
+                processor.emby_url,
+                processor.emby_api_key,
+                item['person_id'],
+                before_submit=before_submit, cached_auth_only=True,
+                admin_context=admin_context, context_job_id=job_id,
+                response_observer=lambda status: transport.update(http_status=status),
+            )
+            if outcome in ('auth_unavailable', 'admin_session_lost'):
+                message = '当前执行的管理员上下文已失效；停止执行，不会自动登录或重放删除'
+                person_cleanup_db.finish_stale_delete_canary_item(
+                    job_id, item['person_id'], 'precheck_failed', error=message,
+                    evidence=transport,
+                )
+                person_cleanup_db.fail_stale_delete_canary_job(job_id, 'admin_session_lost', message)
+                return
+            if outcome == 'ambiguous':
+                person_cleanup_db.finish_stale_delete_canary_item(
+                    job_id, item['person_id'], 'delete_ambiguous',
+                    evidence=transport,
+                    error='DeletePerson 结果不确定；禁止自动重放',
+                )
+                person_cleanup_db.fail_stale_delete_canary_job(
+                    job_id, 'delete_ambiguous',
+                    f"人物 {item['person_id']} DeletePerson 结果不确定；任务停止",
+                )
+                return
+            if outcome != 'confirmed':
+                person_cleanup_db.finish_stale_delete_canary_item(
+                    job_id, item['person_id'], 'delete_failed',
+                    evidence=transport,
+                    error='DeletePerson 明确失败；禁止继续 Canary',
+                )
+                person_cleanup_db.fail_stale_delete_canary_job(
+                    job_id, 'delete_failed',
+                    f"人物 {item['person_id']} DeletePerson 明确失败；任务停止",
+                )
+                return
+
+            readback = emby.get_person_detail_forensic_strict(
+                processor.emby_url,
+                processor.emby_api_key,
+                item['person_id'],
+            )
+            if readback.get('status') == 'person_missing':
+                person_cleanup_db.finish_stale_delete_canary_item(
+                    job_id, item['person_id'], 'confirmed_deleted',
+                    {**transport, 'readback': 'person_missing'},
+                )
+                person_cleanup_db.remove_candidate(item['person_id'])
+                confirmed_ids.add(str(item['person_id']))
+            elif readback.get('status') == 'ok':
+                person_cleanup_db.finish_stale_delete_canary_item(
+                    job_id, item['person_id'], 'delete_not_confirmed',
+                    {**transport, 'readback': 'person_exists'},
+                    'DeletePerson 返回成功但 exact GET 仍存在；禁止重放',
+                )
+                person_cleanup_db.fail_stale_delete_canary_job(
+                    job_id, 'delete_not_confirmed',
+                    f"人物 {item['person_id']} 删除未由 exact GET 确认；任务停止",
+                )
+                return
+            else:
+                person_cleanup_db.finish_stale_delete_canary_item(
+                    job_id, item['person_id'], 'delete_ambiguous',
+                    {**transport, 'readback': 'unavailable'},
+                    'DeletePerson 后 exact GET 不确定；禁止重放',
+                )
+                person_cleanup_db.fail_stale_delete_canary_job(
+                    job_id, 'delete_ambiguous',
+                    f"人物 {item['person_id']} 删除回读不确定；任务停止",
+                )
+                return
+
+            task_manager.update_status_from_thread(
+                int((index + 1) * 95 / max(1, len(items))),
+                f'Stale Index Canary 串行删除 {index + 1}/{len(items)}',
+            )
+
+        person_cleanup_db.validate_stale_delete_canary_chain(job_id)
+        final_snapshot = _build_stale_delete_canary_snapshot(processor)
+        expected_people = {
+            person_id: detail
+            for person_id, detail in execution_snapshot['person_details'].items()
+            if str(person_id) not in confirmed_ids
+        }
+        verification = {
+            'protection_unchanged': final_snapshot['generation'] == execution_snapshot['generation']
+                and final_snapshot['protection_hash'] == execution_snapshot['protection_hash'],
+            'relationship_unchanged': final_snapshot['normal_people_relationship_hash'] == execution_snapshot['normal_people_relationship_hash']
+                and final_snapshot['item_people'] == execution_snapshot['item_people'],
+            'person_delta_exact': final_snapshot['person_details'] == expected_people,
+            'final_protection_hash': final_snapshot['protection_hash'],
+            'final_relationship_hash': final_snapshot['normal_people_relationship_hash'],
+            'final_person_hash': final_snapshot['person_hash'],
+            'confirmed_deleted_count': len(confirmed_ids),
+        }
+        if not all(verification[key] for key in ('protection_unchanged', 'relationship_unchanged', 'person_delta_exact')):
+            person_cleanup_db.fail_stale_delete_canary_job(
+                job_id, 'environment_drift',
+                'Canary 最终全局快照不是 execution start 减去 confirmed IDs',
+                final_verification=verification,
+            )
+            return
+        person_cleanup_db.complete_stale_delete_canary_job(job_id, verification)
+        task_manager.update_status_from_thread(100, 'Stale Index Canary 已完成并通过全局验证')
+    except Exception as exc:
+        # Do not persist/log a raw HTTP exception (it may contain URLs/secrets).
+        state = exc.state if isinstance(exc, (person_cleanup_db.CanarySafetyError, emby.AdminDeleteContextError)) else 'failed_safe'
+        message = str(exc) if isinstance(exc, (person_cleanup_db.CanarySafetyError, emby.AdminDeleteContextError)) else f'Canary 执行中止: {type(exc).__name__}'
+        logger.error('Stale Index Canary 执行失败: %s', message)
+        current = person_cleanup_db.get_stale_delete_canary_job(job_id)
+        if current and current.get('admin_auth_state') == 'post_reserved' and state == 'failed_safe':
+            state = 'admin_auth_ambiguous'
+        if current and current.get('state') not in person_cleanup_db.STALE_DELETE_CANARY_TERMINAL_STATES:
+            persisted_items = person_cleanup_db.list_stale_delete_canary_items(job_id)
+            if any(row.get('execute_state') == 'post_reserved' for row in persisted_items):
+                state = 'delete_ambiguous'
+            elif 'item' in locals():
+                if current.get('stop_requested'):
+                    state = 'stopped'
+                person_cleanup_db.finish_stale_delete_canary_item(
+                    job_id, item['person_id'], 'precheck_failed', error=message,
+                )
+            elif current.get('stop_requested'):
+                state = 'stopped'
+            person_cleanup_db.fail_stale_delete_canary_job(
+                job_id, state, message,
+            )
+        raise RuntimeError(message) from None
 
 
 def task_stale_index_readonly_forensic(processor, run_id=None):

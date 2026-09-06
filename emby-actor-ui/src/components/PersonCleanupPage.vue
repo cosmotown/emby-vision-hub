@@ -401,6 +401,99 @@
       </n-space>
     </n-card>
 
+    <n-card size="small" title="Stable Stale Index Safe Delete Canary" style="margin-bottom: 16px;">
+      <n-alert type="error" style="margin-bottom: 12px;">
+        独立 Canary 仅从连续两轮 completed Stale Index 稳定证据中确定性抽样，后端硬上限 100。
+        这是不可逆 Person 删除操作，不会批量删除全部稳定候选。任一抽样人物预检拒绝则整次预览不可执行。
+        它不是 orphan 清理，也不提供全量删除、全选或 limit 覆盖；停止或重启后该任务不可 resume。
+        预览仅只读；明确确认后，本 execution 最多一次管理员登录。认证或会话失效即停止，不自动重新登录。
+      </n-alert>
+      <n-space v-if="!staleDeleteCanaryJob" justify="end">
+        <n-button type="warning" :disabled="isBackgroundBusy" @click="startStaleDeleteCanaryPreview">
+          创建最多 100 人 Canary 预览
+        </n-button>
+      </n-space>
+      <template v-else>
+        <n-descriptions bordered :column="2" label-placement="left">
+          <n-descriptions-item label="状态">{{ staleDeleteCanaryJob.state }}</n-descriptions-item>
+          <n-descriptions-item label="硬上限">100（不可覆盖）</n-descriptions-item>
+          <n-descriptions-item label="管理员认证">
+            {{ staleDeleteCanaryJob.admin_auth_state || 'pending' }}（{{ staleDeleteCanaryJob.admin_auth_attempts || 0 }} / 1）
+          </n-descriptions-item>
+          <n-descriptions-item label="管理员会话已核验">
+            {{ staleDeleteCanaryJob.admin_session_verified === true ? '是' : '否' }}
+          </n-descriptions-item>
+          <n-descriptions-item label="稳定证据 generation">
+            {{ staleDeleteCanaryJob.previous_generation }} → {{ staleDeleteCanaryJob.latest_generation }}
+          </n-descriptions-item>
+          <n-descriptions-item label="符合条件 / 抽样">
+            {{ staleDeleteCanaryJob.eligible_total || 0 }} / {{ staleDeleteCanaryJob.candidate_total || 0 }}
+          </n-descriptions-item>
+          <n-descriptions-item label="Canary ready">{{ staleDeleteCanaryJob.ready_count || 0 }}</n-descriptions-item>
+          <n-descriptions-item label="确认删除">{{ staleDeleteCanaryJob.confirmed_deleted_count || 0 }}</n-descriptions-item>
+          <n-descriptions-item label="Stable 总数">{{ staleDeleteCanaryJob.stable_total || 0 }}</n-descriptions-item>
+          <n-descriptions-item label="Same-name 排除">{{ staleDeleteCanaryJob.same_name_excluded || 0 }}</n-descriptions-item>
+          <n-descriptions-item label="预检拒绝">{{ staleDeleteCanaryJob.items?.filter(item => item.preview_state === 'preflight_rejected').length || 0 }}</n-descriptions-item>
+          <n-descriptions-item label="结果不确定">{{ staleDeleteCanaryJob.ambiguous_count || 0 }}</n-descriptions-item>
+        </n-descriptions>
+        <n-alert v-if="staleDeleteCanaryJob.last_error" type="warning" style="margin-top: 12px;">
+          {{ staleDeleteCanaryJob.last_error }}
+        </n-alert>
+        <n-alert v-if="staleDeleteCanaryJob.final_verification?.person_delta_exact === true" type="success" style="margin-top: 12px;">
+          全局终检通过：保护和 People 关系未变化；Person 集合仅减去已逐项回读确认删除的 ID。
+        </n-alert>
+        <n-list v-if="staleDeleteCanaryJob.items?.length" bordered style="margin-top: 12px; max-height: 280px; overflow: auto;">
+          <n-list-item v-for="item in staleDeleteCanaryJob.items" :key="item.person_id">
+            <n-space justify="space-between">
+              <span>{{ item.person_name || item.person_id }}（{{ item.person_id }}）</span>
+              <n-text>{{ item.preview_state }} / {{ item.execute_state }}</n-text>
+            </n-space>
+            <n-text v-if="item.last_error" depth="3">{{ item.last_error }}</n-text>
+            <n-text v-if="item.post_attempts" depth="3">提交次数 {{ item.post_attempts }}；HTTP {{ item.http_status ?? '未知' }}；回读 {{ item.readback_state || '未确认' }}</n-text>
+          </n-list-item>
+        </n-list>
+        <n-space justify="end" style="margin-top: 12px;">
+          <n-button
+            v-if="['previewing', 'preview_ready', 'confirmed', 'preflighting', 'running', 'stop_requested'].includes(staleDeleteCanaryJob.state)"
+            type="warning"
+            @click="stopStaleDeleteCanary"
+          >在人物边界停止</n-button>
+          <n-button
+            v-if="staleDeleteCanaryJob.state === 'preview_ready'"
+            type="error"
+            :disabled="isBackgroundBusy"
+            @click="openStaleDeleteCanaryConfirmation"
+          >确认 Canary 串行删除</n-button>
+          <n-button
+            v-if="!['previewing', 'preview_ready', 'confirmed', 'preflighting', 'running', 'stop_requested'].includes(staleDeleteCanaryJob.state)"
+            type="warning"
+            secondary
+            :disabled="isBackgroundBusy"
+            @click="startStaleDeleteCanaryPreview"
+          >创建新的 Canary 预览</n-button>
+        </n-space>
+      </template>
+    </n-card>
+
+    <n-modal v-model:show="staleDeleteCanaryConfirmVisible" :mask-closable="false">
+      <n-card class="person-verify-card" title="确认 Stable Stale Index Canary" closable @close="staleDeleteCanaryConfirmVisible = false">
+        <n-alert type="error" style="margin-bottom: 12px;">
+          令牌仅对当前固定预览有效并在 10 分钟后过期。执行串行且遇到任何失败立即停止，不会自动重放。
+        </n-alert>
+        <n-text>请输入：确认删除稳定陈旧索引 Canary 人物</n-text>
+        <n-input v-model:value="staleDeleteCanaryConfirmation" style="margin-top: 8px;" />
+        <n-space justify="end" style="margin-top: 12px;">
+          <n-button @click="staleDeleteCanaryConfirmVisible = false">取消</n-button>
+          <n-button
+            type="error"
+            :loading="staleDeleteCanaryConfirming"
+            :disabled="staleDeleteCanaryConfirmation !== '确认删除稳定陈旧索引 Canary 人物'"
+            @click="confirmStaleDeleteCanary"
+          >执行独立 Canary</n-button>
+        </n-space>
+      </n-card>
+    </n-modal>
+
     <n-space align="center" style="margin: 16px 0 10px;">
       <n-text strong>全服务器幽灵人物候选</n-text>
       <n-text depth="3">已排除当前在用人物、保护库快照身份，以及只读核验确认的保护库别名人物。</n-text>
@@ -882,9 +975,15 @@ const staleIndexSamples = ref([]);
 const staleIndexSamplesPage = ref(1);
 const staleIndexSamplesPageSize = 20;
 const staleIndexSamplesTotal = ref(0);
+const staleDeleteCanaryJob = ref(null);
+const staleDeleteCanaryConfirmVisible = ref(false);
+const staleDeleteCanaryConfirmation = ref('');
+const staleDeleteCanaryToken = ref('');
+const staleDeleteCanaryConfirming = ref(false);
 let safeCleanupPollTimer = null;
 let aliasProofPollTimer = null;
 let staleIndexPollTimer = null;
+let staleDeleteCanaryPollTimer = null;
 const pagination = { pageSize: 30, showSizePicker: true, pageSizes: [20, 30, 50, 100] };
 
 const currentAction = computed(() => props.taskStatus?.current_action || '');
@@ -1510,6 +1609,78 @@ const openStaleIndexSamples = async (row) => {
   await fetchStaleIndexSamples(1);
 };
 
+const scheduleStaleDeleteCanaryPoll = () => {
+  if (staleDeleteCanaryPollTimer) window.clearTimeout(staleDeleteCanaryPollTimer);
+  if (!staleDeleteCanaryJob.value || !['previewing', 'confirmed', 'preflighting', 'running', 'stop_requested'].includes(staleDeleteCanaryJob.value.state)) return;
+  staleDeleteCanaryPollTimer = window.setTimeout(fetchStaleDeleteCanary, 1200);
+};
+
+const fetchStaleDeleteCanary = async () => {
+  try {
+    const response = await axios.get('/api/person-cleanup/stale-delete-canary/latest');
+    staleDeleteCanaryJob.value = response.data.job || null;
+    scheduleStaleDeleteCanaryPoll();
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法读取 Stale Index Canary 状态');
+  }
+};
+
+const startStaleDeleteCanaryPreview = async () => {
+  try {
+    await axios.post('/api/person-cleanup/stale-delete-canary/preview', { limit: 100 });
+    message.success('Canary GET-only 预览已提交；尚未执行删除');
+    window.setTimeout(fetchStaleDeleteCanary, 500);
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法创建 Stale Index Canary 预览');
+  }
+};
+
+const openStaleDeleteCanaryConfirmation = async () => {
+  try {
+    const response = await axios.post(
+      `/api/person-cleanup/stale-delete-canary/${encodeURIComponent(staleDeleteCanaryJob.value.job_id)}/confirmation-token`,
+    );
+    staleDeleteCanaryToken.value = response.data.confirmation_token;
+    staleDeleteCanaryConfirmation.value = '';
+    staleDeleteCanaryConfirmVisible.value = true;
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法签发 Canary 短时确认令牌');
+  }
+};
+
+const confirmStaleDeleteCanary = async () => {
+  staleDeleteCanaryConfirming.value = true;
+  try {
+    await axios.post(
+      `/api/person-cleanup/stale-delete-canary/${encodeURIComponent(staleDeleteCanaryJob.value.job_id)}/confirm`,
+      {
+        confirmation: staleDeleteCanaryConfirmation.value,
+        confirmation_token: staleDeleteCanaryToken.value,
+      },
+    );
+    staleDeleteCanaryConfirmVisible.value = false;
+    staleDeleteCanaryToken.value = '';
+    message.warning('Stale Index Canary 已确认，开始串行执行并逐项严格回读');
+    window.setTimeout(fetchStaleDeleteCanary, 500);
+  } catch (error) {
+    message.error(error.response?.data?.error || 'Stale Index Canary 确认失败');
+  } finally {
+    staleDeleteCanaryConfirming.value = false;
+  }
+};
+
+const stopStaleDeleteCanary = async () => {
+  try {
+    await axios.post(
+      `/api/person-cleanup/stale-delete-canary/${encodeURIComponent(staleDeleteCanaryJob.value.job_id)}/stop`,
+    );
+    staleDeleteCanaryJob.value = { ...staleDeleteCanaryJob.value, state: 'stop_requested' };
+    scheduleStaleDeleteCanaryPoll();
+  } catch (error) {
+    message.error(error.response?.data?.error || '无法停止 Stale Index Canary');
+  }
+};
+
 const confirmDelete = () => {
   const selectedNames = candidates.value
     .filter((item) => selectedIds.value.includes(item.person_id))
@@ -1692,12 +1863,14 @@ onMounted(() => {
   fetchLatestSafeCleanupJob();
   fetchAliasProof();
   fetchStaleIndex();
+  fetchStaleDeleteCanary();
 });
 
 onBeforeUnmount(() => {
   if (safeCleanupPollTimer) window.clearTimeout(safeCleanupPollTimer);
   if (aliasProofPollTimer) window.clearTimeout(aliasProofPollTimer);
   if (staleIndexPollTimer) window.clearTimeout(staleIndexPollTimer);
+  if (staleDeleteCanaryPollTimer) window.clearTimeout(staleDeleteCanaryPollTimer);
 });
 </script>
 

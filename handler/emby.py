@@ -9,13 +9,15 @@ import base64
 import shutil
 import time
 import threading
+import hashlib
+from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from threading import BoundedSemaphore
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import config_manager
 import constants
@@ -3153,7 +3155,172 @@ def upload_item_primary_image_from_url(
         return False
 
 
-def delete_person_custom_api_outcome(base_url: str, api_key: str, person_id: str) -> str:
+@dataclass(frozen=True)
+class AdminDeleteContext:
+    """Execution-local capability; never serialized or retained in a cache."""
+    base_url: str
+    user_id: str
+    user_name: str
+    job_id: str
+    binding_hash: str
+    process_id: int
+    access_token: str = field(repr=False)
+    session_id: str = field(default='', repr=False)
+    device_id: str = ''
+
+
+class AdminDeleteContextError(RuntimeError):
+    """Only fixed, secret-free diagnostics may cross the task boundary."""
+    def __init__(self, state):
+        self.state = state
+        super().__init__(state)
+
+
+def ensure_admin_delete_context(base_url: str, api_key: str, job_id: str) -> AdminDeleteContext:
+    """Resolve only the explicitly configured administrator using GET, not login.
+
+    This resolves a principal for preview binding, NOT a usable session.
+    Only authenticate_canary_admin_once can create the execution capability.
+    """
+    configured_url = str(config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_SERVER_URL) or '').rstrip('/')
+    configured_key = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_KEY)
+    name = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_ADMIN_USER)
+    endpoint = urlsplit(configured_url)
+    if (not base_url or base_url.rstrip('/') != configured_url or not api_key
+            or endpoint.scheme not in ('http', 'https') or not endpoint.netloc
+            or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment
+            or api_key != configured_key or not isinstance(name, str) or not name.strip()
+            or not isinstance(job_id, str) or not job_id):
+        raise AdminDeleteContextError('admin_credentials_missing')
+    try:
+        def read(path):
+            response = emby_client.get(
+                configured_url + path, headers={'X-Emby-Token': api_key},
+                timeout=15, allow_redirects=False,
+            )
+            if response.status_code != 200:
+                raise ValueError('http_failure')
+            return response.json()
+        users = read('/Users')
+        if not isinstance(users, list) or any(not isinstance(u, dict) for u in users):
+            raise ValueError('invalid_users')
+        matched = [u for u in users if u.get('Name') == name]
+        if len(matched) != 1:
+            raise ValueError('configured_admin_not_unique')
+        user_id = matched[0].get('Id')
+        if not isinstance(user_id, str) or not user_id or not user_id.isalnum():
+            raise ValueError('invalid_admin_id')
+        detail = read('/Users/' + user_id)
+        for user in (matched[0], detail):
+            if (not isinstance(user, dict) or user.get('Id') != user_id or user.get('Name') != name
+                    or not isinstance(user.get('Policy'), dict)
+                    or user['Policy'].get('IsAdministrator') is not True
+                    or user['Policy'].get('IsDisabled') is not False):
+                raise ValueError('configured_admin_not_enabled')
+    except AdminDeleteContextError:
+        raise
+    except Exception:
+        raise AdminDeleteContextError('admin_session_not_admin') from None
+    # Bind the confirmed job to this exact principal, endpoint and credential.
+    # Persist only the one-way binding; never persist the API key or token.
+    binding = hashlib.sha256(json.dumps(
+        [configured_url, user_id, name, job_id, api_key], separators=(',', ':'),
+    ).encode()).hexdigest()
+    return AdminDeleteContext(configured_url, user_id, name, job_id, binding, os.getpid(), '')
+
+
+def verify_canary_admin_session(context, *, lost=False):
+    """GET-only check of both the exact user policy and execution's session."""
+    state = 'admin_session_lost' if lost else 'admin_session_invalid'
+    if (not isinstance(context, AdminDeleteContext) or context.process_id != os.getpid()
+            or not context.access_token or not context.session_id or not context.device_id):
+        raise AdminDeleteContextError(state)
+    try:
+        user_response = emby_client.get(
+            context.base_url + '/Users/' + context.user_id,
+            headers={'X-Emby-Token': context.access_token}, timeout=15, allow_redirects=False)
+        if user_response.status_code != 200:
+            raise ValueError('user_read_failed')
+        user = user_response.json()
+        if not isinstance(user, dict) or user.get('Id') != context.user_id or user.get('Name') != context.user_name:
+            raise ValueError('user_identity_changed')
+        policy = user.get('Policy')
+        if (not isinstance(policy, dict) or policy.get('IsAdministrator') is not True
+                or policy.get('IsDisabled') is not False):
+            raise AdminDeleteContextError('admin_session_lost' if lost else 'admin_session_not_admin')
+        response = emby_client.get(
+            context.base_url + '/Sessions', params={'DeviceId': context.device_id},
+            headers={'X-Emby-Token': context.access_token}, timeout=15, allow_redirects=False)
+        if response.status_code != 200:
+            raise ValueError('session_read_failed')
+        sessions = response.json()
+        if not isinstance(sessions, list) or any(not isinstance(s, dict) for s in sessions):
+            raise ValueError('invalid_sessions')
+        matched = [s for s in sessions if s.get('Id') == context.session_id]
+        if (len(matched) != 1 or matched[0].get('UserId') != context.user_id
+                or matched[0].get('DeviceId') != context.device_id):
+            raise ValueError('session_not_bound')
+    except AdminDeleteContextError:
+        raise
+    except Exception:
+        raise AdminDeleteContextError(state) from None
+    return True
+
+
+def authenticate_canary_admin_once(principal, *, before_submit):
+    """One reserved login POST, then GET verification. No cache or fallback."""
+    cfg = dict(config_manager.APP_CONFIG)
+    password = cfg.get(constants.CONFIG_OPTION_EMBY_ADMIN_PASS)
+    if (not isinstance(principal, AdminDeleteContext) or principal.access_token
+            or not isinstance(password, str) or not password
+            or cfg.get(constants.CONFIG_OPTION_EMBY_ADMIN_USER) != principal.user_name):
+        raise AdminDeleteContextError('admin_credentials_missing')
+    current_url = str(cfg.get(constants.CONFIG_OPTION_EMBY_SERVER_URL) or '').rstrip('/')
+    current_key = cfg.get(constants.CONFIG_OPTION_EMBY_API_KEY)
+    binding = hashlib.sha256(json.dumps(
+        [current_url, principal.user_id, principal.user_name, principal.job_id, current_key],
+        separators=(',', ':'),
+    ).encode()).hexdigest()
+    if current_url != principal.base_url or not current_key or binding != principal.binding_hash:
+        raise AdminDeleteContextError('admin_session_invalid')
+    device_id = hashlib.sha256(('canary:' + principal.job_id).encode()).hexdigest()
+    # Callback must commit before the request. Never catch/retry a commit error.
+    if before_submit() is not True:
+        raise AdminDeleteContextError('admin_auth_failed')
+    try:
+        response = emby_client.post_once(
+            principal.base_url + '/Users/AuthenticateByName',
+            headers={'X-Emby-Authorization': f'Emby Client="Emby Vision Hub", Device="EVH Canary", DeviceId="{device_id}", Version="{constants.APP_VERSION}"'},
+            json={'Username': principal.user_name, 'Pw': password},
+            timeout=30, allow_redirects=False,
+        )
+    except Exception:
+        raise AdminDeleteContextError('admin_auth_ambiguous') from None
+    if 300 <= response.status_code < 500:
+        raise AdminDeleteContextError('admin_auth_failed')
+    if not 200 <= response.status_code < 300:
+        raise AdminDeleteContextError('admin_auth_ambiguous')
+    try:
+        data = response.json()
+        token, user, session = data['AccessToken'], data['User'], data['SessionInfo']
+        if (not isinstance(token, str) or not token
+                or token == current_key
+                or user['Id'] != principal.user_id or user['Name'] != principal.user_name
+                or not isinstance(session.get('Id'), str) or not session['Id']):
+            raise ValueError('invalid_authentication')
+        context = AdminDeleteContext(principal.base_url, principal.user_id, principal.user_name,
+            principal.job_id, principal.binding_hash, os.getpid(), token, session['Id'], device_id)
+    except Exception:
+        raise AdminDeleteContextError('admin_auth_ambiguous') from None
+    verify_canary_admin_session(context)
+    return context
+
+
+def delete_person_custom_api_outcome(
+    base_url: str, api_key: str, person_id: str, *,
+    before_submit=None, cached_auth_only=False, response_observer=None,
+    admin_context=None, context_job_id=None,
+) -> str:
     """
     【V-Final Frontier 终极版 - 同样使用账密获取令牌】
     通过模拟管理员登录获取临时 AccessToken 来删除演员。
@@ -3163,7 +3330,45 @@ def delete_person_custom_api_outcome(base_url: str, api_key: str, person_id: str
     logger.trace(f"检测到删除演员请求，将尝试使用 [自动登录模式] 执行...")
 
     # 1. 登录获取临时令牌
-    access_token, logged_in_user_id = get_admin_access_token()
+    if admin_context is not None:
+        # Only a fresh preflight-created, process-local capability is accepted.
+        # Do not discover/login once per Person; the server still enforces auth
+        # on the mutation if permission is revoked after execution preflight.
+        if (not isinstance(admin_context, AdminDeleteContext)
+                or admin_context.process_id != os.getpid()
+                or admin_context.job_id != context_job_id
+                or admin_context.base_url != base_url.rstrip('/')
+                or not admin_context.access_token or admin_context.access_token == api_key
+                or not admin_context.session_id or not admin_context.device_id
+                or config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_API_KEY) != api_key
+                or str(config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_SERVER_URL) or '').rstrip('/') != admin_context.base_url
+                or config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_ADMIN_USER) != admin_context.user_name):
+            return 'auth_unavailable'
+        access_token, logged_in_user_id = admin_context.access_token, admin_context.user_id
+    elif cached_auth_only:
+        # Canary must not create an authentication POST as a hidden side effect.
+        configured_url = config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_EMBY_SERVER_URL) or ''
+        if configured_url.rstrip('/') != base_url.rstrip('/'):
+            return 'auth_unavailable'
+        access_token = _admin_token_cache.get('access_token')
+        logged_in_user_id = _admin_token_cache.get('user_id')
+        if not access_token or not logged_in_user_id:
+            return 'auth_unavailable'
+        try:
+            auth = emby_client.get(
+                f"{base_url.rstrip('/')}/Users/{logged_in_user_id}",
+                headers={'X-Emby-Token': access_token}, timeout=15, allow_redirects=False,
+            )
+            if auth.status_code != 200:
+                return 'auth_unavailable'
+            user = auth.json()
+            if (not isinstance(user, dict) or str(user.get('Id')) != str(logged_in_user_id)
+                    or user.get('Policy', {}).get('IsAdministrator') is not True):
+                return 'auth_unavailable'
+        except Exception:
+            return 'auth_unavailable'
+    else:
+        access_token, logged_in_user_id = get_admin_access_token()
     
     if not access_token:
         logger.error("  🚫 无法获取临时 AccessToken，删除演员操作中止。请检查管理员账号密码是否正确。")
@@ -3183,6 +3388,11 @@ def delete_person_custom_api_outcome(base_url: str, api_key: str, person_id: str
         'UserId': logged_in_user_id # ★ 使用登录后返回的 UserId
     }
     
+    # The callback must commit the irreversible DB reservation. It runs AFTER
+    # any waiting/authentication, immediately before the sole mutation request.
+    # Exceptions propagate without sending POST; ambiguous commits never replay.
+    if before_submit is not None and before_submit() is not True:
+        return 'failed'
     try:
         # 这个接口是 POST 请求
         response = emby_client.post_once(
@@ -3192,10 +3402,14 @@ def delete_person_custom_api_outcome(base_url: str, api_key: str, person_id: str
             timeout=60,
         )
         status_code = int(response.status_code)
+        if response_observer is not None:
+            response_observer(status_code)
         if 200 <= status_code < 300:
             logger.info(f"  ✅ 成功提交删除演员 ID: {person_id}。")
             return 'confirmed'
         if 300 <= status_code < 500:
+            if admin_context is not None and status_code in (400, 401, 403):
+                return 'admin_session_lost'
             if status_code == 404:
                 logger.error(f"删除演员 {person_id} 失败：需神医Pro版本才支持此功能。")
             else:

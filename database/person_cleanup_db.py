@@ -1826,6 +1826,885 @@ def list_stale_index_items(
     return {'items': items, 'total': total, 'page': safe_page, 'page_size': safe_size}
 
 
+STALE_DELETE_CANARY_LIMIT = 100
+STALE_DELETE_CANARY_CONFIRMATION_TTL_MINUTES = 10
+STALE_DELETE_CANARY_TERMINAL_STATES = {
+    'canary_verified', 'preview_failed', 'preflight_failed', 'stopped',
+    'delete_failed', 'delete_ambiguous', 'delete_not_confirmed',
+    'environment_drift', 'interrupted_requires_review',
+    'confirmation_expired', 'evidence_drift', 'protection_drift',
+    'relationship_drift', 'person_snapshot_drift', 'source_proof_drift',
+    'candidate_changed', 'linked', 'protected', 'people_unavailable',
+    'query_disappeared', 'failed_safe',
+    'admin_credentials_missing', 'admin_auth_failed', 'admin_auth_ambiguous',
+    'admin_session_not_admin', 'admin_session_invalid', 'admin_session_lost',
+}
+
+
+class CanarySafetyError(RuntimeError):
+    def __init__(self, state, reason):
+        super().__init__(reason)
+        self.state = state
+
+
+def _canary_preview_fingerprint(cursor, job):
+    keys = (
+        'job_id', 'job_type', 'token_purpose', 'latest_run_id', 'previous_run_id',
+        'latest_generation', 'previous_generation', 'latest_source_proof_id',
+        'latest_source_proof_hash', 'previous_source_proof_id',
+        'previous_source_proof_hash', 'requested_limit', 'candidate_total',
+        'preview_snapshot_generation', 'preview_protection_hash',
+        'preview_relationship_hash', 'preview_person_hash',
+        'preview_admin_context_hash',
+    )
+    cursor.execute("""
+        SELECT person_id, candidate_fingerprint, provider_ids, deterministic_rank,
+               latest_forensic_state, previous_forensic_state,
+               latest_identity_signal, previous_identity_signal,
+               latest_people_signal, previous_people_signal,
+               latest_stable_pass_count, previous_stable_pass_count,
+               preview_state, preview_evidence
+        FROM person_cleanup_stale_delete_job_items
+        WHERE job_id = %s ORDER BY deterministic_rank, person_id
+    """, (str(job['job_id']),))
+    items = [dict(row) for row in cursor.fetchall()]
+    if not 0 < len(items) == int(job['candidate_total']) <= 100:
+        raise CanarySafetyError('evidence_drift', 'Canary 固定样本计数不完整')
+    payload = {key: job.get(key) for key in keys}
+    payload['items'] = items
+    return hashlib.sha256(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'),
+    ).encode('utf-8')).hexdigest()
+
+
+def _assert_canary_preview_fingerprint(cursor, job):
+    if (
+        job.get('job_type') != 'canary'
+        or job.get('token_purpose') != 'stable_stale_canary_delete'
+        or not job.get('preview_fingerprint')
+        or not secrets.compare_digest(
+            _canary_preview_fingerprint(cursor, job), job['preview_fingerprint'],
+        )
+    ):
+        raise CanarySafetyError('evidence_drift', 'Canary preview fingerprint 已变化')
+
+
+def _validate_stale_delete_source_run(cursor, run: Dict[str, Any]) -> None:
+    """Validate one immutable completed Stale Index source run."""
+    required_hashes = (
+        'source_proof_hash', 'protection_hash',
+        'normal_people_relationship_hash', 'person_snapshot_hash',
+    )
+    if (
+        not run or run.get('state') != 'completed'
+        or int(run.get('candidate_total') or -1) < 0
+        or int(run.get('checked_count') or -1) != int(run.get('candidate_total') or -2)
+        or any(not str(run.get(key) or '').strip() for key in required_hashes)
+    ):
+        raise RuntimeError('Stale Index source run 不完整或未完成')
+    if any(bool(run.get(key)) for key in (
+        'drift_generation', 'drift_protection', 'drift_normal_relationship',
+        'drift_person', 'drift_source_proof',
+    )):
+        raise RuntimeError('Stale Index source run 存在 snapshot drift')
+    final_pairs = (
+        ('snapshot_generation', 'final_snapshot_generation'),
+        ('protection_hash', 'final_protection_hash'),
+        ('normal_people_relationship_hash', 'final_normal_people_relationship_hash'),
+        ('person_snapshot_hash', 'final_person_snapshot_hash'),
+        ('source_proof_hash', 'final_source_proof_hash'),
+    )
+    # v7.2.24 completed runs predate persisted diagnostics. When final values are
+    # present they must be complete and exact; absent legacy diagnostics never
+    # override the original completed-run transaction contract.
+    present = [run.get(final) is not None for _, final in final_pairs]
+    if any(present) and not all(present):
+        raise RuntimeError('Stale Index source run final snapshot 不完整')
+    if all(present):
+        for start, final in final_pairs:
+            if str(run.get(start)) != str(run.get(final)):
+                raise RuntimeError('Stale Index source run final snapshot 已漂移')
+    source = _require_complete_alias_proof_source(cursor, run['source_proof_id'])
+    if source['source_proof_hash'] != run['source_proof_hash']:
+        raise CanarySafetyError('source_proof_drift', 'Stale Index source Alias Proof 已变化')
+    cursor.execute("""
+        SELECT COUNT(*)::INTEGER AS total,
+               COUNT(*) FILTER (WHERE forensic_state IN ('pending', 'checking')
+                   OR NOT (forensic_state = ANY(%s)))::INTEGER AS invalid
+        FROM person_cleanup_stale_index_items WHERE run_id = %s
+    """, (sorted(STALE_INDEX_FORENSIC_STATES), str(run['run_id'])))
+    counts = cursor.fetchone()
+    if int(counts['total']) != int(run['candidate_total']) or int(counts['invalid']):
+        raise CanarySafetyError('evidence_drift', 'Stale Index source 项目计数或状态不完整')
+
+
+def _load_stale_delete_source_chain(cursor) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    cursor.execute(
+        """
+        SELECT * FROM person_cleanup_stale_index_runs
+        WHERE state = 'completed'
+        ORDER BY forensic_generation DESC, run_id DESC
+        LIMIT 2
+        """
+    )
+    runs = [dict(row) for row in cursor.fetchall()]
+    if len(runs) != 2:
+        raise RuntimeError('需要连续两轮 completed Stale Index 证据')
+    latest, previous = runs
+    if (
+        str(latest['run_id']) == str(previous['run_id'])
+        or int(latest['forensic_generation']) != int(previous['forensic_generation']) + 1
+    ):
+        raise RuntimeError('最近两轮 Stale Index generation 不连续')
+    _validate_stale_delete_source_run(cursor, latest)
+    _validate_stale_delete_source_run(cursor, previous)
+    return latest, previous
+
+
+def _stale_delete_canary_eligible_rows(cursor, latest, previous) -> List[Dict[str, Any]]:
+    cursor.execute(
+        """
+        SELECT latest.person_id, latest.person_name, latest.provider_ids,
+               latest.candidate_fingerprint,
+               latest.forensic_state AS latest_forensic_state,
+               previous.forensic_state AS previous_forensic_state,
+               latest.identity_signal AS latest_identity_signal,
+               previous.identity_signal AS previous_identity_signal,
+               latest.people_signal AS latest_people_signal,
+               previous.people_signal AS previous_people_signal,
+               latest.stable_pass_count AS latest_stable_pass_count,
+               previous.stable_pass_count AS previous_stable_pass_count
+        FROM person_cleanup_stale_index_items latest
+        JOIN person_cleanup_stale_index_items previous
+          ON previous.run_id = %s
+         AND previous.person_id = latest.person_id
+         AND previous.candidate_fingerprint = latest.candidate_fingerprint
+        JOIN person_cleanup_alias_proof_items latest_proof
+          ON latest_proof.proof_id = %s AND latest_proof.person_id = latest.person_id
+         AND latest_proof.candidate_fingerprint = latest.candidate_fingerprint
+         AND latest_proof.proof_state = 'identity_not_found'
+        JOIN person_cleanup_alias_proof_items previous_proof
+          ON previous_proof.proof_id = %s AND previous_proof.person_id = previous.person_id
+         AND previous_proof.candidate_fingerprint = previous.candidate_fingerprint
+         AND previous_proof.proof_state = 'identity_not_found'
+        WHERE latest.run_id = %s
+          AND latest.forensic_state = 'stable_stale_index_signature'
+          AND latest.stable_pass_count >= 2
+          AND latest.identity_signal = 'stale_index_no_identity_owner'
+          AND latest.people_signal = 'stale_index_different_people'
+          AND previous.forensic_state = ANY(%s)
+          AND previous.stable_pass_count >= 1
+          AND previous.identity_signal = 'stale_index_no_identity_owner'
+          AND previous.people_signal = 'stale_index_different_people'
+        ORDER BY latest.person_id ASC
+        """,
+        (
+            str(previous['run_id']), str(latest['source_proof_id']),
+            str(previous['source_proof_id']), str(latest['run_id']),
+            sorted(STALE_INDEX_SIGNATURE_STATES),
+        ),
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def create_stale_delete_canary_job(limit: int = STALE_DELETE_CANARY_LIMIT) -> Dict[str, Any]:
+    requested_limit = int(limit)
+    if requested_limit < 1 or requested_limit > STALE_DELETE_CANARY_LIMIT:
+        raise ValueError('Canary limit 必须为 1 到 100，后端硬上限不可覆盖')
+    job_id = str(uuid.uuid4())
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            latest, previous = _load_stale_delete_source_chain(cursor)
+            eligible = _stale_delete_canary_eligible_rows(cursor, latest, previous)
+            ranked = []
+            for row in eligible:
+                rank = hashlib.sha256(
+                    f"{latest['run_id']}:{row['person_id']}".encode('utf-8')
+                ).hexdigest()
+                ranked.append((rank, row))
+            ranked.sort(key=lambda item: (item[0], str(item[1]['person_id'])))
+            selected = ranked[:requested_limit]
+            cursor.execute("""
+                SELECT COUNT(*) FILTER (WHERE forensic_state = 'stable_stale_index_signature')::INTEGER AS stable_total,
+                       COUNT(*) FILTER (WHERE people_signal = 'stale_index_same_name_other_person')::INTEGER AS excluded
+                FROM person_cleanup_stale_index_items WHERE run_id = %s
+            """, (str(latest['run_id']),))
+            source_counts = cursor.fetchone()
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO person_cleanup_stale_delete_jobs (
+                        job_id, state, latest_run_id, previous_run_id,
+                        latest_generation, previous_generation,
+                        latest_source_proof_id, latest_source_proof_hash,
+                        previous_source_proof_id, previous_source_proof_hash,
+                        requested_limit, eligible_total, candidate_total, stable_total, same_name_excluded
+                    ) VALUES (
+                        %s, 'previewing', %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        job_id, str(latest['run_id']), str(previous['run_id']),
+                        int(latest['forensic_generation']), int(previous['forensic_generation']),
+                        str(latest['source_proof_id']), str(latest['source_proof_hash']),
+                        str(previous['source_proof_id']), str(previous['source_proof_hash']),
+                        requested_limit, len(eligible), len(selected),
+                        int(source_counts['stable_total']), int(source_counts['excluded']),
+                    ),
+                )
+            except Exception as exc:
+                raise RuntimeError('已有活动中的 Stale Index Canary 任务') from exc
+            for rank, row in selected:
+                cursor.execute(
+                    """
+                    INSERT INTO person_cleanup_stale_delete_job_items (
+                        job_id, person_id, person_name, provider_ids,
+                        candidate_fingerprint, deterministic_rank,
+                        latest_forensic_state, previous_forensic_state,
+                        latest_identity_signal, previous_identity_signal,
+                        latest_people_signal, previous_people_signal,
+                        latest_stable_pass_count, previous_stable_pass_count
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        job_id, str(row['person_id']), row.get('person_name'),
+                        json.dumps(row.get('provider_ids') or {}, ensure_ascii=False),
+                        str(row['candidate_fingerprint']), rank,
+                        row['latest_forensic_state'], row['previous_forensic_state'],
+                        row['latest_identity_signal'], row['previous_identity_signal'],
+                        row['latest_people_signal'], row['previous_people_signal'],
+                        int(row['latest_stable_pass_count']),
+                        int(row['previous_stable_pass_count']),
+                    ),
+                )
+    return get_stale_delete_canary_job(job_id, include_items=True)
+
+
+def get_stale_delete_canary_job(job_id: Optional[str] = None, include_items: bool = False):
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            if job_id:
+                cursor.execute(
+                    "SELECT * FROM person_cleanup_stale_delete_jobs WHERE job_id = %s",
+                    (str(job_id),),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT * FROM person_cleanup_stale_delete_jobs
+                    ORDER BY created_at DESC, job_id DESC LIMIT 1
+                    """
+                )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            if include_items:
+                cursor.execute(
+                    """
+                    SELECT * FROM person_cleanup_stale_delete_job_items
+                    WHERE job_id = %s
+                    ORDER BY deterministic_rank ASC, person_id ASC
+                    """,
+                    (str(result['job_id']),),
+                )
+                result['items'] = [dict(item) for item in cursor.fetchall()]
+            return result
+
+
+def validate_stale_delete_canary_chain(job_id: str) -> Dict[str, Any]:
+    """Re-read and lock the two fixed source runs; never select a newer proof."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT * FROM person_cleanup_stale_delete_jobs WHERE job_id = %s FOR SHARE",
+                (str(job_id),),
+            )
+            job = cursor.fetchone()
+            if not job:
+                raise RuntimeError('Canary job 不存在')
+            cursor.execute(
+                "SELECT * FROM person_cleanup_stale_index_runs WHERE run_id = %s",
+                (str(job['latest_run_id']),),
+            )
+            latest = cursor.fetchone()
+            cursor.execute(
+                "SELECT * FROM person_cleanup_stale_index_runs WHERE run_id = %s",
+                (str(job['previous_run_id']),),
+            )
+            previous = cursor.fetchone()
+            if not latest or not previous:
+                raise RuntimeError('Canary 固定 source run 已缺失')
+            latest, previous = dict(latest), dict(previous)
+            _validate_stale_delete_source_run(cursor, latest)
+            _validate_stale_delete_source_run(cursor, previous)
+            expected = dict(job)
+            cursor.execute("""
+                SELECT run_id FROM person_cleanup_stale_index_runs
+                WHERE state = 'completed' ORDER BY forensic_generation DESC, run_id DESC LIMIT 2
+            """)
+            if [str(row['run_id']) for row in cursor.fetchall()] != [
+                str(expected['latest_run_id']), str(expected['previous_run_id']),
+            ]:
+                raise CanarySafetyError('evidence_drift', '最新 completed stable evidence 已变化')
+            if (
+                str(latest['run_id']) != str(expected['latest_run_id'])
+                or str(previous['run_id']) != str(expected['previous_run_id'])
+                or int(latest['forensic_generation']) != int(expected['latest_generation'])
+                or int(previous['forensic_generation']) != int(expected['previous_generation'])
+                or int(latest['forensic_generation']) != int(previous['forensic_generation']) + 1
+                or latest['source_proof_hash'] != expected['latest_source_proof_hash']
+                or previous['source_proof_hash'] != expected['previous_source_proof_hash']
+                or latest['source_proof_id'] != expected['latest_source_proof_id']
+                or previous['source_proof_id'] != expected['previous_source_proof_id']
+            ):
+                raise CanarySafetyError('evidence_drift', 'Canary 固定 stable evidence chain 已变化')
+            eligible = {
+                str(row['person_id']): row
+                for row in _stale_delete_canary_eligible_rows(cursor, latest, previous)
+            }
+            cursor.execute("""
+                SELECT * FROM person_cleanup_stale_delete_job_items WHERE job_id = %s
+            """, (str(job_id),))
+            selected = [dict(row) for row in cursor.fetchall()]
+            if not 0 < len(selected) == int(job['candidate_total']) <= 100:
+                raise CanarySafetyError('evidence_drift', 'Canary selected evidence 不完整')
+            for row in selected:
+                original = eligible.get(str(row['person_id']))
+                if original is None or any(row.get(key) != value for key, value in original.items()):
+                    raise CanarySafetyError('evidence_drift', 'Canary item stable evidence 已变化')
+            if job.get('preview_fingerprint'):
+                _assert_canary_preview_fingerprint(cursor, job)
+            return {'job': expected, 'latest': latest, 'previous': previous}
+
+
+def list_stale_delete_canary_items(job_id: str, ready_only: bool = False) -> List[Dict[str, Any]]:
+    where = " AND preview_state = 'canary_delete_ready' AND execute_state = 'pending'" if ready_only else ''
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT * FROM person_cleanup_stale_delete_job_items
+                WHERE job_id = %s{where}
+                ORDER BY deterministic_rank ASC, person_id ASC
+                """,
+                (str(job_id),),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
+def _refresh_stale_delete_canary_counts(cursor, job_id: str) -> None:
+    cursor.execute(
+        """
+        UPDATE person_cleanup_stale_delete_jobs jobs
+        SET ready_count = counts.ready_count,
+            confirmed_deleted_count = counts.confirmed_deleted_count,
+            failed_count = counts.failed_count,
+            ambiguous_count = counts.ambiguous_count,
+            updated_at = NOW()
+        FROM (
+            SELECT
+                COUNT(*) FILTER (WHERE preview_state = 'canary_delete_ready')::INTEGER AS ready_count,
+                COUNT(*) FILTER (WHERE execute_state = 'confirmed_deleted')::INTEGER AS confirmed_deleted_count,
+                COUNT(*) FILTER (WHERE execute_state NOT IN ('pending', 'confirmed_deleted'))::INTEGER AS failed_count,
+                COUNT(*) FILTER (WHERE execute_state IN ('post_reserved', 'delete_ambiguous', 'delete_not_confirmed'))::INTEGER AS ambiguous_count
+            FROM person_cleanup_stale_delete_job_items WHERE job_id = %s
+        ) counts
+        WHERE jobs.job_id = %s
+        """,
+        (str(job_id), str(job_id)),
+    )
+
+
+def reserve_stale_delete_canary_admin_auth(job_id: str) -> bool:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT * FROM person_cleanup_stale_delete_jobs WHERE job_id=%s FOR UPDATE', (str(job_id),))
+            job = cursor.fetchone()
+            if (not job or job['state'] != 'preflighting' or job['stop_requested']
+                    or job['admin_auth_attempts'] != 0
+                    or not job['execution_admin_context_hash']
+                    or job['execution_admin_context_hash'] != job['preview_admin_context_hash']):
+                return False
+            _assert_canary_preview_fingerprint(cursor, job)
+            cursor.execute("""
+                UPDATE person_cleanup_stale_delete_jobs
+                SET admin_auth_state='post_reserved', admin_auth_attempts=1,
+                    admin_auth_reserved_at=NOW(), updated_at=NOW()
+                WHERE job_id=%s AND admin_auth_attempts=0 RETURNING job_id
+            """, (str(job_id),))
+            return cursor.fetchone() is not None
+
+
+def verify_stale_delete_canary_admin_auth(job_id: str, user_id: str, binding_hash: str) -> None:
+    if not isinstance(user_id, str) or not user_id:
+        raise CanarySafetyError('admin_session_invalid', '缺少已验证管理员 ID')
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                UPDATE person_cleanup_stale_delete_jobs
+                SET admin_auth_state='verified', admin_session_verified=TRUE,
+                    admin_user_id=%s, admin_auth_verified_at=NOW(), updated_at=NOW()
+                WHERE job_id=%s AND state='preflighting' AND NOT stop_requested
+                    AND admin_auth_state='post_reserved' AND admin_auth_attempts=1
+                    AND execution_admin_context_hash=%s AND preview_admin_context_hash=%s
+                RETURNING job_id
+            """, (user_id, str(job_id), binding_hash, binding_hash))
+            if not cursor.fetchone():
+                raise CanarySafetyError('admin_session_invalid', '认证核验后任务状态改变')
+
+
+def bind_stale_delete_canary_admin_context(job_id: str, binding_hash: str, *, execution=False) -> None:
+    if not isinstance(binding_hash, str) or len(binding_hash) != 64 or any(c not in '0123456789abcdef' for c in binding_hash):
+        raise CanarySafetyError('failed_safe', '管理员上下文 binding 无效')
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            if execution:
+                cursor.execute("""
+                    UPDATE person_cleanup_stale_delete_jobs
+                    SET execution_admin_context_hash = %s, updated_at = NOW()
+                    WHERE job_id = %s AND state = 'preflighting'
+                        AND preview_admin_context_hash = %s AND NOT stop_requested
+                    RETURNING job_id
+                """, (binding_hash, str(job_id), binding_hash))
+            else:
+                cursor.execute("""
+                    UPDATE person_cleanup_stale_delete_jobs
+                    SET preview_admin_context_hash = %s, updated_at = NOW()
+                    WHERE job_id = %s AND state = 'previewing' AND NOT stop_requested
+                        AND preview_admin_context_hash IS NULL
+                    RETURNING job_id
+                """, (binding_hash, str(job_id)))
+            if not cursor.fetchone():
+                raise CanarySafetyError('failed_safe', '管理员上下文变化或任务不可执行；必须重新预览')
+
+
+def set_stale_delete_canary_preview_snapshot(job_id: str, snapshot: Dict[str, Any]) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_delete_jobs
+                SET preview_snapshot_generation = %s, preview_protection_hash = %s,
+                    preview_relationship_hash = %s, preview_person_hash = %s,
+                    updated_at = NOW()
+                WHERE job_id = %s AND state = 'previewing'
+                RETURNING job_id
+                """,
+                (
+                    int(snapshot['generation']), str(snapshot['protection_hash']),
+                    str(snapshot['normal_people_relationship_hash']),
+                    str(snapshot['person_hash']), str(job_id),
+                ),
+            )
+            if not cursor.fetchone():
+                raise RuntimeError('Canary preview 状态已变化')
+
+
+def mark_stale_delete_canary_preview_item(
+    job_id: str, person_id: str, state: str,
+    evidence: Optional[Dict[str, Any]] = None, error: Optional[str] = None,
+) -> bool:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_delete_job_items
+                SET preview_state = %s, preview_evidence = %s, last_error = %s
+                WHERE job_id = %s AND person_id = %s AND preview_state = 'pending'
+                RETURNING person_id
+                """,
+                (
+                    str(state), json.dumps(evidence or {}, ensure_ascii=False),
+                    str(error)[:4000] if error else None,
+                    str(job_id), str(person_id),
+                ),
+            )
+            changed = cursor.fetchone() is not None
+            if changed:
+                _refresh_stale_delete_canary_counts(cursor, job_id)
+            return changed
+
+
+def finish_stale_delete_canary_preview(job_id: str) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT *
+                FROM person_cleanup_stale_delete_jobs
+                WHERE job_id = %s AND state = 'previewing' FOR UPDATE
+                """,
+                (str(job_id),),
+            )
+            job = cursor.fetchone()
+            if not job or any(job.get(key) is None for key in (
+                'preview_snapshot_generation', 'preview_protection_hash',
+                'preview_relationship_hash', 'preview_person_hash',
+                'preview_admin_context_hash',
+            )):
+                raise RuntimeError('Canary preview snapshot 不完整')
+            cursor.execute(
+                """
+                SELECT COUNT(*)::INTEGER AS total,
+                       COUNT(*) FILTER (WHERE preview_state = 'pending')::INTEGER AS pending,
+                       COUNT(*) FILTER (WHERE preview_state = 'canary_delete_ready')::INTEGER AS ready
+                FROM person_cleanup_stale_delete_job_items WHERE job_id = %s
+                """,
+                (str(job_id),),
+            )
+            counts = cursor.fetchone()
+            if int(counts['pending'] or 0):
+                raise RuntimeError('Canary preview 项目未全部终结')
+            fingerprint = _canary_preview_fingerprint(cursor, job)
+            _refresh_stale_delete_canary_counts(cursor, job_id)
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_delete_jobs
+                SET state = CASE WHEN ready_count = candidate_total AND ready_count > 0
+                                 THEN 'preview_ready' ELSE 'preview_failed' END,
+                    last_error = CASE WHEN ready_count = candidate_total AND ready_count > 0
+                                      THEN NULL ELSE '固定样本未全部通过实时预检；禁止执行' END,
+                    preview_fingerprint = %s,
+                    preview_completed_at = NOW(), updated_at = NOW()
+                WHERE job_id = %s AND state = 'previewing'
+                """,
+                (fingerprint, str(job_id)),
+            )
+
+
+def fail_stale_delete_canary_job(job_id: str, state: str, error: str, *, final_verification=None) -> None:
+    if state not in STALE_DELETE_CANARY_TERMINAL_STATES:
+        raise ValueError(f'不支持的 Canary 终态: {state}')
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            if state.startswith('admin_'):
+                cursor.execute("""
+                    UPDATE person_cleanup_stale_delete_jobs
+                    SET admin_auth_state=%s, admin_session_verified=FALSE WHERE job_id=%s
+                """, (state, str(job_id)))
+            _refresh_stale_delete_canary_counts(cursor, job_id)
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_delete_jobs
+                SET state = %s, completed_at = NOW(), updated_at = NOW(),
+                    confirmation_token_hash = NULL,
+                    confirmation_token_expires_at = NULL,
+                    last_error = %s,
+                    final_verification = COALESCE(%s::jsonb, final_verification)
+                WHERE job_id = %s
+                  AND state IN ('previewing', 'preview_ready', 'confirmed',
+                                'preflighting', 'running', 'stop_requested')
+                """,
+                (str(state), str(error)[:4000], json.dumps(final_verification) if final_verification is not None else None, str(job_id)),
+            )
+
+
+def issue_stale_delete_canary_confirmation_token(job_id: str) -> str:
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM person_cleanup_stale_delete_jobs WHERE job_id = %s FOR UPDATE", (str(job_id),))
+            job = cursor.fetchone()
+            if not job or job['state'] != 'preview_ready':
+                raise RuntimeError('Canary preview 未就绪')
+            _assert_canary_preview_fingerprint(cursor, job)
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_delete_jobs
+                SET confirmation_token_hash = %s,
+                    confirmation_token_expires_at = NOW() + INTERVAL '10 minutes',
+                    updated_at = NOW()
+                WHERE job_id = %s AND state = 'preview_ready'
+                  AND ready_count > 0 AND candidate_total <= 100
+                  AND preview_fingerprint IS NOT NULL
+                RETURNING job_id
+                """,
+                (token_hash, str(job_id)),
+            )
+            if not cursor.fetchone():
+                raise RuntimeError('Canary preview 未就绪、为空或已失效')
+    return token
+
+
+def confirm_stale_delete_canary_job(job_id: str, token: str) -> None:
+    token_hash = hashlib.sha256(str(token).encode('utf-8')).hexdigest()
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                UPDATE person_cleanup_stale_delete_jobs
+                SET state = 'confirmation_expired', completed_at = NOW(),
+                    confirmation_token_hash = NULL, confirmation_token_expires_at = NULL,
+                    last_error = '确认令牌已过期；需要新预览'
+                WHERE job_id = %s AND state = 'preview_ready'
+                  AND confirmation_token_expires_at <= NOW()
+                RETURNING job_id
+            """, (str(job_id),))
+            expired = cursor.fetchone() is not None
+    if expired:
+        raise CanarySafetyError('confirmation_expired', 'Canary 确认令牌已过期')
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM person_cleanup_stale_delete_jobs WHERE job_id = %s FOR UPDATE", (str(job_id),))
+            job = cursor.fetchone()
+            if not job or job['state'] != 'preview_ready':
+                raise RuntimeError('Canary 确认状态已变化')
+            _assert_canary_preview_fingerprint(cursor, job)
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_delete_jobs
+                SET state = 'confirmed', confirmed_at = NOW(), updated_at = NOW(),
+                    confirmation_token_hash = NULL,
+                    confirmation_token_expires_at = NULL
+                WHERE job_id = %s AND state = 'preview_ready'
+                  AND confirmation_token_hash = %s
+                  AND confirmation_token_expires_at > NOW()
+                  AND ready_count > 0 AND ready_count = candidate_total AND candidate_total <= 100
+                RETURNING job_id
+                """,
+                (str(job_id), token_hash),
+            )
+            if not cursor.fetchone():
+                raise RuntimeError('Canary 确认令牌错误、过期或任务状态已变化')
+
+
+def claim_stale_delete_canary_execution(job_id: str) -> bool:
+    """Only one process may enter preflight; no automatic takeover/replay."""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                UPDATE person_cleanup_stale_delete_jobs
+                SET state = 'preflighting', updated_at = NOW()
+                WHERE job_id = %s AND state = 'confirmed' AND NOT stop_requested
+                RETURNING job_id
+            """, (str(job_id),))
+            return cursor.fetchone() is not None
+
+
+def start_stale_delete_canary_job(job_id: str, snapshot: Dict[str, Any]) -> None:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_delete_jobs
+                SET state = 'running', started_at = NOW(), updated_at = NOW(),
+                    execution_snapshot_generation = %s,
+                    execution_protection_hash = %s,
+                    execution_relationship_hash = %s,
+                    execution_person_hash = %s,
+                    last_error = NULL
+                WHERE job_id = %s AND state = 'preflighting' AND NOT stop_requested
+                  AND preview_snapshot_generation = %s
+                  AND preview_protection_hash = %s
+                  AND preview_relationship_hash = %s
+                  AND preview_person_hash = %s
+                  AND execution_admin_context_hash = preview_admin_context_hash
+                  AND execution_admin_context_hash IS NOT NULL
+                  AND admin_auth_state='verified' AND admin_auth_attempts=1
+                  AND admin_session_verified=TRUE
+                RETURNING job_id
+                """,
+                (
+                    int(snapshot['generation']), str(snapshot['protection_hash']),
+                    str(snapshot['normal_people_relationship_hash']),
+                    str(snapshot['person_hash']), str(job_id),
+                    int(snapshot['generation']), str(snapshot['protection_hash']),
+                    str(snapshot['normal_people_relationship_hash']),
+                    str(snapshot['person_hash']),
+                ),
+            )
+            if not cursor.fetchone():
+                raise RuntimeError('Canary execution preflight snapshot 与 preview 不一致')
+
+
+def request_stale_delete_canary_stop(job_id: str) -> bool:
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_delete_jobs
+                SET stop_requested = TRUE,
+                    state = CASE WHEN state IN ('confirmed', 'preview_ready') THEN 'stopped'
+                                 WHEN state = 'running' THEN 'stop_requested' ELSE state END,
+                    completed_at = CASE WHEN state IN ('confirmed', 'preview_ready') THEN NOW() ELSE completed_at END,
+                    confirmation_token_hash = NULL, confirmation_token_expires_at = NULL,
+                    updated_at = NOW()
+                WHERE job_id = %s AND state IN ('previewing', 'preview_ready', 'confirmed', 'preflighting', 'running', 'stop_requested')
+                RETURNING job_id
+                """,
+                (str(job_id),),
+            )
+            return bool(cursor.fetchone())
+
+
+def stale_delete_canary_stop_requested(job_id: str) -> bool:
+    job = get_stale_delete_canary_job(job_id)
+    return bool(job and job.get('stop_requested'))
+
+
+def reserve_stale_delete_canary_attempt(job_id: str, person_id: str) -> bool:
+    """Atomically commit both global and Canary post_attempts=1 before POST."""
+    operation_id = f'stale-canary:{job_id}'
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT state, stop_requested, execution_snapshot_generation,
+                       preview_admin_context_hash, execution_admin_context_hash,
+                       admin_auth_state, admin_auth_attempts, admin_session_verified
+                FROM person_cleanup_stale_delete_jobs
+                WHERE job_id = %s FOR UPDATE
+                """,
+                (str(job_id),),
+            )
+            job = cursor.fetchone()
+            if not job or job['state'] != 'running' or job['stop_requested']:
+                return False
+            if (not job.get('execution_admin_context_hash')
+                    or job['execution_admin_context_hash'] != job.get('preview_admin_context_hash')):
+                raise CanarySafetyError('failed_safe', 'POST reservation 缺少已绑定管理员上下文')
+            if (job['admin_auth_state'] != 'verified' or job['admin_auth_attempts'] != 1
+                    or job['admin_session_verified'] is not True):
+                raise CanarySafetyError('admin_session_invalid', 'Person reservation 必须晚于管理员认证核验')
+            cursor.execute("""
+                SELECT generation, snapshot_state FROM person_cleanup_protection_state
+                WHERE singleton = TRUE FOR SHARE
+            """)
+            protection = cursor.fetchone()
+            if (not protection or protection['snapshot_state'] != 'ready'
+                    or protection['generation'] != job['execution_snapshot_generation']):
+                raise CanarySafetyError('protection_drift', 'POST reservation 前保护 generation 已变化')
+            cursor.execute("""
+                SELECT * FROM person_cleanup_candidates WHERE person_id = %s FOR SHARE
+            """, (str(person_id),))
+            candidate = cursor.fetchone()
+            cursor.execute("""
+                SELECT candidate_fingerprint FROM person_cleanup_stale_delete_job_items
+                WHERE job_id = %s AND person_id = %s AND preview_state = 'canary_delete_ready'
+            """, (str(job_id), str(person_id)))
+            expected = cursor.fetchone()
+            if not candidate or not expected or candidate_fingerprint(candidate) != expected['candidate_fingerprint']:
+                raise CanarySafetyError('candidate_changed', 'POST reservation 前 candidate fingerprint 已变化')
+            cursor.execute(
+                """
+                INSERT INTO person_cleanup_delete_attempts (
+                    person_id, operation_id, state, post_attempts
+                ) VALUES (%s, %s, 'submitting', 1)
+                ON CONFLICT (person_id) DO NOTHING
+                RETURNING person_id
+                """,
+                (str(person_id), operation_id),
+            )
+            if not cursor.fetchone():
+                return False
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_delete_job_items
+                SET execute_state = 'post_reserved', post_attempts = 1,
+                    submitted_at = NOW(), last_error = NULL
+                WHERE job_id = %s AND person_id = %s
+                  AND preview_state = 'canary_delete_ready'
+                  AND execute_state = 'pending' AND post_attempts = 0
+                RETURNING person_id
+                """,
+                (str(job_id), str(person_id)),
+            )
+            if not cursor.fetchone():
+                cursor.execute(
+                    """
+                    DELETE FROM person_cleanup_delete_attempts
+                    WHERE person_id = %s AND operation_id = %s AND state = 'submitting'
+                    """,
+                    (str(person_id), operation_id),
+                )
+                return False
+            return True
+
+
+def finish_stale_delete_canary_item(
+    job_id: str, person_id: str, state: str,
+    evidence: Optional[Dict[str, Any]] = None, error: Optional[str] = None,
+) -> bool:
+    allowed = {
+        'confirmed_deleted', 'delete_failed', 'delete_ambiguous',
+        'delete_not_confirmed', 'precheck_failed', 'stopped_before_start',
+    }
+    if state not in allowed:
+        raise ValueError(f'不支持的 Canary item 状态: {state}')
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_delete_job_items
+                SET execute_state = %s, execute_evidence = %s,
+                    completed_at = NOW(), last_error = %s,
+                    http_status = %s, readback_state = %s,
+                    deleted_at = CASE WHEN %s = 'confirmed_deleted' THEN NOW() ELSE NULL END
+                WHERE job_id = %s AND person_id = %s
+                  AND execute_state IN ('pending', 'post_reserved')
+                  AND (%s != 'confirmed_deleted' OR (execute_state = 'post_reserved' AND post_attempts = 1))
+                RETURNING post_attempts
+                """,
+                (
+                    str(state), json.dumps(evidence or {}, ensure_ascii=False),
+                    str(error)[:4000] if error else None,
+                    (evidence or {}).get('http_status'), (evidence or {}).get('readback'),
+                    str(state), str(job_id), str(person_id), str(state),
+                ),
+            )
+            changed = cursor.fetchone()
+            if not changed:
+                return False
+            if int(changed['post_attempts'] or 0) == 1:
+                attempt_state = {
+                    'confirmed_deleted': 'confirmed',
+                    'delete_failed': 'failed',
+                    'delete_ambiguous': 'ambiguous',
+                    'delete_not_confirmed': 'ambiguous',
+                    'precheck_failed': 'failed',
+                }.get(state)
+                if attempt_state:
+                    cursor.execute(
+                        """
+                        UPDATE person_cleanup_delete_attempts
+                        SET state = %s, completed_at = NOW(), last_error = %s
+                        WHERE person_id = %s AND operation_id = %s
+                        """,
+                        (
+                            attempt_state, str(error)[:4000] if error else None,
+                            str(person_id), f'stale-canary:{job_id}',
+                        ),
+                    )
+            _refresh_stale_delete_canary_counts(cursor, job_id)
+            return True
+
+
+def complete_stale_delete_canary_job(job_id: str, verification: Dict[str, Any]) -> None:
+    if not all(verification.get(key) is True for key in (
+        'protection_unchanged', 'relationship_unchanged', 'person_delta_exact',
+    )):
+        raise CanarySafetyError('environment_drift', 'Canary final verification 不完整')
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            _refresh_stale_delete_canary_counts(cursor, job_id)
+            cursor.execute(
+                """
+                UPDATE person_cleanup_stale_delete_jobs
+                SET state = 'canary_verified', completed_at = NOW(), updated_at = NOW(),
+                    last_error = NULL, final_verification = %s
+                WHERE job_id = %s AND state = 'running' AND NOT stop_requested
+                  AND confirmed_deleted_count = ready_count
+                  AND ready_count = candidate_total AND failed_count = 0 AND ready_count > 0
+                RETURNING job_id
+                """,
+                (json.dumps(verification, sort_keys=True), str(job_id)),
+            )
+            if not cursor.fetchone():
+                raise RuntimeError('Canary 最终项目计数未闭环')
+
+
 def list_candidates() -> List[Dict[str, Any]]:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:

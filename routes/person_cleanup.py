@@ -22,6 +22,8 @@ from tasks.actors import (
     task_preview_safe_person_cleanup,
     task_scan_ghost_actor_candidates,
     task_stale_index_readonly_forensic,
+    task_preview_stale_delete_canary,
+    task_execute_stale_delete_canary,
 )
 
 
@@ -261,6 +263,120 @@ def stop_stale_index_forensic(run_id):
     if not person_cleanup_db.request_stale_index_stop(run_id):
         return jsonify({'error': 'Stale Index 只读取证未运行或状态已变化'}), 409
     return jsonify({'message': '已请求安全停止；当前 bounded GET 将完成后停止'})
+
+
+@person_cleanup_bp.route('/stale-delete-canary/preview', methods=['POST'])
+@admin_required
+@task_lock_required
+@processor_ready_required
+def create_stale_delete_canary_preview():
+    payload = request.get_json(silent=True) or {}
+    try:
+        limit = int(payload.get('limit', 100))
+        job = person_cleanup_db.create_stale_delete_canary_job(limit=limit)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        return jsonify({'error': str(exc)}), 409
+    submitted = task_manager.submit_task(
+        task_preview_stale_delete_canary,
+        'Stale Index Safe Delete Canary 预览',
+        processor_type='media',
+        job_id=job['job_id'],
+    )
+    if not submitted:
+        person_cleanup_db.fail_stale_delete_canary_job(
+            job['job_id'], 'preview_failed', '后台任务繁忙，Canary 预览未启动',
+        )
+        return jsonify({'error': 'Canary 预览提交失败，未执行任何删除'}), 409
+    return jsonify({
+        'job_id': job['job_id'],
+        'state': 'previewing',
+        'hard_limit': person_cleanup_db.STALE_DELETE_CANARY_LIMIT,
+        'message': 'Canary GET-only 预览已提交；此阶段不会删除人物',
+    }), 202
+
+
+@person_cleanup_bp.route('/stale-delete-canary/latest', methods=['GET'])
+@admin_required
+def get_latest_stale_delete_canary():
+    job = person_cleanup_db.get_stale_delete_canary_job(include_items=True)
+    if job:
+        job = dict(job)
+        job.pop('confirmation_token_hash', None)
+    return jsonify({
+        'job': job,
+        'hard_limit': person_cleanup_db.STALE_DELETE_CANARY_LIMIT,
+    })
+
+
+@person_cleanup_bp.route('/stale-delete-canary/<job_id>', methods=['GET'])
+@admin_required
+def get_stale_delete_canary(job_id):
+    job = person_cleanup_db.get_stale_delete_canary_job(job_id, include_items=True)
+    if not job:
+        return jsonify({'error': 'Stale Index Canary 任务不存在'}), 404
+    job = dict(job)
+    job.pop('confirmation_token_hash', None)
+    return jsonify({'job': job, 'hard_limit': person_cleanup_db.STALE_DELETE_CANARY_LIMIT})
+
+
+@person_cleanup_bp.route(
+    '/stale-delete-canary/<job_id>/confirmation-token', methods=['POST'],
+)
+@admin_required
+@processor_ready_required
+def issue_stale_delete_canary_token(job_id):
+    try:
+        token = person_cleanup_db.issue_stale_delete_canary_confirmation_token(job_id)
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 409
+    return jsonify({
+        'job_id': job_id,
+        'confirmation_token': token,
+        'expires_in_seconds': 600,
+        'confirmation_phrase': '确认删除稳定陈旧索引 Canary 人物',
+    })
+
+
+@person_cleanup_bp.route('/stale-delete-canary/<job_id>/confirm', methods=['POST'])
+@admin_required
+@task_lock_required
+@processor_ready_required
+def confirm_stale_delete_canary(job_id):
+    payload = request.get_json(silent=True) or {}
+    if payload.get('confirmation') != '确认删除稳定陈旧索引 Canary 人物':
+        return jsonify({'error': '缺少 Stale Index Canary 专用确认短语'}), 400
+    token = str(payload.get('confirmation_token') or '')
+    if not token:
+        return jsonify({'error': '缺少当前 Canary 短时确认令牌'}), 400
+    try:
+        person_cleanup_db.confirm_stale_delete_canary_job(job_id, token)
+    except RuntimeError as exc:
+        return jsonify({'error': str(exc)}), 409
+    submitted = task_manager.submit_task(
+        task_execute_stale_delete_canary,
+        'Stale Index Safe Delete Canary',
+        processor_type='media',
+        job_id=job_id,
+    )
+    if not submitted:
+        person_cleanup_db.fail_stale_delete_canary_job(
+            job_id, 'preflight_failed', '后台任务繁忙；确认已消费且未发送人物删除请求',
+        )
+        return jsonify({'error': 'Canary 执行未启动，确认已失效且未删除人物'}), 409
+    return jsonify({'job_id': job_id, 'state': 'confirmed'}), 202
+
+
+@person_cleanup_bp.route('/stale-delete-canary/<job_id>/stop', methods=['POST'])
+@admin_required
+@processor_ready_required
+def stop_stale_delete_canary(job_id):
+    if not person_cleanup_db.request_stale_delete_canary_stop(job_id):
+        return jsonify({'error': 'Canary 任务不存在或当前不可中止'}), 409
+    return jsonify({
+        'job_id': job_id,
+        'state': 'stop_requested',
+        'message': '将在当前人物边界后停止；该任务不可 resume',
+    }), 202
 
 
 @person_cleanup_bp.route('/protected-libraries', methods=['GET'])

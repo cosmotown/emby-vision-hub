@@ -700,6 +700,114 @@ def init_db():
                 """)
 
                 cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS person_cleanup_stale_delete_jobs (
+                        job_id TEXT PRIMARY KEY,
+                        state TEXT NOT NULL,
+                        latest_run_id TEXT NOT NULL REFERENCES person_cleanup_stale_index_runs(run_id),
+                        previous_run_id TEXT NOT NULL REFERENCES person_cleanup_stale_index_runs(run_id),
+                        latest_generation BIGINT NOT NULL,
+                        previous_generation BIGINT NOT NULL,
+                        latest_source_proof_id TEXT NOT NULL,
+                        latest_source_proof_hash TEXT NOT NULL,
+                        previous_source_proof_id TEXT NOT NULL,
+                        previous_source_proof_hash TEXT NOT NULL,
+                        requested_limit INTEGER NOT NULL CHECK (requested_limit BETWEEN 1 AND 100),
+                        eligible_total INTEGER NOT NULL DEFAULT 0,
+                        candidate_total INTEGER NOT NULL DEFAULT 0 CHECK (candidate_total BETWEEN 0 AND 100),
+                        ready_count INTEGER NOT NULL DEFAULT 0,
+                        confirmed_deleted_count INTEGER NOT NULL DEFAULT 0,
+                        failed_count INTEGER NOT NULL DEFAULT 0,
+                        preview_snapshot_generation BIGINT,
+                        preview_protection_hash TEXT,
+                        preview_relationship_hash TEXT,
+                        preview_person_hash TEXT,
+                        execution_snapshot_generation BIGINT,
+                        execution_protection_hash TEXT,
+                        execution_relationship_hash TEXT,
+                        execution_person_hash TEXT,
+                        preview_fingerprint TEXT,
+                        confirmation_token_hash TEXT,
+                        confirmation_token_expires_at TIMESTAMP WITH TIME ZONE,
+                        stop_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        preview_completed_at TIMESTAMP WITH TIME ZONE,
+                        confirmed_at TIMESTAMP WITH TIME ZONE,
+                        started_at TIMESTAMP WITH TIME ZONE,
+                        completed_at TIMESTAMP WITH TIME ZONE,
+                        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                        last_error TEXT
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS person_cleanup_stale_delete_job_items (
+                        job_id TEXT NOT NULL REFERENCES person_cleanup_stale_delete_jobs(job_id) ON DELETE CASCADE,
+                        person_id TEXT NOT NULL,
+                        person_name TEXT,
+                        provider_ids JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        candidate_fingerprint TEXT NOT NULL,
+                        deterministic_rank TEXT NOT NULL,
+                        latest_forensic_state TEXT NOT NULL,
+                        previous_forensic_state TEXT NOT NULL,
+                        latest_identity_signal TEXT NOT NULL,
+                        previous_identity_signal TEXT NOT NULL,
+                        latest_people_signal TEXT NOT NULL,
+                        previous_people_signal TEXT NOT NULL,
+                        latest_stable_pass_count INTEGER NOT NULL,
+                        previous_stable_pass_count INTEGER NOT NULL,
+                        preview_state TEXT NOT NULL DEFAULT 'pending',
+                        execute_state TEXT NOT NULL DEFAULT 'pending',
+                        preview_evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        execute_evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        post_attempts INTEGER NOT NULL DEFAULT 0 CHECK (post_attempts BETWEEN 0 AND 1),
+                        submitted_at TIMESTAMP WITH TIME ZONE,
+                        completed_at TIMESTAMP WITH TIME ZONE,
+                        last_error TEXT,
+                        PRIMARY KEY (job_id, person_id)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_person_cleanup_stale_delete_items_state
+                    ON person_cleanup_stale_delete_job_items (job_id, preview_state, execute_state)
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_stale_delete_jobs
+                    ADD COLUMN IF NOT EXISTS job_type TEXT NOT NULL DEFAULT 'canary',
+                    ADD COLUMN IF NOT EXISTS token_purpose TEXT NOT NULL DEFAULT 'stable_stale_canary_delete',
+                    ADD COLUMN IF NOT EXISTS stable_total INTEGER NOT NULL DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS same_name_excluded INTEGER NOT NULL DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS ambiguous_count INTEGER NOT NULL DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS preview_admin_context_hash TEXT,
+                    ADD COLUMN IF NOT EXISTS execution_admin_context_hash TEXT,
+                    ADD COLUMN IF NOT EXISTS admin_auth_state TEXT NOT NULL DEFAULT 'pending',
+                    ADD COLUMN IF NOT EXISTS admin_auth_attempts INTEGER NOT NULL DEFAULT 0 CHECK (admin_auth_attempts BETWEEN 0 AND 1),
+                    ADD COLUMN IF NOT EXISTS admin_auth_reserved_at TIMESTAMP WITH TIME ZONE,
+                    ADD COLUMN IF NOT EXISTS admin_user_id TEXT,
+                    ADD COLUMN IF NOT EXISTS admin_session_verified BOOLEAN NOT NULL DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS admin_auth_verified_at TIMESTAMP WITH TIME ZONE,
+                    ADD COLUMN IF NOT EXISTS final_verification JSONB NOT NULL DEFAULT '{}'::jsonb
+                """)
+                cursor.execute("""
+                    ALTER TABLE person_cleanup_stale_delete_job_items
+                    ADD COLUMN IF NOT EXISTS http_status INTEGER,
+                    ADD COLUMN IF NOT EXISTS readback_state TEXT,
+                    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE
+                """)
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_person_cleanup_stale_delete_preflighting
+                    ON person_cleanup_stale_delete_jobs ((TRUE))
+                    WHERE state IN ('previewing', 'preview_ready', 'confirmed', 'preflighting', 'running', 'stop_requested')
+                """)
+                cursor.execute("""
+                    UPDATE person_cleanup_stale_delete_jobs
+                    SET state = 'interrupted_requires_review', stop_requested = TRUE,
+                        completed_at = COALESCE(completed_at, NOW()), updated_at = NOW(),
+                        confirmation_token_hash = NULL,
+                        confirmation_token_expires_at = NULL,
+                        last_error = COALESCE(last_error, '进程重启；Canary 不自动继续或重放删除')
+                    WHERE state IN ('previewing', 'preview_ready', 'confirmed', 'preflighting', 'running', 'stop_requested')
+                """)
+
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS person_cleanup_jobs (
                         job_id TEXT PRIMARY KEY,
                         state TEXT NOT NULL,

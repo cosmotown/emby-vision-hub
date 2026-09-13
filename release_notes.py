@@ -2,6 +2,23 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.30",
+        "published_at": "2026-09-13T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.30",
+        "changelog": """## VidHub Recent Mixed 虚拟库兼容修复
+
+- 修复 VidHub 无法显示同时包含 Movie 与 Series 的 Recent 动态虚拟库问题。
+- VidHub 下，符合 Recent 语义的 Movie + Series Mixed 虚拟库使用 `CollectionType=movies` 作为客户端兼容别名。
+- Movie-only 虚拟库继续沿用 v7.2.29 的 VidHub `movies` 兼容；Series-only 继续返回 `tvshows`。
+- 普通 Mixed 虚拟库仍保持 `mixed`；Emby Web、Infuse 及其他非 VidHub 客户端行为完全不变。
+- 本版本不修改 Items 查询、内容筛选、用户权限、数据库、View ID、Season/Episode 层级、详情、图片或播放逻辑。
+
+本修复仅针对 VidHub 的客户端展示兼容，不回退 v7.1.1 以来的全局 `CollectionType=mixed` 策略。
+
+""",
+    },
+
+    {
         "version": "v7.2.29",
         "published_at": "2026-09-13T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.29",

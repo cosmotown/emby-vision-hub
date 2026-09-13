@@ -68,8 +68,19 @@ server {
         proxy_pass http://emby_server;
     }
 
-    # 规则 3：拦截所有路径中包含虚拟ID的请求 (例如获取图片)
-    location ~ /(emby/Users/[^/]+/Items|emby/Items)/-(\d+) {
+    # 规则 3a：虚拟 View 详情同时兼容带/不带 /emby 前缀的客户端。
+    location ~ ^/(emby/)?Users/[^/]+/Items/-(\d+)$ {
+        proxy_pass http://virtual_library_proxy;
+    }
+
+    # 规则 3b：保持现有带 /emby 前缀的虚拟图片等请求处理。
+    location ~ ^/emby/Items/-(\d+) {
+        proxy_pass http://virtual_library_proxy;
+    }
+
+    # Infuse Direct 请求虚拟 View 主图时不带 /emby 前缀和 tag。
+    # 仅拦截精确的负数虚拟 View Primary 图片路径，避免影响原生项目图片。
+    location ~ ^/Items/-(\d+)/Images/Primary$ {
         proxy_pass http://virtual_library_proxy;
     }
 

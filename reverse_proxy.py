@@ -186,6 +186,7 @@ def _vidhub_trace_log_response(response):
         )
     return response
 
+
 MISSING_ID_PREFIX = "-800000_"
 
 def to_missing_item_id(tmdb_id): 
@@ -203,8 +204,9 @@ def from_mimicked_id(mimicked_id): return -(int(mimicked_id)) - MIMICKED_ID_BASE
 def is_mimicked_id(item_id):
     try: return isinstance(item_id, str) and item_id.startswith('-')
     except: return False
-MIMICKED_ITEMS_RE = re.compile(r'/emby/Users/([^/]+)/Items/(-(\d+))')
-MIMICKED_ITEM_DETAILS_RE = re.compile(r'emby/Users/([^/]+)/Items/(-(\d+))$')
+MIMICKED_ITEMS_RE = re.compile(r'/(?:emby/)?Users/([^/]+)/Items/(-(\d+))')
+MIMICKED_ITEM_DETAILS_RE = re.compile(r'/(?:emby/)?Users/([^/]+)/Items/(-(\d+))$')
+MIMICKED_PRIMARY_IMAGE_RE = re.compile(r'/(?:emby/)?Items/(-(\d+))/Images/Primary$')
 
 def _get_real_emby_url_and_key():
     base_url = config_manager.APP_CONFIG.get("emby_server_url", "").rstrip('/')
@@ -348,6 +350,94 @@ def is_vidhub_client(http_request):
     return user_agent.casefold().startswith('vidhub/')
 
 
+def is_infuse_direct_client(http_request):
+    """Return whether the request comes from the observed Infuse Direct family."""
+    user_agent = str(http_request.headers.get('User-Agent') or '').strip()
+    return user_agent.casefold().startswith('infuse-direct/')
+
+
+_INFUSE_VIRTUAL_ITEM_FIELDS = {
+    'AlternateMediaSources',
+    'Etag',
+    'Genres',
+    'MediaSources',
+    'OfficialRating',
+    'Overview',
+    'ParentId',
+    'Path',
+}
+
+
+def _get_virtual_item_fields(base_fields, params, http_request):
+    """Include only the additional virtual item fields proven necessary by Infuse."""
+    fields = [field.strip() for field in str(base_fields or '').split(',') if field.strip()]
+    if not is_infuse_direct_client(http_request):
+        return ','.join(fields)
+
+    requested = str(params.get('Fields') or '')
+    for field in requested.split(','):
+        field = field.strip()
+        if field in _INFUSE_VIRTUAL_ITEM_FIELDS and field not in fields:
+            fields.append(field)
+    return ','.join(fields)
+
+
+def _collection_allowed_user_ids(collection):
+    """Normalize allowed_user_ids; None means the collection is unrestricted."""
+    allowed_users = collection.get('allowed_user_ids')
+    if isinstance(allowed_users, str):
+        try:
+            allowed_users = json.loads(allowed_users)
+        except (TypeError, ValueError):
+            return ()
+    if not allowed_users:
+        return None
+    if not isinstance(allowed_users, list):
+        return ()
+    return tuple(str(value) for value in allowed_users)
+
+
+def _collection_allowed_for_user(collection, user_id):
+    """Apply the existing allowed_user_ids contract to one virtual collection."""
+    allowed_users = _collection_allowed_user_ids(collection)
+    return allowed_users is None or user_id in allowed_users
+
+
+def _request_emby_user_id():
+    """Read the current Emby user id from the standard authorization header."""
+    authorization = (
+        request.headers.get('X-Emby-Authorization')
+        or request.headers.get('Authorization')
+        or ''
+    )
+    match = re.search(r'(?:^|[,\s])UserId\s*=\s*"([^"]+)"', authorization, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _request_authenticates_emby_user(base_url, user_id, headers, params):
+    """Fail closed unless the client credential authenticates the claimed Emby user."""
+    if not user_id:
+        return False
+    auth_params = {
+        key: value for key, value in params.items()
+        if str(key).lower() in {'api_key', 'apikey', 'access_token'}
+    }
+    try:
+        response = requests.get(
+            f"{base_url}/Users/{user_id}",
+            headers=headers,
+            params=auth_params,
+            timeout=15,
+            allow_redirects=False,
+        )
+        if response.status_code != 200:
+            return False
+        payload = response.json()
+        return isinstance(payload, dict) and str(payload.get('Id') or '') == user_id
+    except (requests.RequestException, TypeError, ValueError):
+        return False
+
+
 def _is_recent_mixed_virtual_collection(collection, definition, normalized_types):
     """Identify a Movie+Series recent-ingest filter without relying on its name."""
     collection_kind = str(collection.get('type') or '').strip().casefold()
@@ -391,6 +481,11 @@ def get_virtual_collection_type(collection, http_request):
             return 'movies'
         if _is_recent_mixed_virtual_collection(collection, definition, normalized_types):
             return 'movies'
+    if is_infuse_direct_client(http_request):
+        if normalized_types == {'movie'}:
+            return 'movies'
+        if _is_recent_mixed_virtual_collection(collection, definition, normalized_types):
+            return 'movies'
     return _virtual_library_collection_type(definition)
 
 def handle_get_views():
@@ -426,10 +521,8 @@ def handle_get_views():
                 continue
 
             # 权限检查：如果设置了 allowed_user_ids，则检查
-            allowed_users = coll.get('allowed_user_ids')
-            if allowed_users and isinstance(allowed_users, list):
-                if user_id not in allowed_users:
-                    continue
+            if not _collection_allowed_for_user(coll, user_id):
+                continue
             
             # 生成虚拟库对象
             db_id = coll['id']
@@ -487,7 +580,8 @@ def handle_get_mimicked_library_details(user_id, mimicked_id):
     try:
         real_db_id = from_mimicked_id(mimicked_id)
         coll = custom_collection_db.get_custom_collection_by_id(real_db_id)
-        if not coll: return "Not Found", 404
+        if not coll or not _collection_allowed_for_user(coll, user_id):
+            return "Not Found", 404
 
         real_server_id = extensions.EMBY_SERVER_ID
         real_emby_collection_id = coll.get('emby_collection_id')
@@ -505,16 +599,36 @@ def handle_get_mimicked_library_details(user_id, mimicked_id):
         logger.error(f"获取伪造库详情时出错: {e}", exc_info=True)
         return "Internal Server Error", 500
 
-def handle_get_mimicked_library_image(path):
+def handle_get_mimicked_library_image(mimicked_id):
     try:
-        tag_with_timestamp = request.args.get('tag') or request.args.get('Tag')
-        if not tag_with_timestamp: return "Bad Request", 400
-        real_emby_collection_id = tag_with_timestamp.split('?')[0]
+        real_db_id = from_mimicked_id(mimicked_id)
+        coll = custom_collection_db.get_custom_collection_by_id(real_db_id)
+        if not coll or not coll.get('emby_collection_id'):
+            return "Not Found", 404
+
         base_url, _ = _get_real_emby_url_and_key()
-        image_url = f"{base_url}/Items/{real_emby_collection_id}/Images/Primary"
         headers = {key: value for key, value in request.headers if key.lower() != 'host'}
         headers['Host'] = urlparse(base_url).netloc
-        resp = requests.get(image_url, headers=headers, stream=True, params=request.args)
+        user_id = _request_emby_user_id()
+        if not _collection_allowed_for_user(coll, user_id):
+            return "Not Found", 404
+        if _collection_allowed_user_ids(coll) is not None and not _request_authenticates_emby_user(
+            base_url,
+            user_id,
+            headers,
+            request.args,
+        ):
+            return "Not Found", 404
+
+        # The persisted virtual-view mapping is authoritative.  Some clients
+        # (notably Infuse Direct) omit the optional image tag entirely.
+        real_emby_collection_id = coll['emby_collection_id']
+        image_url = f"{base_url}/Items/{real_emby_collection_id}/Images/Primary"
+        upstream_params = {
+            key: value for key, value in request.args.items()
+            if str(key).lower() != 'tag'
+        }
+        resp = requests.get(image_url, headers=headers, stream=True, params=upstream_params)
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         response_headers = [(name, value) for name, value in resp.raw.headers.items() if name.lower() not in excluded_headers]
         return Response(resp.iter_content(chunk_size=8192), resp.status_code, response_headers)
@@ -572,7 +686,7 @@ def handle_get_mimicked_library_items(user_id, mimicked_id, params):
         # 1. 获取合集基础信息
         real_db_id = from_mimicked_id(mimicked_id)
         collection_info = custom_collection_db.get_custom_collection_by_id(real_db_id)
-        if not collection_info:
+        if not collection_info or not _collection_allowed_for_user(collection_info, user_id):
             return Response(json.dumps({"Items": [], "TotalRecordCount": 0}), mimetype='application/json')
 
         definition = collection_info.get('definition_json') or {}
@@ -699,7 +813,11 @@ def handle_get_mimicked_library_items(user_id, mimicked_id, params):
                 status_map = queries_db.get_missing_items_metadata(missing_tids)
                 
                 base_url, api_key = _get_real_emby_url_and_key()
-                full_fields = "PrimaryImageAspectRatio,ImageTags,HasPrimaryImage,ProviderIds,UserData,Name,ProductionYear,CommunityRating,Type"
+                full_fields = _get_virtual_item_fields(
+                    "PrimaryImageAspectRatio,ImageTags,HasPrimaryImage,ProviderIds,UserData,Name,ProductionYear,CommunityRating,Type",
+                    params,
+                    request,
+                )
                 emby_details = _fetch_items_in_chunks(base_url, api_key, user_id, real_eids, full_fields)
                 emby_map = {item['Id']: item for item in emby_details}
 
@@ -778,7 +896,11 @@ def handle_get_mimicked_library_items(user_id, mimicked_id, params):
                 return Response(json.dumps({"Items": [], "TotalRecordCount": reported_total_count}), mimetype='application/json')
 
             final_emby_ids = [i['Id'] for i in items]
-            full_fields = "PrimaryImageAspectRatio,ImageTags,HasPrimaryImage,ProviderIds,UserData,Name,ProductionYear,CommunityRating,DateCreated,PremiereDate,Type,RecursiveItemCount,SortName,ChildCount,BasicSyncInfo"
+            full_fields = _get_virtual_item_fields(
+                "PrimaryImageAspectRatio,ImageTags,HasPrimaryImage,ProviderIds,UserData,Name,ProductionYear,CommunityRating,DateCreated,PremiereDate,Type,RecursiveItemCount,SortName,ChildCount,BasicSyncInfo",
+                params,
+                request,
+            )
 
             if is_emby_proxy_sort_required:
                 # 代理排序模式：将所有 ID 交给 Emby (或内存) 进行排序和分页
@@ -1070,7 +1192,7 @@ def proxy_all(path):
 
         # --- 拦截 C: 最新项目 (Latest) ---
         if path.endswith('/Items/Latest'):
-            user_id_match = re.search(r'/emby/Users/([^/]+)/', full_path)
+            user_id_match = re.search(r'/(?:emby/)?Users/([^/]+)/', full_path)
             if user_id_match:
                 return handle_get_latest_items(user_id_match.group(1), request.args)
 
@@ -1081,11 +1203,10 @@ def proxy_all(path):
             mimicked_id = details_match.group(2)
             return handle_get_mimicked_library_details(user_id, mimicked_id)
 
-        # --- 拦截 E: 虚拟库图片 ---
-        if path.startswith('emby/Items/') and '/Images/' in path:
-            item_id = path.split('/')[2]
-            if is_mimicked_id(item_id):
-                return handle_get_mimicked_library_image(path)
+        # --- 拦截 E: 虚拟库主图（兼容带/不带 /emby 前缀） ---
+        mimicked_image_match = MIMICKED_PRIMARY_IMAGE_RE.search(full_path)
+        if mimicked_image_match:
+            return handle_get_mimicked_library_image(mimicked_image_match.group(1))
         
         # --- 拦截 F: 虚拟库内容浏览 (Items) ---
         parent_id = request.args.get("ParentId")
@@ -1095,7 +1216,7 @@ def proxy_all(path):
                 return handle_mimicked_library_metadata_endpoint(path, parent_id, request.args)
             
             # 处理内容列表请求
-            user_id_match = re.search(r'emby/Users/([^/]+)/Items', path)
+            user_id_match = re.search(r'(?:^|/)(?:emby/)?Users/([^/]+)/Items', path)
             if user_id_match:
                 user_id = user_id_match.group(1)
                 return handle_get_mimicked_library_items(user_id, parent_id, request.args)

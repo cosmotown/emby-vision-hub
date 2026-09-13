@@ -43,6 +43,19 @@ class VidHubTraceTests(unittest.TestCase):
             ):
                 self.assertFalse(reverse_proxy.is_vidhub_client(reverse_proxy.request))
 
+    def test_infuse_direct_family_detection_is_narrow_and_version_independent(self):
+        for user_agent in ('Infuse-Direct/8.5.3', 'Infuse-Direct/9.x'):
+            with self.subTest(user_agent=user_agent), reverse_proxy.proxy_app.test_request_context(
+                headers={'User-Agent': user_agent},
+            ):
+                self.assertTrue(reverse_proxy.is_infuse_direct_client(reverse_proxy.request))
+
+        for user_agent in ('Infuse/8.5.3', 'OtherInfuse-Direct/8.5.3', 'VidHub/2.3.6', ''):
+            with self.subTest(user_agent=user_agent), reverse_proxy.proxy_app.test_request_context(
+                headers={'User-Agent': user_agent},
+            ):
+                self.assertFalse(reverse_proxy.is_infuse_direct_client(reverse_proxy.request))
+
     def test_collection_type_isolated_by_client_and_content_type(self):
         recent_mixed = {
             'type': 'filter',
@@ -56,14 +69,18 @@ class VidHubTraceTests(unittest.TestCase):
         cases = (
             ('VidHub/2.3.6', {'definition_json': {'item_type': ['Movie']}}, 'movies'),
             ('VidHub/2.x.x', {'definition_json': {'item_type': 'Movie'}}, 'movies'),
+            ('Infuse-Direct/8.5.3', {'definition_json': {'item_type': ['Movie']}}, 'movies'),
+            ('Infuse-Direct/9.x', {'definition_json': {'item_type': 'Movie'}}, 'movies'),
             ('Mozilla/5.0 EmbyWeb/4.9.5.0', {'definition_json': {'item_type': ['Movie']}}, 'mixed'),
             ('', {'definition_json': {'item_type': ['Movie']}}, 'mixed'),
             ('OtherClient/1.0', {'definition_json': {'item_type': ['Movie']}}, 'mixed'),
             ('VidHub/2.3.6', {'definition_json': {'item_type': ['Series', 'Episode']}}, 'tvshows'),
+            ('Infuse-Direct/8.5.3', {'definition_json': {'item_type': ['Series', 'Episode']}}, 'tvshows'),
             ('OtherClient/1.0', {'definition_json': {'item_type': ['Series', 'Episode']}}, 'tvshows'),
             ('VidHub/2.3.6', recent_mixed, 'movies'),
             ('Mozilla/5.0 EmbyWeb/4.9.5.0', recent_mixed, 'mixed'),
             ('Infuse/8.1.7', recent_mixed, 'mixed'),
+            ('Infuse-Direct/8.5.3', recent_mixed, 'movies'),
             ('', recent_mixed, 'mixed'),
             ('VidHub/2.3.6', {'type': 'filter', 'definition_json': {'item_type': ['Movie', 'Series'], 'rules': []}}, 'mixed'),
         )
@@ -74,6 +91,381 @@ class VidHubTraceTests(unittest.TestCase):
                     reverse_proxy.get_virtual_collection_type(collection, reverse_proxy.request),
                     expected,
                 )
+
+    def test_infuse_movie_views_and_detail_use_same_movies_type(self):
+        collection = {
+            'id': 5,
+            'name': 'Localized Movie View',
+            'emby_collection_id': 'boxset-5',
+            'definition_json': {'item_type': ['Movie']},
+            'in_library_count': 2,
+        }
+        with patch.object(reverse_proxy.extensions, 'EMBY_SERVER_ID', 'server-1'), \
+             patch.object(reverse_proxy.emby, 'get_emby_libraries', return_value=[]), \
+             patch.object(
+                 reverse_proxy.custom_collection_db,
+                 'get_all_active_custom_collections',
+                 return_value=[collection],
+             ), patch.object(
+                 reverse_proxy.custom_collection_db,
+                 'get_custom_collection_by_id',
+                 return_value=collection,
+             ):
+            for path in ('/emby/Users/abcdef/Views', '/Users/abcdef/Views'):
+                with self.subTest(path=path):
+                    response = self.client.get(path, headers={'User-Agent': 'Infuse-Direct/8.5.3'})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.get_json()['Items'][0]['CollectionType'], 'movies')
+
+            detail = self.client.get(
+                '/emby/Users/abcdef/Items/-900005',
+                headers={'User-Agent': 'Infuse-Direct/8.5.3'},
+            )
+            self.assertEqual(detail.status_code, 200)
+            self.assertEqual(detail.get_json()['CollectionType'], 'movies')
+
+            ordinary = self.client.get(
+                '/Users/abcdef/Views',
+                headers={'User-Agent': 'Mozilla/5.0 EmbyWeb/4.9.5.0'},
+            )
+            self.assertEqual(ordinary.get_json()['Items'][0]['CollectionType'], 'mixed')
+
+    def test_infuse_unprefixed_virtual_catalogue_paths_reuse_existing_handlers(self):
+        json_response = reverse_proxy.Response(
+            json.dumps({'Items': [], 'TotalRecordCount': 0}),
+            mimetype='application/json',
+        )
+        latest_response = reverse_proxy.Response(json.dumps([]), mimetype='application/json')
+        detail_response = reverse_proxy.Response(
+            json.dumps({'Id': '-900005', 'CollectionType': 'movies'}),
+            mimetype='application/json',
+        )
+        with patch.object(
+            reverse_proxy,
+            'handle_get_latest_items',
+            return_value=latest_response,
+        ) as latest, patch.object(
+            reverse_proxy,
+            'handle_get_mimicked_library_items',
+            return_value=json_response,
+        ) as items, patch.object(
+            reverse_proxy,
+            'handle_get_mimicked_library_details',
+            return_value=detail_response,
+        ) as details:
+            headers = {'User-Agent': 'Infuse-Direct/8.5.3'}
+            self.assertEqual(self.client.get(
+                '/Users/abcdef/Items/Latest',
+                query_string={'ParentId': '-900005'},
+                headers=headers,
+            ).status_code, 200)
+            self.assertEqual(self.client.get(
+                '/Users/abcdef/Items',
+                query_string={'ParentId': '-900005'},
+                headers=headers,
+            ).status_code, 200)
+            self.assertEqual(self.client.get(
+                '/Users/abcdef/Items/-900005',
+                headers=headers,
+            ).status_code, 200)
+
+        latest.assert_called_once()
+        self.assertEqual(latest.call_args.args[0], 'abcdef')
+        items.assert_called_once()
+        self.assertEqual(items.call_args.args[:2], ('abcdef', '-900005'))
+        details.assert_called_once_with('abcdef', '-900005')
+
+    def test_infuse_unprefixed_virtual_primary_image_uses_persisted_mapping_without_tag(self):
+        collection = {
+            'id': 5,
+            'name': 'Localized Movie View',
+            'emby_collection_id': 'real-boxset-5',
+        }
+        upstream = Mock()
+        upstream.status_code = 200
+        upstream.raw.headers = {
+            'Content-Type': 'image/jpeg',
+            'Content-Length': '4',
+        }
+        upstream.iter_content.return_value = [b'jpeg']
+
+        with patch.object(
+            reverse_proxy.custom_collection_db,
+            'get_custom_collection_by_id',
+            return_value=collection,
+        ), patch.object(
+            reverse_proxy,
+            '_get_real_emby_url_and_key',
+            return_value=('http://isolated-emby:8096', 'server-secret-key'),
+        ), patch.object(reverse_proxy.requests, 'get', return_value=upstream) as get:
+            response = self.client.get(
+                '/Items/-900005/Images/Primary',
+                headers={
+                    'User-Agent': 'Infuse-Direct/8.5.3',
+                    'X-Emby-Token': 'client-token',
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b'jpeg')
+        self.assertEqual(response.content_type, 'image/jpeg')
+        self.assertEqual(
+            get.call_args.args[0],
+            'http://isolated-emby:8096/Items/real-boxset-5/Images/Primary',
+        )
+        self.assertEqual(get.call_args.kwargs['params'], {})
+        self.assertEqual(get.call_args.kwargs['headers']['X-Emby-Token'], 'client-token')
+
+    def test_virtual_primary_image_ignores_client_tag_and_unknown_view_fails_closed(self):
+        collection = {'id': 5, 'emby_collection_id': 'real-boxset-5'}
+        upstream = Mock()
+        upstream.status_code = 200
+        upstream.raw.headers = {'Content-Type': 'image/jpeg'}
+        upstream.iter_content.return_value = [b'jpeg']
+        with patch.object(
+            reverse_proxy.custom_collection_db,
+            'get_custom_collection_by_id',
+            side_effect=lambda db_id: collection if db_id == 5 else None,
+        ), patch.object(
+            reverse_proxy,
+            '_get_real_emby_url_and_key',
+            return_value=('http://isolated-emby:8096', 'server-secret-key'),
+        ), patch.object(reverse_proxy.requests, 'get', return_value=upstream) as get:
+            tagged = self.client.get(
+                '/emby/Items/-900005/Images/Primary',
+                query_string={'tag': 'untrusted-other-item'},
+                headers={'User-Agent': 'VidHub/2.3.6'},
+            )
+            missing = self.client.get('/Items/-900099/Images/Primary')
+
+        self.assertEqual(tagged.status_code, 200)
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(
+            get.call_args.args[0],
+            'http://isolated-emby:8096/Items/real-boxset-5/Images/Primary',
+        )
+        self.assertEqual(get.call_args.kwargs['params'], {})
+
+    def test_positive_item_primary_image_keeps_native_proxy_behavior(self):
+        upstream = Mock()
+        upstream.status_code = 200
+        upstream.raw.headers = {'Content-Type': 'image/jpeg'}
+        upstream.iter_content.return_value = [b'native-jpeg']
+
+        with patch.object(
+            reverse_proxy,
+            '_get_real_emby_url_and_key',
+            return_value=('http://isolated-emby:8096', 'server-secret-key'),
+        ), patch.object(reverse_proxy.requests, 'request', return_value=upstream) as request:
+            response = self.client.get(
+                '/Items/12345/Images/Primary',
+                headers={
+                    'User-Agent': 'Infuse-Direct/8.5.3',
+                    'X-Emby-Token': 'client-token',
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b'native-jpeg')
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(
+            request.call_args.kwargs['url'],
+            'http://isolated-emby:8096/Items/12345/Images/Primary',
+        )
+        self.assertEqual(request.call_args.kwargs['params']['api_key'], 'server-secret-key')
+
+    def test_positive_parent_id_items_keep_native_proxy_behavior(self):
+        upstream = Mock()
+        upstream.status_code = 200
+        upstream.raw.headers = {'Content-Type': 'application/json'}
+        upstream.content = b'{"Items":[{"Id":"movie-1"}],"TotalRecordCount":1}'
+        upstream.iter_content.return_value = [upstream.content]
+
+        with patch.object(
+            reverse_proxy,
+            '_get_real_emby_url_and_key',
+            return_value=('http://isolated-emby:8096', 'server-secret-key'),
+        ), patch.object(reverse_proxy.requests, 'request', return_value=upstream) as request:
+            response = self.client.get(
+                '/Users/abcdef/Items',
+                query_string={'ParentId': 'native-library-1'},
+                headers={'User-Agent': 'Infuse-Direct/8.5.3'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['TotalRecordCount'], 1)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(
+            request.call_args.kwargs['url'],
+            'http://isolated-emby:8096/Users/abcdef/Items',
+        )
+        self.assertEqual(request.call_args.kwargs['params']['ParentId'], 'native-library-1')
+
+    def test_restricted_virtual_primary_image_requires_allowed_authenticated_user(self):
+        collection = {
+            'id': 5,
+            'emby_collection_id': 'real-boxset-5',
+            'allowed_user_ids': ['allowed-user'],
+        }
+        profile = Mock()
+        profile.status_code = 200
+        profile.json.return_value = {'Id': 'allowed-user'}
+        image = Mock()
+        image.status_code = 200
+        image.raw.headers = {'Content-Type': 'image/jpeg'}
+        image.iter_content.return_value = [b'jpeg']
+        authorization = 'MediaBrowser Client="Infuse", UserId="allowed-user", DeviceId="device-1"'
+
+        with patch.object(
+            reverse_proxy.custom_collection_db,
+            'get_custom_collection_by_id',
+            return_value=collection,
+        ), patch.object(
+            reverse_proxy,
+            '_get_real_emby_url_and_key',
+            return_value=('http://isolated-emby:8096', 'server-secret-key'),
+        ), patch.object(reverse_proxy.requests, 'get', side_effect=[profile, image]) as get:
+            response = self.client.get(
+                '/Items/-900005/Images/Primary',
+                headers={
+                    'User-Agent': 'Infuse-Direct/8.5.3',
+                    'X-Emby-Authorization': authorization,
+                    'X-Emby-Token': 'client-token',
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b'jpeg')
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args_list[0].args[0], 'http://isolated-emby:8096/Users/allowed-user')
+        self.assertNotIn('api_key', get.call_args_list[0].kwargs['params'])
+
+    def test_restricted_virtual_routes_fail_closed_for_disallowed_user(self):
+        collection = {
+            'id': 5,
+            'emby_collection_id': 'real-boxset-5',
+            'allowed_user_ids': ['allowed-user'],
+            'definition_json': {'item_type': ['Movie']},
+        }
+        with patch.object(
+            reverse_proxy.custom_collection_db,
+            'get_custom_collection_by_id',
+            return_value=collection,
+        ), patch.object(reverse_proxy.requests, 'get') as get:
+            detail = self.client.get('/Users/disallowed-user/Items/-900005')
+            items = self.client.get(
+                '/Users/disallowed-user/Items',
+                query_string={'ParentId': '-900005'},
+            )
+            image = self.client.get(
+                '/Items/-900005/Images/Primary',
+                headers={
+                    'X-Emby-Authorization': 'MediaBrowser UserId="disallowed-user"',
+                    'X-Emby-Token': 'client-token',
+                },
+            )
+
+        self.assertEqual(detail.status_code, 404)
+        self.assertEqual(items.status_code, 200)
+        self.assertEqual(items.get_json(), {'Items': [], 'TotalRecordCount': 0})
+        self.assertEqual(image.status_code, 404)
+        get.assert_not_called()
+
+    def test_restricted_virtual_primary_image_rejects_failed_user_authentication(self):
+        collection = {
+            'id': 5,
+            'emby_collection_id': 'real-boxset-5',
+            'allowed_user_ids': '["allowed-user"]',
+        }
+        unauthorized = Mock()
+        unauthorized.status_code = 401
+        with patch.object(
+            reverse_proxy.custom_collection_db,
+            'get_custom_collection_by_id',
+            return_value=collection,
+        ), patch.object(
+            reverse_proxy,
+            '_get_real_emby_url_and_key',
+            return_value=('http://isolated-emby:8096', 'server-secret-key'),
+        ), patch.object(reverse_proxy.requests, 'get', return_value=unauthorized) as get:
+            response = self.client.get(
+                '/Items/-900005/Images/Primary',
+                headers={
+                    'X-Emby-Authorization': 'MediaBrowser UserId="allowed-user"',
+                    'X-Emby-Token': 'revoked-client-token',
+                },
+            )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(get.call_count, 1)
+
+    def test_infuse_virtual_items_include_requested_media_fields(self):
+        collection = {
+            'id': 5,
+            'type': 'filter',
+            'definition_json': {
+                'item_type': ['Movie'],
+                'rules': [],
+                'default_sort_by': 'DateCreated',
+            },
+        }
+        indexed = [{'Id': 'movie-1'}]
+        details = [{'Id': 'movie-1', 'Type': 'Movie', 'MediaSources': [{'Id': 'source-1'}]}]
+        with patch.object(
+            reverse_proxy.custom_collection_db,
+            'get_custom_collection_by_id',
+            return_value=collection,
+        ), patch.object(
+            reverse_proxy.queries_db,
+            'query_virtual_library_items',
+            return_value=(indexed, 1),
+        ), patch.object(
+            reverse_proxy,
+            '_get_real_emby_url_and_key',
+            return_value=('http://isolated-emby:8096', 'server-secret-key'),
+        ), patch.object(
+            reverse_proxy,
+            '_fetch_items_in_chunks',
+            return_value=details,
+        ) as fetch:
+            response = self.client.get(
+                '/Users/abcdef/Items',
+                query_string={
+                    'ParentId': '-900005',
+                    'Fields': 'MediaSources,Path,ParentId,Etag',
+                },
+                headers={'User-Agent': 'Infuse-Direct/8.5.3'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['TotalRecordCount'], 1)
+        requested_fields = set(fetch.call_args.args[4].split(','))
+        self.assertTrue({'MediaSources', 'Path', 'ParentId', 'Etag'} <= requested_fields)
+
+    def test_infuse_virtual_items_do_not_forward_unproven_requested_fields(self):
+        base = 'PrimaryImageAspectRatio,ImageTags,Name'
+        with reverse_proxy.proxy_app.test_request_context(headers={'User-Agent': 'Infuse-Direct/8.5.3'}):
+            fields = reverse_proxy._get_virtual_item_fields(
+                base,
+                {'Fields': 'MediaSources,Path,UnprovenField'},
+                reverse_proxy.request,
+            )
+        self.assertEqual(set(fields.split(',')), {
+            'PrimaryImageAspectRatio', 'ImageTags', 'Name', 'MediaSources', 'Path',
+        })
+
+    def test_non_infuse_virtual_items_keep_existing_field_set(self):
+        base = 'PrimaryImageAspectRatio,ImageTags,Name'
+        with reverse_proxy.proxy_app.test_request_context(headers={'User-Agent': 'VidHub/2.3.6'}):
+            self.assertEqual(
+                reverse_proxy._get_virtual_item_fields(
+                    base,
+                    {'Fields': 'MediaSources,Path,Etag'},
+                    reverse_proxy.request,
+                ),
+                base,
+            )
 
     def test_recent_detection_uses_filter_semantics_not_display_name(self):
         semantic_recent = {
@@ -199,6 +591,17 @@ class VidHubTraceTests(unittest.TestCase):
             )
             self.assertEqual(detail.status_code, 200)
             self.assertEqual(detail.get_json()['CollectionType'], 'movies')
+
+            infuse_view = self.client.get(
+                '/Users/abcdef/Views',
+                headers={'User-Agent': 'Infuse-Direct/8.5.3'},
+            )
+            self.assertEqual(infuse_view.get_json()['Items'][0]['CollectionType'], 'movies')
+            infuse_detail = self.client.get(
+                '/Users/abcdef/Items/-900007',
+                headers={'User-Agent': 'Infuse-Direct/8.5.3'},
+            )
+            self.assertEqual(infuse_detail.get_json()['CollectionType'], 'movies')
 
             for user_agent in ('Mozilla/5.0 EmbyWeb/4.9.5.0', 'Infuse/8.1.7', ''):
                 with self.subTest(user_agent=user_agent):
@@ -371,7 +774,11 @@ class VidHubTraceTests(unittest.TestCase):
 
         self.assertIn('log_format vidhub_trace', template)
         self.assertIn('access_log /dev/stdout vidhub_trace', template)
+        self.assertNotIn('log_format infuse_trace', template)
         self.assertIn('if ($arg_ParentId ~ ^-\\d+$)', template)
+        self.assertIn('location ~ ^/(emby/)?Users/[^/]+/Items/-(\\d+)$', template)
+        self.assertIn('location ~ ^/Items/-(\\d+)/Images/Primary$', template)
+        self.assertNotIn('location ~ ^/(emby/)?Items/-(\\d+)', template)
         self.assertNotIn('location = /emby/Library/VirtualFolders', template)
         self.assertNotIn('location = /Library/VirtualFolders', template)
         self.assertNotIn('location = /emby/Items', template)

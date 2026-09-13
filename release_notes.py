@@ -2,6 +2,22 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.31",
+        "published_at": "2026-09-13T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.31",
+        "changelog": """## Infuse Direct 虚拟库兼容修复
+
+- 修复 Infuse Direct Mode 无法发现 Movie-only 与 Recent Movie + Series Mixed 虚拟库的问题。
+- 仅对 `Infuse-Direct/` 客户端应用窄兼容：Movie-only 返回 `movies`，Series-only 返回 `tvshows`，符合内部 Recent 规则语义的 Movie + Series Mixed 返回 `movies`；普通 Mixed 仍返回 `mixed`。
+- 补齐 Infuse 真机已证明需要的无 `/emby` 前缀虚拟 View 详情、内容、Latest 与主图路径，不复制其他路由。
+- 虚拟 View 主图只通过持久化的负数 View ID 数据库映射解析，并继续复用既有 `allowed_user_ids` 权限合同；未知 View 与未授权访问保持 fail closed。
+- VidHub v7.2.30 的客户端判断与 CollectionType 行为完全不变；Emby Web、无 User-Agent、普通客户端和原生媒体库继续保持原行为。
+- 本版本不修改虚拟库 Items 筛选、View ID、Guid、PresentationUniqueKey、Season/Episode 层级、详情、播放、用户权限或数据库结构。
+
+""",
+    },
+
+    {
         "version": "v7.2.30",
         "published_at": "2026-09-13T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.30",

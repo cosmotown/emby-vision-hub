@@ -348,6 +348,24 @@ def is_vidhub_client(http_request):
     return user_agent.casefold().startswith('vidhub/')
 
 
+def _is_recent_mixed_virtual_collection(collection, definition, normalized_types):
+    """Identify a Movie+Series recent-ingest filter without relying on its name."""
+    collection_kind = str(collection.get('type') or '').strip().casefold()
+    if collection_kind != 'filter' or normalized_types != {'movie', 'series'}:
+        return False
+
+    rules = definition.get('rules', [])
+    if not isinstance(rules, list):
+        return False
+
+    return any(
+        isinstance(rule, dict)
+        and str(rule.get('field') or '').strip().casefold() == 'date_added'
+        and str(rule.get('operator') or '').strip().casefold() == 'in_last_days'
+        for rule in rules
+    )
+
+
 def get_virtual_collection_type(collection, http_request):
     """Return the client-compatible CollectionType for one virtual collection."""
     definition = collection.get('definition_json') or {}
@@ -368,8 +386,11 @@ def get_virtual_collection_type(collection, http_request):
         if str(item_type).strip()
     }
 
-    if is_vidhub_client(http_request) and normalized_types == {'movie'}:
-        return 'movies'
+    if is_vidhub_client(http_request):
+        if normalized_types == {'movie'}:
+            return 'movies'
+        if _is_recent_mixed_virtual_collection(collection, definition, normalized_types):
+            return 'movies'
     return _virtual_library_collection_type(definition)
 
 def handle_get_views():

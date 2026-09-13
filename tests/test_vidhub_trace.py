@@ -247,6 +247,61 @@ class VidHubTraceTests(unittest.TestCase):
         )
         self.assertEqual(get.call_args.kwargs['params'], {})
 
+    def test_positive_item_primary_image_keeps_native_proxy_behavior(self):
+        upstream = Mock()
+        upstream.status_code = 200
+        upstream.raw.headers = {'Content-Type': 'image/jpeg'}
+        upstream.iter_content.return_value = [b'native-jpeg']
+
+        with patch.object(
+            reverse_proxy,
+            '_get_real_emby_url_and_key',
+            return_value=('http://isolated-emby:8096', 'server-secret-key'),
+        ), patch.object(reverse_proxy.requests, 'request', return_value=upstream) as request:
+            response = self.client.get(
+                '/Items/12345/Images/Primary',
+                headers={
+                    'User-Agent': 'Infuse-Direct/8.5.3',
+                    'X-Emby-Token': 'client-token',
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b'native-jpeg')
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(
+            request.call_args.kwargs['url'],
+            'http://isolated-emby:8096/Items/12345/Images/Primary',
+        )
+        self.assertEqual(request.call_args.kwargs['params']['api_key'], 'server-secret-key')
+
+    def test_positive_parent_id_items_keep_native_proxy_behavior(self):
+        upstream = Mock()
+        upstream.status_code = 200
+        upstream.raw.headers = {'Content-Type': 'application/json'}
+        upstream.content = b'{"Items":[{"Id":"movie-1"}],"TotalRecordCount":1}'
+        upstream.iter_content.return_value = [upstream.content]
+
+        with patch.object(
+            reverse_proxy,
+            '_get_real_emby_url_and_key',
+            return_value=('http://isolated-emby:8096', 'server-secret-key'),
+        ), patch.object(reverse_proxy.requests, 'request', return_value=upstream) as request:
+            response = self.client.get(
+                '/Users/abcdef/Items',
+                query_string={'ParentId': 'native-library-1'},
+                headers={'User-Agent': 'Infuse-Direct/8.5.3'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['TotalRecordCount'], 1)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(
+            request.call_args.kwargs['url'],
+            'http://isolated-emby:8096/Users/abcdef/Items',
+        )
+        self.assertEqual(request.call_args.kwargs['params']['ParentId'], 'native-library-1')
+
     def test_restricted_virtual_primary_image_requires_allowed_authenticated_user(self):
         collection = {
             'id': 5,

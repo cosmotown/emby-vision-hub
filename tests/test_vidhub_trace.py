@@ -44,24 +44,77 @@ class VidHubTraceTests(unittest.TestCase):
                 self.assertFalse(reverse_proxy.is_vidhub_client(reverse_proxy.request))
 
     def test_collection_type_isolated_by_client_and_content_type(self):
+        recent_mixed = {
+            'type': 'filter',
+            'definition_json': {
+                'item_type': ['Movie', 'Series'],
+                'rules': [
+                    {'field': 'date_added', 'operator': 'in_last_days', 'value': 30},
+                ],
+            },
+        }
         cases = (
-            ('VidHub/2.3.6', {'item_type': ['Movie']}, 'movies'),
-            ('VidHub/2.x.x', {'item_type': 'Movie'}, 'movies'),
-            ('Mozilla/5.0 EmbyWeb/4.9.5.0', {'item_type': ['Movie']}, 'mixed'),
-            ('', {'item_type': ['Movie']}, 'mixed'),
-            ('OtherClient/1.0', {'item_type': ['Movie']}, 'mixed'),
-            ('VidHub/2.3.6', {'item_type': ['Series', 'Episode']}, 'tvshows'),
-            ('OtherClient/1.0', {'item_type': ['Series', 'Episode']}, 'tvshows'),
-            ('VidHub/2.3.6', {'item_type': ['Movie', 'Series']}, 'mixed'),
+            ('VidHub/2.3.6', {'definition_json': {'item_type': ['Movie']}}, 'movies'),
+            ('VidHub/2.x.x', {'definition_json': {'item_type': 'Movie'}}, 'movies'),
+            ('Mozilla/5.0 EmbyWeb/4.9.5.0', {'definition_json': {'item_type': ['Movie']}}, 'mixed'),
+            ('', {'definition_json': {'item_type': ['Movie']}}, 'mixed'),
+            ('OtherClient/1.0', {'definition_json': {'item_type': ['Movie']}}, 'mixed'),
+            ('VidHub/2.3.6', {'definition_json': {'item_type': ['Series', 'Episode']}}, 'tvshows'),
+            ('OtherClient/1.0', {'definition_json': {'item_type': ['Series', 'Episode']}}, 'tvshows'),
+            ('VidHub/2.3.6', recent_mixed, 'movies'),
+            ('Mozilla/5.0 EmbyWeb/4.9.5.0', recent_mixed, 'mixed'),
+            ('Infuse/8.1.7', recent_mixed, 'mixed'),
+            ('', recent_mixed, 'mixed'),
+            ('VidHub/2.3.6', {'type': 'filter', 'definition_json': {'item_type': ['Movie', 'Series'], 'rules': []}}, 'mixed'),
         )
-        for user_agent, definition, expected in cases:
-            with self.subTest(user_agent=user_agent, definition=definition), \
+        for user_agent, collection, expected in cases:
+            with self.subTest(user_agent=user_agent, collection=collection), \
                  reverse_proxy.proxy_app.test_request_context(headers={'User-Agent': user_agent}):
-                collection = {'definition_json': definition}
                 self.assertEqual(
                     reverse_proxy.get_virtual_collection_type(collection, reverse_proxy.request),
                     expected,
                 )
+
+    def test_recent_detection_uses_filter_semantics_not_display_name(self):
+        semantic_recent = {
+            'type': 'filter',
+            'name': 'Any Localized Name',
+            'definition_json': {
+                'item_type': ['Series', 'Movie'],
+                'rules': [
+                    {'field': 'date_added', 'operator': 'in_last_days', 'value': 14},
+                ],
+            },
+        }
+        name_only = {
+            'type': 'filter',
+            'name': '近期入库',
+            'definition_json': {'item_type': ['Movie', 'Series'], 'rules': []},
+        }
+        wrong_date_semantics = {
+            'type': 'filter',
+            'name': 'Recent',
+            'definition_json': {
+                'item_type': ['Movie', 'Series'],
+                'rules': [
+                    {'field': 'release_date', 'operator': 'in_last_days', 'value': 30},
+                ],
+            },
+        }
+
+        with reverse_proxy.proxy_app.test_request_context(headers={'User-Agent': 'VidHub/9.0'}):
+            self.assertEqual(
+                reverse_proxy.get_virtual_collection_type(semantic_recent, reverse_proxy.request),
+                'movies',
+            )
+            self.assertEqual(
+                reverse_proxy.get_virtual_collection_type(name_only, reverse_proxy.request),
+                'mixed',
+            )
+            self.assertEqual(
+                reverse_proxy.get_virtual_collection_type(wrong_date_semantics, reverse_proxy.request),
+                'mixed',
+            )
 
     def test_vidhub_views_paths_and_detail_use_same_movies_type(self):
         collection = {
@@ -108,6 +161,125 @@ class VidHubTraceTests(unittest.TestCase):
             )
             self.assertEqual(ordinary_detail.status_code, 200)
             self.assertEqual(ordinary_detail.get_json()['CollectionType'], 'mixed')
+
+    def test_recent_mixed_views_and_detail_are_client_isolated(self):
+        collection = {
+            'id': 7,
+            'name': 'Localized Recent View',
+            'type': 'filter',
+            'emby_collection_id': 'boxset-7',
+            'definition_json': {
+                'item_type': ['Movie', 'Series'],
+                'rules': [
+                    {'field': 'date_added', 'operator': 'in_last_days', 'value': 30},
+                ],
+            },
+            'in_library_count': 3,
+        }
+        with patch.object(reverse_proxy.extensions, 'EMBY_SERVER_ID', 'server-1'), \
+             patch.object(reverse_proxy.emby, 'get_emby_libraries', return_value=[]), \
+             patch.object(
+                 reverse_proxy.custom_collection_db,
+                 'get_all_active_custom_collections',
+                 return_value=[collection],
+             ), patch.object(
+                 reverse_proxy.custom_collection_db,
+                 'get_custom_collection_by_id',
+                 return_value=collection,
+             ):
+            for path in ('/emby/Users/abcdef/Views', '/Users/abcdef/Views'):
+                with self.subTest(path=path):
+                    response = self.client.get(path, headers={'User-Agent': 'VidHub/2.3.6'})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.get_json()['Items'][0]['CollectionType'], 'movies')
+
+            detail = self.client.get(
+                '/emby/Users/abcdef/Items/-900007',
+                headers={'User-Agent': 'VidHub/2.3.6'},
+            )
+            self.assertEqual(detail.status_code, 200)
+            self.assertEqual(detail.get_json()['CollectionType'], 'movies')
+
+            for user_agent in ('Mozilla/5.0 EmbyWeb/4.9.5.0', 'Infuse/8.1.7', ''):
+                with self.subTest(user_agent=user_agent):
+                    view = self.client.get(
+                        '/emby/Users/abcdef/Views',
+                        headers={'User-Agent': user_agent},
+                    )
+                    item = view.get_json()['Items'][0]
+                    self.assertEqual(item['CollectionType'], 'mixed')
+                    ordinary_detail = self.client.get(
+                        '/emby/Users/abcdef/Items/-900007',
+                        headers={'User-Agent': user_agent},
+                    )
+                    self.assertEqual(ordinary_detail.get_json()['CollectionType'], 'mixed')
+
+    def test_recent_mixed_items_keep_movie_and_series_query_semantics(self):
+        collection = {
+            'id': 7,
+            'name': 'Localized Recent View',
+            'type': 'filter',
+            'definition_json': {
+                'item_type': ['Movie', 'Series'],
+                'target_library_ids': ['movies-library', 'series-library'],
+                'rules': [
+                    {'field': 'date_added', 'operator': 'in_last_days', 'value': 30},
+                ],
+            },
+        }
+        indexed_items = [
+            {'Id': 'movie-1', 'tmdb_id': '101'},
+            {'Id': 'series-1', 'tmdb_id': '202'},
+        ]
+        emby_items = [
+            {'Id': 'movie-1', 'Name': 'Recent Movie', 'Type': 'Movie'},
+            {
+                'Id': 'series-1',
+                'Name': 'Recent Series',
+                'Type': 'Series',
+                'ChildCount': 1,
+            },
+        ]
+
+        with patch.object(
+            reverse_proxy.custom_collection_db,
+            'get_custom_collection_by_id',
+            return_value=collection,
+        ), patch.object(
+            reverse_proxy.queries_db,
+            'query_virtual_library_items',
+            return_value=(indexed_items, 2),
+        ) as query, patch.object(
+            reverse_proxy,
+            '_get_real_emby_url_and_key',
+            return_value=('http://isolated-emby:8096', 'server-secret-key'),
+        ), patch.object(
+            reverse_proxy,
+            '_fetch_items_in_chunks',
+            return_value=emby_items,
+        ):
+            response = self.client.get(
+                '/emby/Users/abcdef/Items',
+                query_string={
+                    'ParentId': '-900007',
+                    'Recursive': 'true',
+                    # VidHub requests Movie after seeing CollectionType=movies.
+                    # The virtual collection definition must remain authoritative.
+                    'IncludeItemTypes': 'Movie',
+                },
+                headers={'User-Agent': 'VidHub/2.3.6'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload['TotalRecordCount'], 2)
+        self.assertEqual([item['Type'] for item in payload['Items']], ['Movie', 'Series'])
+        self.assertEqual(payload['Items'][1]['ChildCount'], 1)
+        self.assertEqual(query.call_args.kwargs['item_types'], ['Movie', 'Series'])
+        self.assertEqual(
+            query.call_args.kwargs['target_library_ids'],
+            ['movies-library', 'series-library'],
+        )
 
     def test_views_trace_records_request_counts_and_view_fields_without_secrets(self):
         native = {

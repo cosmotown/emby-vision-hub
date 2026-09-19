@@ -381,16 +381,25 @@ def save_config(new_config: Dict[str, Any]):
         raise
 
 def get_docker_image_name() -> str:
-    configured_image = _normalize_docker_image_name(
-        APP_CONFIG.get(constants.CONFIG_OPTION_DOCKER_IMAGE_NAME)
-    )
     environment_image = _normalize_docker_image_name(
         os.environ.get(constants.ENV_VAR_DOCKER_IMAGE_NAME)
     )
+    configured_image = _normalize_docker_image_name(
+        APP_CONFIG.get(constants.CONFIG_OPTION_DOCKER_IMAGE_NAME)
+    )
     return (
-        configured_image
-        or environment_image
+        environment_image
+        or configured_image
         or constants.DEFAULT_DOCKER_IMAGE_NAME
+    )
+
+
+def get_container_name() -> str:
+    """Resolve the self-container name using the documented precedence."""
+    return (
+        str(os.environ.get(constants.ENV_VAR_CONTAINER_NAME) or "").strip()
+        or str(APP_CONFIG.get("container_name") or "").strip()
+        or "emby-toolkit"
     )
 
 # ★★★ 保存自定义主题 ★★★

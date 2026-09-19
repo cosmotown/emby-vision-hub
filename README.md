@@ -53,7 +53,7 @@ EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 S
     services:
       # --- 1. Emby Vision Hub 主程序 ---
       emby-vision-hub:
-        image: tzyzero186/emby-vision-hub:7.2.18
+        image: tzyzero186/emby-vision-hub:latest
         container_name: emby-vision-hub
         network_mode: bridge                          # 网络模式
         ports:
@@ -63,7 +63,6 @@ EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 S
           - /path/emby-vision-hub:/config             # 将宿主机的数据目录挂载到容器的 /config 目录
           - /path/STRM:/STRM:ro                       # 映射 STRM 根目录供实时监控；容器内路径需与监控设置一致
           - /path/tmdb:/tmdb                          # 映射神医本地TMDB目录，非神医Pro用户可以留空
-          - /var/run/docker.sock:/var/run/docker.sock # 一键更新用，不需要可以不配置
         environment:
           - APP_DATA_DIR=/config                      # 持久化目录
           - TZ=Asia/Shanghai                          # 设置容器时区
@@ -75,8 +74,8 @@ EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 S
           - DB_USER=evh                               # !!! (可选) 修改为你自己的数据库用户名
           - DB_PASSWORD=请替换为强密码                 # !!! (必填) 与下方保持一致 !!!
           - DB_NAME=evh                               # !!! (可选) 修改为你自己的数据库名
-          - CONTAINER_NAME=emby-vision-hub            # 以下两项都是一键更新用，不需要可以不配置
-          - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:7.2.18
+          - CONTAINER_NAME=emby-vision-hub            # 仅标识服务；Compose 更新由原管理器执行
+          - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:latest
         restart: unless-stopped
         depends_on:                                   # 确保主程序只在数据库健康检查通过后才启动 
           db:
@@ -114,6 +113,15 @@ EVH 是由 CosmoTown 维护的 Emby 媒体库管理与自动化中枢，覆盖 S
     ```bash
     docker-compose up -d
     ```
+
+### 内建更新器支持边界
+
+- 配置优先级为：运行环境变量 > Web 页面明确保存的配置 > 程序默认值。`CONTAINER_NAME` 必须准确指向当前 EVH 容器，`DOCKER_IMAGE_NAME` 必须属于官方 `tzyzero186/emby-vision-hub` 仓库。
+- 内建更新器只支持已验证为当前 EVH 自身的独立 Docker 容器，要求本地持久 `/config`、Docker socket 和有效 Docker Healthcheck。它固定正式 Release 对应的 image ID 后，事务性替换当前容器。
+- Compose（包括 latest）、Portainer Stack、1Panel、Swarm、Kubernetes、Nomad 均须通过原部署管理器升级。无 inspect 标记的第三方管理器存在识别限制；这类部署不要使用内建替换。NFS/SMB/未知锁文件系统、tmpfs 挂载及特殊 volume options/static network 不在本版自动替换支持范围。
+- `AMBIGUOUS` 表示对象归属或 Docker 操作结果无法证明：停止自动操作并保留现场，不删除冲突对象，也不会把拉取成功当升级成功。首次安装本版必须通过外部管理器完成；新更新器从下一次升级开始生效。
+- 独立 Docker 内建更新必须持久化可写 `/config`，并以 bind mount 提供可写 `/var/run/docker.sock`（该接口具有宿主机管理权限；Compose 示例无需挂载）。更新器会校验新容器的 image ID、`APP_VERSION`、health 和关键运行配置；条件失败时尝试恢复旧容器，无法证明归属时停止自动操作。
+- 内建更新器只管理 EVH 自身，不接受浏览器传入任意容器名或镜像名。
 
 
 3.  **首次配置**：

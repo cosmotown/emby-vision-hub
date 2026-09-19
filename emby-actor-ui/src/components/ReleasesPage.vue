@@ -39,12 +39,12 @@
     
     <div v-else>
       <n-list hoverable clickable>
-        <n-list-item v-for="(release, index) in appStore.releases" :key="release.version">
+        <n-list-item v-for="release in appStore.releases" :key="release.version">
           <n-thing>
             <template #header>
               <n-space align="center">
                 <a :href="release.url" target="_blank" class="version-link">{{ release.version }}</a>
-                <n-tag v-if="index === 0" type="success" size="small" round>最新软件版本</n-tag>
+                <n-tag v-if="isLatestStable(release.version)" type="success" size="small" round>最新软件版本</n-tag>
                 <n-tag v-if="isCurrentRelease(release.version)" type="info" size="small" round>当前版本</n-tag>
               </n-space>
             </template>
@@ -84,14 +84,17 @@
     >
       <n-space align="center" style="margin-top: 20px; margin-bottom: 20px;">
         <!-- 动态加载动画 -->
-        <n-spin size="small" />
+        <n-spin v-if="isUpdating" size="small" />
         <!-- 状态文本 -->
         <n-text>{{ updateStatusText }}</n-text>
       </n-space>
+      <n-text v-if="updateTransactionId" depth="3" style="font-size: 12px;">
+        事务 ID：{{ updateTransactionId }}
+      </n-text>
 
       <template #footer>
         <div style="text-align: right;">
-          <n-button @click="showUpdateModal = false" :disabled="!isUpdateFinished">
+          <n-button @click="closeUpdateModal" :disabled="!isUpdateFinished">
             关闭
           </n-button>
         </div>
@@ -103,7 +106,8 @@
 </template>
 
 <script setup>
-import { ref, onMounted, computed } from 'vue';
+import { ref, onMounted, onUnmounted, computed } from 'vue';
+import axios from 'axios';
 import { marked } from 'marked';
 import { formatDistanceToNow, parseISO } from 'date-fns';
 import { zhCN } from 'date-fns/locale';
@@ -131,7 +135,69 @@ const isUpdating = ref(false);
 const showUpdateModal = ref(false);
 const updateStatusText = ref('');
 const isUpdateFinished = ref(false);
-let eventSource = null;
+const updateTransactionId = ref(localStorage.getItem('evhUpdateTransactionId') || '');
+let pollTimer = null;
+
+const terminalStates = new Set(['SUCCESS', 'ALREADY_CURRENT', 'ROLLED_BACK', 'FAILED', 'AMBIGUOUS']);
+const stateLabels = {
+  PREPARING: '正在执行更新预检…',
+  PULLING: '正在拉取并校验目标正式镜像…',
+  TARGET_PINNED: '目标镜像身份已固定…',
+  AMBIGUOUS: '操作结果无法安全确认，已停止自动更新，请通过原部署管理器恢复。',
+  RECREATING: '正在事务性替换 EVH 容器…',
+  STARTING: '新 EVH 容器正在启动…',
+  HEALTH_CHECK: '正在等待新容器健康检查…',
+  VERIFYING: '正在核验镜像、版本和运行配置…',
+  SUCCESS: '更新完成，所有提交条件均已通过。',
+  ALREADY_CURRENT: '当前容器已经运行目标镜像和目标版本，无需更新。',
+  ROLLING_BACK: '新版本未通过验证，正在恢复旧版本…',
+  ROLLED_BACK: '更新失败，旧版本已恢复并通过健康检查。',
+  FAILED: '更新失败，未能完成事务。',
+};
+
+const stopPolling = () => {
+  if (pollTimer) clearTimeout(pollTimer);
+  pollTimer = null;
+};
+
+const closeUpdateModal = () => {
+  showUpdateModal.value = false;
+  if (isUpdateFinished.value) {
+    localStorage.removeItem('evhUpdateTransactionId');
+    updateTransactionId.value = '';
+  }
+};
+
+const schedulePoll = (delay = 2000) => {
+  stopPolling();
+  pollTimer = setTimeout(pollUpdateStatus, delay);
+};
+
+const pollUpdateStatus = async () => {
+  if (!updateTransactionId.value) return;
+  try {
+    const response = await axios.get(`/api/system/update/status/${updateTransactionId.value}`);
+    const transaction = response.data;
+    const stateText = transaction.message || stateLabels[transaction.state] || transaction.state;
+    const failureDetail = ['ROLLED_BACK', 'FAILED', 'AMBIGUOUS'].includes(transaction.state) && transaction.last_error
+      ? ` 原因：${transaction.last_error}`
+      : '';
+    updateStatusText.value = `${stateText}${failureDetail}`;
+    if (terminalStates.has(transaction.state)) {
+      isUpdateFinished.value = true;
+      isUpdating.value = false;
+      stopPolling();
+      await appStore.fetchVersionInfo();
+      return;
+    }
+    isUpdating.value = true;
+    schedulePoll();
+  } catch (err) {
+    updateStatusText.value = '服务正在重启或暂时不可达，正在重新连接更新事务…';
+    isUpdating.value = true;
+    schedulePoll(3000);
+  }
+};
 
 const handleUpdate = () => {
   dialog.warning({
@@ -144,35 +210,17 @@ const handleUpdate = () => {
       showUpdateModal.value = true;
       isUpdateFinished.value = false;
       isUpdating.value = true;
-      updateStatusText.value = '正在连接到更新服务...';
-
-      eventSource = new EventSource('/api/system/update/stream');
-
-      eventSource.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        
-        // 只需更新状态文本
-        if (data.status) {
-          updateStatusText.value = data.status;
-        }
-        
-        // 检查更新流是否结束
-        if (data.event === 'DONE' || data.event === 'ERROR') {
-          isUpdateFinished.value = true;
-          isUpdating.value = false;
-          eventSource.close();
-        }
-      };
-
-      eventSource.onerror = (err) => {
-        console.error('EventSource failed:', err);
-        updateStatusText.value = '与服务器的连接中断。可能正在重启，请稍后刷新。';
+      updateStatusText.value = '正在创建持久化更新事务…';
+      axios.post('/api/system/update/start').then((response) => {
+        updateTransactionId.value = response.data.transaction_id;
+        localStorage.setItem('evhUpdateTransactionId', updateTransactionId.value);
+        updateStatusText.value = response.data.message || stateLabels[response.data.state];
+        schedulePoll(500);
+      }).catch((err) => {
+        updateStatusText.value = err.response?.data?.error || '无法启动更新事务。';
         isUpdateFinished.value = true;
         isUpdating.value = false;
-        if (eventSource) {
-          eventSource.close();
-        }
-      };
+      });
     },
   });
 };
@@ -200,12 +248,25 @@ const isCurrentRelease = (releaseVersion) => {
   return normalizeVersion(releaseVersion) === normalizeVersion(appStore.currentVersion);
 };
 
+const isLatestStable = (releaseVersion) => {
+  return normalizeVersion(releaseVersion) === normalizeVersion(appStore.latestVersion);
+};
+
 const formatReleaseDate = (dateString) => {
   if (!dateString) return '';
   return formatDistanceToNow(parseISO(dateString), { addSuffix: true, locale: zhCN });
 };
 
-onMounted(fetchData);
+onMounted(async () => {
+  await fetchData();
+  if (updateTransactionId.value) {
+    showUpdateModal.value = true;
+    isUpdating.value = true;
+    isUpdateFinished.value = false;
+    pollUpdateStatus();
+  }
+});
+onUnmounted(stopPolling);
 </script>
 
 <style scoped>

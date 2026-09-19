@@ -403,6 +403,33 @@ def _collection_allowed_for_user(collection, user_id):
     return allowed_users is None or user_id in allowed_users
 
 
+def _configured_native_view_ids():
+    """Return the existing exact-ID allow-list for native Emby libraries."""
+    if not config_manager.APP_CONFIG.get('proxy_merge_native_libraries', True):
+        return ()
+
+    configured = config_manager.APP_CONFIG.get('proxy_native_view_selection', '')
+    if isinstance(configured, str):
+        configured = configured.split(',')
+    if not isinstance(configured, (list, tuple, set)):
+        return ()
+
+    return tuple(dict.fromkeys(
+        str(value).strip() for value in configured if str(value).strip()
+    ))
+
+
+def filter_visible_native_libraries(user_visible_native_libraries):
+    """Apply the established native-library selection to user-visible Views."""
+    selected_ids = set(_configured_native_view_ids())
+    if not selected_ids or not isinstance(user_visible_native_libraries, list):
+        return []
+    return [
+        library for library in user_visible_native_libraries
+        if isinstance(library, dict) and str(library.get('Id') or '') in selected_ids
+    ]
+
+
 def _request_emby_user_id():
     """Read the current Emby user id from the standard authorization header."""
     authorization = (
@@ -436,6 +463,66 @@ def _request_authenticates_emby_user(base_url, user_id, headers, params):
         return isinstance(payload, dict) and str(payload.get('Id') or '') == user_id
     except (requests.RequestException, TypeError, ValueError):
         return False
+
+
+def handle_get_infuse_virtual_folders():
+    """Return only native folders allowed by the existing EVH Views contract."""
+    user_id = _request_emby_user_id()
+    if not user_id:
+        return "Forbidden", 403
+
+    try:
+        base_url, api_key = _get_real_emby_url_and_key()
+        forward_headers = {
+            key: value for key, value in request.headers
+            if key.lower() not in {'host', 'accept-encoding'}
+        }
+        auth_params = {
+            key: value for key, value in request.args.items()
+            if str(key).lower() in {'api_key', 'apikey', 'access_token'}
+        }
+        if not _request_authenticates_emby_user(
+            base_url, user_id, forward_headers, auth_params
+        ):
+            return "Forbidden", 403
+
+        user_visible_libraries = emby.get_emby_libraries(base_url, api_key, user_id)
+        if user_visible_libraries is None:
+            return "Upstream library visibility unavailable", 502
+        visible_ids = {
+            str(library.get('Id'))
+            for library in filter_visible_native_libraries(user_visible_libraries)
+            if library.get('Id')
+        }
+
+        response = requests.get(
+            f"{base_url}/Library/VirtualFolders",
+            headers={'X-Emby-Token': api_key},
+            timeout=15,
+        )
+        response.raise_for_status()
+        folders = response.json()
+        if not isinstance(folders, list):
+            return "Invalid upstream VirtualFolders response", 502
+
+        filtered = [
+            folder for folder in folders
+            if isinstance(folder, dict)
+            and str(folder.get('ItemId') or folder.get('Id') or '') in visible_ids
+        ]
+        return Response(json.dumps(filtered), mimetype='application/json')
+    except requests.RequestException as exc:
+        logger.error(
+            "[PROXY] Infuse VirtualFolders upstream request failed: error_type=%s",
+            type(exc).__name__,
+        )
+        return "Upstream VirtualFolders unavailable", 502
+    except (TypeError, ValueError) as exc:
+        logger.error(
+            "[PROXY] Infuse VirtualFolders response invalid: error_type=%s",
+            type(exc).__name__,
+        )
+        return "Invalid upstream VirtualFolders response", 502
 
 
 def _is_recent_mixed_virtual_collection(collection, definition, normalized_types):
@@ -548,17 +635,7 @@ def handle_get_views():
             fake_views_items.append(fake_view)
         
         # 3. 合并与排序
-        native_views_items = []
-        should_merge_native = config_manager.APP_CONFIG.get('proxy_merge_native_libraries', True)
-        if should_merge_native:
-            all_native_views = user_visible_native_libs
-            raw_selection = config_manager.APP_CONFIG.get('proxy_native_view_selection', '')
-            selected_native_view_ids = [x.strip() for x in raw_selection.split(',') if x.strip()] if isinstance(raw_selection, str) else raw_selection
-            
-            if selected_native_view_ids:
-                native_views_items = [view for view in all_native_views if view.get("Id") in selected_native_view_ids]
-            else:
-                native_views_items = []
+        native_views_items = filter_visible_native_libraries(user_visible_native_libs)
         
         final_items = []
         native_order = config_manager.APP_CONFIG.get('proxy_native_view_order', 'before')
@@ -1189,6 +1266,12 @@ def proxy_all(path):
             path.startswith('emby/Users/') or path.startswith('Users/')
         ):
             return handle_get_views()
+
+        # Infuse Direct separately enumerates VirtualFolders after Views. Apply
+        # the same exact-ID native-library visibility contract to both prefixes.
+        if re.fullmatch(r'(?:emby/)?Library/VirtualFolders', path, re.IGNORECASE) \
+                and is_infuse_direct_client(request):
+            return handle_get_infuse_virtual_folders()
 
         # --- 拦截 C: 最新项目 (Latest) ---
         if path.endswith('/Items/Latest'):

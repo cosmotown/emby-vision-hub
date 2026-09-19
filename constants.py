@@ -4,7 +4,7 @@ import os
 # ==============================================================================
 # ✨ 应用基础信息 (Application Basics)
 # ==============================================================================
-APP_VERSION = "7.2.31"  # 更新版本号
+APP_VERSION = "7.2.32"  # 更新版本号
 SELF_UPDATE_SCHEMA_CONTRACT = "evh-7.2-additive-v1"
 SELF_UPDATE_BINARY_ROLLBACK_SAFE = True
 GITHUB_REPO_OWNER = "cosmotown"  # 您的 GitHub 用户名

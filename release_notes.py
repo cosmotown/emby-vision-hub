@@ -2,6 +2,29 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.32",
+        "published_at": "2026-09-19T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.32",
+        "changelog": """## EVH 事务性自更新与安全加固
+
+- 修复镜像已拉取、运行容器仍停留在旧 image ID/旧版本却提示更新完成的问题。拉取完成或 worker 退出均不再代表升级成功。
+- 仅选择已发布的 GitHub 正式稳定 Release，固定目标 image ID；创建、核验与中断恢复不重新解析可变 tag。
+- 使用共享持久锁保证跨进程单事务、单 worker 执行；持久化进度支持页面刷新与重连，旧 GET/SSE 更新入口停用。
+- 新容器必须同时通过实际 image ID、APP_VERSION、running/healthy 和运行配置指纹校验，才持久化 SUCCESS。
+- 替换前保留原容器及其数据挂载，验证失败时尝试恢复原容器；对象身份或操作结果不确定时进入 AMBIGUOUS，停止自动操作并保留现场。
+- helper/candidate 清理同时核对原始容器 ID 和事务标签，不按同名猜测归属，不删除数据卷。错误信息使用安全类别，不回显凭据或 Docker 原始异常。
+
+### 支持边界与升级提示
+
+- 本版自动替换仅支持经过自身身份校验的独立 Docker EVH，要求本地持久 `/config`、Docker socket 和有效 Docker Healthcheck。
+- Compose、Portainer Stack、1Panel、Swarm、Kubernetes、Nomad 请继续通过原部署管理器升级；本更新器不会绕过管理器重建容器。特殊挂载、静态网络或无法证明安全的配置保持拒绝。
+- **首次升级到 v7.2.32 请通过原部署管理器重新创建容器。旧版更新器自身的缺陷不能靠拉取本版镜像修复；新更新器从下一次升级开始生效。**
+- 本版不修改 VidHub、Infuse、虚拟库、近期入库、人物清理、数据库结构、MoviePilot 或 115 逻辑。
+
+""",
+    },
+
+    {
         "version": "v7.2.31",
         "published_at": "2026-09-13T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.31",

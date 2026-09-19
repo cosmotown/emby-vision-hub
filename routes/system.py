@@ -1,8 +1,7 @@
 # routes/system.py
 
-from flask import Blueprint, jsonify, request, Response, stream_with_context
+from flask import Blueprint, jsonify, request
 import logging
-import json
 import os
 import re
 import requests
@@ -15,10 +14,11 @@ import handler.emby as emby
 import handler.github as github
 # 导入共享模块
 import extensions
-from extensions import admin_required, task_lock_required
-from tasks.system_update import _update_process_generator
+from extensions import admin_required
+from tasks.system_update import start_system_update
 import constants
 import utils
+from services import self_update
 from release_notes import CUSTOM_RELEASES
 from database import settings_db
 # 1. 创建蓝图
@@ -396,8 +396,20 @@ def get_about_info():
             proxies=config_manager.get_proxies_for_requests(),
         ) or []
 
-        merged_by_version = {release.get("version"): dict(release) for release in CUSTOM_RELEASES if release.get("version")}
-        for remote in remote_releases:
+        stable_remote_releases = [
+            release for release in remote_releases
+            if release.get("source") == "release"
+            and not release.get("draft")
+            and not release.get("prerelease")
+            and github.stable_version_key(release.get("version")) is not None
+        ]
+        latest_stable = github.get_latest_stable_release(stable_remote_releases)
+        merged_by_version = {
+            release.get("version"): dict(release)
+            for release in CUSTOM_RELEASES
+            if github.stable_version_key(release.get("version")) is not None
+        }
+        for remote in stable_remote_releases:
             version = remote.get("version")
             if not version:
                 continue
@@ -409,14 +421,15 @@ def get_about_info():
                 "url": remote.get("url") or local.get("url"),
             }
 
-        def version_key(release):
-            numbers = re.findall(r'\d+', release.get("version") or "")
-            return tuple(int(number) for number in numbers[:4])
-
-        releases = sorted(merged_by_version.values(), key=version_key, reverse=True)
+        releases = sorted(
+            merged_by_version.values(),
+            key=lambda release: github.stable_version_key(release.get("version")) or (-1, -1, -1),
+            reverse=True,
+        )
         response_data = {
             "current_version": constants.APP_VERSION,
             "releases": releases,
+            "latest_stable_version": latest_stable.get("version") if latest_stable else None,
         }
         return jsonify(response_data)
 
@@ -424,30 +437,47 @@ def get_about_info():
         logger.error(f"API /system/about_info 发生错误: {e}", exc_info=True)
         return jsonify({"error": "获取版本信息时发生服务器内部错误"}), 500
 
-# --- 一键更新 ---
+# --- 事务性自更新 ---
+@system_bp.route('/system/update/start', methods=['POST'])
+@admin_required
+def start_update():
+    try:
+        transaction = start_system_update()
+        return jsonify(self_update.redact_transaction(transaction)), 202
+    except self_update.SelfUpdateError as exc:
+        status = 409 if "已有更新事务" in str(exc) or "worker 正在运行" in str(exc) else 400
+        return jsonify({"error": "已有更新事务或部署不满足安全更新条件，请使用原部署管理器。", "code": self_update.safe_error(exc)}), status
+    except docker.errors.DockerException as exc:
+        logger.error("无法启动自更新事务: evh_update_docker_unavailable")
+        return jsonify({"error": "无法访问 Docker，未启动更新。"}), 503
+    except Exception as exc:
+        logger.error("启动自更新事务失败: evh_update_start_failed")
+        return jsonify({"error": "启动更新事务失败，当前容器未被修改。"}), 500
+
+
+@system_bp.route('/system/update/status', methods=['GET'])
+@system_bp.route('/system/update/status/<transaction_id>', methods=['GET'])
+@admin_required
+def update_status(transaction_id=None):
+    try:
+        transaction = (
+            self_update.load_transaction(transaction_id)
+            if transaction_id
+            else (self_update.get_active_transaction() or self_update.get_latest_transaction())
+        )
+        if not transaction:
+            return jsonify({"error": "没有可读取的更新事务。"}), 404
+        return jsonify(self_update.redact_transaction(transaction)), 200
+    except self_update.SelfUpdateError as exc:
+        return jsonify({"error": self_update.safe_error(exc)}), 400
+
+
 @system_bp.route('/system/update/stream', methods=['GET'])
 @admin_required
-@task_lock_required
-def stream_update_progress():
-    """
-    【V11 - 简化UI版】
-    通过启动一个临时的“更新器容器”来执行更新操作，并向前端提供简化的状态文本流。
-    """
-    def generate_progress():
-        def send_event(data):
-            # 确保发送的是 JSON 格式的字符串
-            yield f"data: {json.dumps(data)}\n\n"
-
-        container_name = config_manager.APP_CONFIG.get('container_name', 'emby-toolkit')
-        image_name_tag = config_manager.get_docker_image_name()
-
-        # 调用共享的生成器
-        generator = _update_process_generator(container_name, image_name_tag)
-        
-        for event in generator:
-            yield from send_event(event)
-
-    return Response(stream_with_context(generate_progress()), mimetype='text/event-stream')
+def retired_update_stream():
+    return jsonify({
+        "error": "旧 SSE 更新入口已停用；GET 请求不会再启动更新，请刷新页面后重试。"
+    }), 410
 
 # +++ 重启容器 +++
 @system_bp.route('/system/restart', methods=['POST'])
@@ -458,8 +488,7 @@ def restart_container():
     """
     try:
         client = docker.from_env()
-        # 从配置中获取容器名，如果未配置则使用默认值
-        container_name = config_manager.APP_CONFIG.get('container_name', 'emby-toolkit')
+        container_name = config_manager.get_container_name()
         
         if not container_name:
             logger.error("API: 尝试重启容器，但配置中未找到 'container_name'。")

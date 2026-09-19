@@ -47,7 +47,7 @@ from routes.media_cleanup import media_cleanup_bp
 from routes.person_cleanup import person_cleanup_bp
 from routes.user_management import user_management_bp
 from routes.webhook import webhook_bp, resume_persistent_webhook_queue
-from tasks.system_update import cleanup_stale_updater_containers
+from tasks.system_update import cleanup_stale_updater_containers, recover_interrupted_system_update
 from routes.unified_auth import unified_auth_bp
 from routes.user_portal import user_portal_bp
 from routes.discover import discover_bp
@@ -451,10 +451,11 @@ def main_app_start():
 
     def cleanup_update_helpers():
         try:
-            container_name = config_manager.APP_CONFIG.get('container_name', 'emby-toolkit')
+            recover_interrupted_system_update()
+            container_name = config_manager.get_container_name()
             cleanup_stale_updater_containers(container_name)
         except Exception as exc:
-            logger.debug(f"启动时清理更新器残留失败，不影响应用运行: {exc}")
+            logger.warning("启动时恢复/清理更新事务失败，已停止自动操作；请查看持久化事务状态。")
 
     spawn_later(2, cleanup_update_helpers)
     

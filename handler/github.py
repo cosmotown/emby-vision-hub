@@ -2,9 +2,31 @@
 
 import requests
 import logging
+import re
 from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
+_STABLE_VERSION_RE = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
+
+
+def stable_version_key(value: Any):
+    match = _STABLE_VERSION_RE.fullmatch(str(value or "").strip())
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def get_latest_stable_release(releases: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return the newest real, published GitHub stable release."""
+    eligible = [
+        release for release in (releases or [])
+        if release.get("source") == "release"
+        and release.get("draft") is False
+        and release.get("prerelease") is False
+        and bool(release.get("published_at"))
+        and stable_version_key(release.get("version")) is not None
+    ]
+    return max(eligible, key=lambda release: stable_version_key(release.get("version")), default=None)
 
 def get_github_releases(owner: str, repo: str, token: Optional[str] = None, proxies: Optional[Dict[str, str]] = None) -> Optional[List[Dict[str, Any]]]:
     """
@@ -48,7 +70,10 @@ def get_github_releases(owner: str, repo: str, token: Optional[str] = None, prox
                 "version": release.get("tag_name"),
                 "published_at": release.get("published_at"),
                 "changelog": release.get("body"), # 更新日志通常在 body 字段
-                "url": release.get("html_url")
+                "url": release.get("html_url"),
+                "draft": release.get("draft"),
+                "prerelease": release.get("prerelease"),
+                "source": "release",
             })
         
         if parsed_releases:
@@ -67,6 +92,9 @@ def get_github_releases(owner: str, repo: str, token: Optional[str] = None, prox
                 "published_at": None,
                 "changelog": "远端版本已发布，更新后可查看完整更新记录。",
                 "url": f"https://github.com/{owner}/{repo}/tree/{tag.get('name')}",
+                "draft": False,
+                "prerelease": False,
+                "source": "tag",
             }
             for tag in tags_response.json()
             if tag.get("name")
@@ -75,8 +103,8 @@ def get_github_releases(owner: str, repo: str, token: Optional[str] = None, prox
         return parsed_tags
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"请求 GitHub API 时发生网络错误: {e}", exc_info=True)
+        logger.error("请求 GitHub API 失败（网络/HTTP错误；敏感异常内容已省略）")
         return None
     except Exception as e:
-        logger.error(f"处理 GitHub API 响应时发生未知错误: {e}", exc_info=True)
+        logger.error("GitHub API 返回无效数据；敏感异常内容已省略")
         return None

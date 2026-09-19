@@ -1,42 +1,19 @@
-import importlib.util
-import sys
-import types
+import os
+import tempfile
 import unittest
-from pathlib import Path
+from unittest import mock
 
-
-class DockerNotFound(Exception):
-    pass
-
-
-docker_stub = types.ModuleType('docker')
-docker_stub.errors = types.SimpleNamespace(
-    NotFound=DockerNotFound,
-    ImageNotFound=type('ImageNotFound', (Exception,), {}),
-)
-sys.modules.setdefault('docker', docker_stub)
-sys.modules.setdefault('task_manager', types.ModuleType('task_manager'))
-sys.modules.setdefault('config_manager', types.ModuleType('config_manager'))
-sys.modules.setdefault('extensions', types.ModuleType('extensions'))
-
-module_path = Path(__file__).resolve().parents[1] / 'tasks' / 'system_update.py'
-spec = importlib.util.spec_from_file_location('system_update_cleanup_test_target', module_path)
-system_update = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(system_update)
+from services import self_update
+from tasks import system_update
 
 
 class FakeContainer:
-    def __init__(self, name, status, image='', command=None, labels=None):
+    def __init__(self, name, status, labels):
         self.name = name
+        self.id = name
         self.status = status
         self.removed = False
-        self.attrs = {
-            'Config': {
-                'Image': image,
-                'Cmd': command or [],
-                'Labels': labels or {},
-            }
-        }
+        self.attrs = {"Image": "sha256:source", "Config": {"Labels": labels}}
 
     def reload(self):
         return None
@@ -49,7 +26,7 @@ class FakeContainers:
     def __init__(self, containers):
         self._containers = containers
 
-    def list(self, all=False):
+    def list(self, all=False, filters=None):
         return list(self._containers)
 
 
@@ -63,55 +40,69 @@ class FakeClient:
 
 
 class SystemUpdateCleanupTests(unittest.TestCase):
-    def test_only_stale_toolkit_updaters_are_removed(self):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.environment = mock.patch.dict(os.environ, {"APP_DATA_DIR": self.temporary.name})
+        self.environment.start()
+
+    def tearDown(self):
+        self.environment.stop()
+        self.temporary.cleanup()
+
+    def _transaction(self, state):
+        transaction = self_update.create_transaction(
+            source_container_id="source-id",
+            source_container_name="emby-toolkit",
+            source_image_id="sha256:source",
+            source_version="7.2.31",
+            source_schema_contract="evh-7.2-additive-v1",
+            target_version="7.2.32",
+            target_image="tzyzero186/emby-vision-hub:7.2.32",
+            deployment_type="standalone_docker",
+        )
+        self_update.update_transaction(transaction["transaction_id"], worker_container_id="terminal-worker")
+        return self_update.append_transaction_event(
+            transaction["transaction_id"], state, state, result=state.lower()
+        )
+
+    def test_only_stopped_terminal_worker_is_removed(self):
+        terminal = self._transaction("SUCCESS")
         labels = {
-            system_update.UPDATER_ROLE_LABEL: 'updater',
-            system_update.UPDATER_TARGET_LABEL: 'emby-toolkit',
+            self_update.UPDATER_ROLE_LABEL: self_update.UPDATER_ROLE_VALUE,
+            self_update.UPDATER_TARGET_LABEL: "emby-toolkit",
+            self_update.UPDATER_TRANSACTION_LABEL: terminal["transaction_id"],
+            self_update.UPDATER_SOURCE_LABEL: "source-id",
         }
-        tagged_stale = FakeContainer('tagged', 'created', labels=labels)
-        legacy_stale = FakeContainer(
-            'legacy',
-            'exited',
-            image='containrrr/watchtower',
-            command=['--cleanup', '--run-once', 'emby-toolkit'],
-        )
-        running = FakeContainer('running', 'running', labels=labels)
-        unrelated = FakeContainer(
-            'user-watchtower',
-            'exited',
-            image='containrrr/watchtower',
-            command=['--cleanup', '--interval', '300'],
-        )
+        stopped = FakeContainer("terminal-worker", "exited", labels)
+        running = FakeContainer("running-worker", "running", labels)
+        unrelated = FakeContainer("unrelated", "exited", {})
 
         removed = system_update.cleanup_stale_updater_containers(
-            'emby-toolkit',
-            client=FakeClient([tagged_stale, legacy_stale, running, unrelated]),
+            "emby-toolkit", client=FakeClient([stopped, running, unrelated])
         )
 
-        self.assertEqual(removed, 2)
-        self.assertTrue(tagged_stale.removed)
-        self.assertTrue(legacy_stale.removed)
+        self.assertEqual(removed, 1)
+        self.assertTrue(stopped.removed)
         self.assertFalse(running.removed)
         self.assertFalse(unrelated.removed)
 
-    def test_updater_for_another_target_is_preserved(self):
-        other_target = FakeContainer(
-            'other-updater',
-            'dead',
-            labels={
-                system_update.UPDATER_ROLE_LABEL: 'updater',
-                system_update.UPDATER_TARGET_LABEL: 'another-app',
+    def test_worker_for_another_target_is_preserved(self):
+        terminal = self._transaction("FAILED")
+        worker = FakeContainer(
+            "other-worker",
+            "dead",
+            {
+                self_update.UPDATER_ROLE_LABEL: self_update.UPDATER_ROLE_VALUE,
+                self_update.UPDATER_TARGET_LABEL: "another-app",
+                self_update.UPDATER_TRANSACTION_LABEL: terminal["transaction_id"],
             },
         )
-
         removed = system_update.cleanup_stale_updater_containers(
-            'emby-toolkit',
-            client=FakeClient([other_target]),
+            "emby-toolkit", client=FakeClient([worker])
         )
-
         self.assertEqual(removed, 0)
-        self.assertFalse(other_target.removed)
+        self.assertFalse(worker.removed)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

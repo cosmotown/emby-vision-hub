@@ -3,11 +3,11 @@
 services:
   emby-vision-hub:
     build: .
-    image: tzyzero186/emby-vision-hub:7.2.18
+    image: tzyzero186/emby-vision-hub:latest
     container_name: emby-vision-hub
     restart: unless-stopped
     volumes:
-      - ./local_data:/config 
+      - ./local_data:/config
     environment:
       - APP_DATA_DIR=/config
       - PUID=1000
@@ -18,7 +18,7 @@ services:
       - DB_PASSWORD=change-me
       - DB_NAME=evh
       - CONTAINER_NAME=emby-vision-hub
-      - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:7.2.18
+      - DOCKER_IMAGE_NAME=tzyzero186/emby-vision-hub:latest
     ports:
       - "5257:5257"
       - "8096:8096"

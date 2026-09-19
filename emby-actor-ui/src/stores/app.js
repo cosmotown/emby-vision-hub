@@ -17,15 +17,17 @@ export const useAppStore = defineStore('app', () => {
     return false;
   }
 
-  // 2. 规范化版本号：去掉可能存在的 'v' 前缀和首尾空格
-  const normalizedLatest = latestVersion.value.replace(/^v/, '').trim();
-  const normalizedCurrent = currentVersion.value.replace(/^v/, '').trim();
-
-  // (可选) 添加一个 console.log 来调试
-  // console.log(`版本比较: 最新='${normalizedLatest}', 当前='${normalizedCurrent}', 是否不同: ${normalizedLatest !== normalizedCurrent}`);
-
-  // 3. 比较规范化后的版本号
-  return normalizedLatest !== normalizedCurrent;
+  const parseStableVersion = (value) => {
+    const match = String(value || '').trim().match(/^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
+    return match ? match.slice(1).map(Number) : null;
+  };
+  const latest = parseStableVersion(latestVersion.value);
+  const current = parseStableVersion(currentVersion.value);
+  if (!latest || !current) return false;
+  for (let index = 0; index < latest.length; index += 1) {
+    if (latest[index] !== current[index]) return latest[index] > current[index];
+  }
+  return false;
 });
 
   // --- Actions ---
@@ -35,10 +37,7 @@ export const useAppStore = defineStore('app', () => {
       currentVersion.value = response.data.current_version;
       releases.value = response.data.releases;
       
-      // 最新版本就是 release 列表的第一个
-      if (response.data.releases && response.data.releases.length > 0) {
-        latestVersion.value = response.data.releases[0].version;
-      }
+      latestVersion.value = response.data.latest_stable_version || '';
     } catch (error) {
       console.error('Failed to fetch version info:', error);
     }

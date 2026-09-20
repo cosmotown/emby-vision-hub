@@ -2,6 +2,22 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.33",
+        "published_at": "2026-09-20T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.33",
+        "changelog": """## Infuse Direct 隐藏原生库修复
+
+- 修复 Infuse Direct 在读取 EVH 虚拟库后，又通过 `/Library/VirtualFolders` 重新显示已配置隐藏的底层原生媒体库的问题。
+- Infuse Direct 的带与不带 `/emby` 前缀 `VirtualFolders` 请求，统一复用 EVH 现有原生库可见性规则。
+- 原生库必须同时满足当前 Emby 用户可见、且在 EVH `proxy_native_view_selection` 中按精确 Library ID 明确允许，才会返回。
+- 不按媒体库中文名称过滤；与隐藏原生库同名的 EVH 负数虚拟 View 继续正常显示。
+- VidHub、Emby Web、无 User-Agent 与其他普通客户端的原生库路径和响应保持不变。
+- 本版本不修改 Infuse CollectionType、Recent Mixed、虚拟库图片、Items、Season/Episode、详情、播放、用户权限或数据库结构。
+
+""",
+    },
+
+    {
         "version": "v7.2.32",
         "published_at": "2026-09-19T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.32",

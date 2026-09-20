@@ -59,6 +59,16 @@ server {
         proxy_pass http://virtual_library_proxy;
     }
 
+    # Infuse Direct performs a second native-library discovery pass through
+    # VirtualFolders. Route only that proven client family through the same EVH
+    # exact-ID visibility contract; every other client keeps the native path.
+    location ~ ^/(emby/)?Library/VirtualFolders$ {
+        if ($http_user_agent ~* "^Infuse-Direct/") {
+            proxy_pass http://virtual_library_proxy;
+        }
+        proxy_pass http://emby_server;
+    }
+
     # Only virtual catalogue requests pass through the Python proxy. Native
     # libraries retain the established direct Emby path.
     location ~ ^/(emby/)?Users/([a-f0-9]+)/Items$ {

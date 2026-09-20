@@ -445,8 +445,9 @@ def start_update():
         transaction = start_system_update()
         return jsonify(self_update.redact_transaction(transaction)), 202
     except self_update.SelfUpdateError as exc:
-        status = 409 if "已有更新事务" in str(exc) or "worker 正在运行" in str(exc) else 400
-        return jsonify({"error": "已有更新事务或部署不满足安全更新条件，请使用原部署管理器。", "code": self_update.safe_error(exc)}), status
+        code = self_update.safe_error(exc)
+        status = 409 if code == "evh_update_active_transaction" or "worker 正在运行" in str(exc) else 400
+        return jsonify({"error": self_update.safe_error_message(exc), "code": code}), status
     except docker.errors.DockerException as exc:
         logger.error("无法启动自更新事务: evh_update_docker_unavailable")
         return jsonify({"error": "无法访问 Docker，未启动更新。"}), 503

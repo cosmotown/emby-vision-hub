@@ -117,6 +117,21 @@ def _verify_target_container(container, tx, fingerprint):
         raise su.SelfUpdateError("evh_update_object_image_mismatch")
     if su.runtime_config_fingerprint(container.attrs) != fingerprint:
         raise su.SelfUpdateError("evh_update_config_mismatch")
+    _verify_deployment_contract(container.attrs, tx, candidate=True)
+
+
+def _verify_deployment_contract(attrs, tx, candidate=False):
+    if tx.get("deployment_type") != "portainer_compose":
+        return
+    contract = su.portainer_stack_contract(attrs)
+    if (contract.get("image_reference") != tx.get("deployment_image_reference")
+            or contract.get("identity_fingerprint") != tx.get("deployment_identity_fingerprint")):
+        raise su.SelfUpdateError("evh_update_portainer_source_mismatch")
+    if candidate:
+        labels = (attrs.get("Config") or {}).get("Labels") or {}
+        if (labels.get(su.COMPOSE_IMAGE_LABEL) != tx.get("target_image_id")
+                or labels.get(su.MANAGED_IMAGE_REFERENCE_LABEL) != tx.get("deployment_image_reference")):
+            raise su.SelfUpdateError("evh_update_portainer_source_mismatch")
 
 
 def _ambiguous(tx, exc):
@@ -174,8 +189,13 @@ def _execute(transaction_id, client):
         attrs = _source_attrs(source, tx)
         # A previously updated container uses a pinned Config.Image. Source
         # identity is the persisted ID, not that mutable declaration string.
-        if not su.detect_deployment_type(attrs)[1]:
+        deployment_type, supported, _ = su.detect_deployment_type(attrs)
+        if not supported or deployment_type != tx.get("deployment_type"):
             raise su.SelfUpdateError("evh_update_deployment_unsupported")
+        deployment_contract = su.validate_deployment_scope(client, source, attrs, deployment_type)
+        if (deployment_contract.get("image_reference") != tx.get("deployment_image_reference")
+                or deployment_contract.get("identity_fingerprint") != tx.get("deployment_identity_fingerprint")):
+            raise su.SelfUpdateError("evh_update_portainer_source_mismatch")
         su.find_config_mount(attrs)
         su.find_docker_socket_mount(attrs)
         su.require_healthcheck(attrs)
@@ -240,6 +260,9 @@ def _execute(transaction_id, client):
             clone["Image"] = tx["target_image_id"]
             clone["Labels"] = {key: value for key, value in (clone.get("Labels") or {}).items() if key not in su.OWNERSHIP_LABELS}
             clone["Labels"].update(su.object_labels(tx, "candidate"))
+            if tx.get("deployment_type") == "portainer_compose":
+                clone["Labels"][su.COMPOSE_IMAGE_LABEL] = tx["target_image_id"]
+                clone["Labels"][su.MANAGED_IMAGE_REFERENCE_LABEL] = tx["deployment_image_reference"]
             su.update_transaction(transaction_id, create_intent=True)
             try:
                 response = client.api.create_container_from_config(clone, name=tx["source_container_name"], platform=platform)
@@ -255,6 +278,7 @@ def _execute(transaction_id, client):
         su.require_healthcheck(candidate.attrs)
         if su.runtime_config_fingerprint(candidate.attrs) != fingerprint:
             raise su.SelfUpdateError("evh_update_config_mismatch")
+        _verify_deployment_contract(candidate.attrs, tx, candidate=True)
         state = candidate.attrs.get("State") or {}
         if state.get("Status") == "created":
             su.append_transaction_event(transaction_id, "STARTING", "新容器身份与配置已核验，正在启动。")

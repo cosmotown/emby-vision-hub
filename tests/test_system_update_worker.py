@@ -12,7 +12,7 @@ import config_manager
 import constants
 from services import self_update
 from tasks import system_update_worker
-from tests.test_transactional_self_update import container_attrs
+from tests.test_transactional_self_update import container_attrs, portainer_attrs
 
 
 class FakeImage:
@@ -85,6 +85,14 @@ class FakeContainers:
             "rollback_safe": True,
         }).encode()
 
+    def list(self, all=False, filters=None):
+        values = list(self.client.by_id.values())
+        labels = (filters or {}).get("label") or []
+        for expression in labels:
+            key, _, expected = expression.partition("=")
+            values = [container for container in values if str(((container.attrs.get("Config") or {}).get("Labels") or {}).get(key)) == expected]
+        return values
+
 
 class FakeImages:
     def __init__(self, client):
@@ -153,6 +161,15 @@ class FakeClient:
     def close(self):
         self.closed = True
 
+    def make_portainer_source(self):
+        attrs = portainer_attrs(self.source_image.id)
+        attrs["Id"] = self.source.id
+        attrs["Name"] = f"/{self.source.name}"
+        attrs["State"] = {"Status": "running", "Health": {"Status": "healthy"}}
+        attrs["Mounts"] = copy.deepcopy(self.source_mounts)
+        self.source.attrs = attrs
+        return self.source
+
 
 class SystemUpdateWorkerTests(unittest.TestCase):
     def setUp(self):
@@ -182,6 +199,59 @@ class SystemUpdateWorkerTests(unittest.TestCase):
             target_image="tzyzero186/emby-vision-hub:7.2.32",
             deployment_type="standalone_docker",
         )
+
+    def portainer_transaction(self, client):
+        client.make_portainer_source()
+        contract = self_update.validate_deployment_scope(
+            client, client.source, client.source.attrs, "portainer_compose"
+        )
+        return self_update.create_transaction(
+            source_container_id=client.source.id,
+            source_container_name=client.source.name,
+            source_image_id=client.source_image.id,
+            source_version="7.2.31",
+            source_schema_contract="evh-7.2-additive-v1",
+            target_version="7.2.32",
+            target_image="tzyzero186/emby-vision-hub:7.2.32",
+            deployment_type="portainer_compose",
+            deployment_image_reference=contract["image_reference"],
+            deployment_identity_fingerprint=contract["identity_fingerprint"],
+        )
+
+    def test_portainer_stack_update_preserves_identity_and_pins_compose_image(self):
+        client = FakeClient()
+        transaction = self.portainer_transaction(client)
+        source_labels = copy.deepcopy(client.source.attrs["Config"]["Labels"])
+        result = system_update_worker.run_transaction(transaction["transaction_id"], client=client)
+        self.assertEqual(result["state"], "SUCCESS")
+        candidate = client.by_name["emby-toolkit"]
+        labels = candidate.attrs["Config"]["Labels"]
+        for key in self_update.COMPOSE_IDENTITY_LABELS:
+            self.assertEqual(labels[key], source_labels[key])
+        self.assertEqual(labels[self_update.COMPOSE_IMAGE_LABEL], "sha256:new")
+        self.assertEqual(
+            labels[self_update.MANAGED_IMAGE_REFERENCE_LABEL],
+            "tzyzero186/emby-vision-hub:latest",
+        )
+        self.assertEqual(candidate.attrs["Config"]["Image"], "sha256:new")
+        self_update.validate_source_repository(candidate.attrs)
+        self.assertEqual(
+            self_update.detect_deployment_type(candidate.attrs)[:2],
+            ("portainer_compose", True),
+        )
+
+    def test_portainer_stack_multiple_instances_fails_before_stop(self):
+        client = FakeClient()
+        transaction = self.portainer_transaction(client)
+        duplicate_attrs = copy.deepcopy(client.source.attrs)
+        duplicate_attrs["Id"] = "duplicate"
+        duplicate_attrs["Name"] = "/duplicate"
+        duplicate = FakeContainer(client, "duplicate", "duplicate", duplicate_attrs)
+        client.add(duplicate)
+        result = system_update_worker.run_transaction(transaction["transaction_id"], client=client)
+        self.assertEqual(result["state"], "FAILED")
+        self.assertEqual(client.source.status, "running")
+        self.assertEqual(client.api.create_count, 0)
 
     def test_pull_up_to_date_still_recreates_old_running_image(self):
         client = FakeClient()

@@ -30,6 +30,9 @@ class SimpleContainers:
             return self.container
         raise docker.errors.NotFound("missing")
 
+    def list(self, all=False, filters=None):
+        return [self.container]
+
 
 class SimpleClient:
     def __init__(self, attrs):
@@ -95,6 +98,22 @@ def container_attrs(image_id="sha256:old", container_id="a" * 64):
     }
 
 
+def portainer_attrs(image_id="sha256:old", container_id="a" * 64, image_reference="tzyzero186/emby-vision-hub:latest"):
+    attrs = container_attrs(image_id=image_id, container_id=container_id)
+    attrs["Config"]["Image"] = image_reference
+    attrs["Config"]["Labels"].update({
+        "com.docker.compose.project": "evh",
+        "com.docker.compose.service": "evh",
+        "com.docker.compose.container-number": "1",
+        "com.docker.compose.oneoff": "False",
+        "com.docker.compose.config-hash": "1" * 64,
+        "com.docker.compose.project.working_dir": "/data/compose/42",
+        "com.docker.compose.project.config_files": "/data/compose/42/docker-compose.yml",
+        "com.docker.compose.image": image_id,
+    })
+    return attrs
+
+
 class TransactionalSelfUpdateTests(unittest.TestCase):
     def test_semantic_version_is_strict_and_ordered(self):
         self.assertEqual(self_update.parse_stable_version("v7.2.31"), (7, 2, 31))
@@ -131,8 +150,8 @@ class TransactionalSelfUpdateTests(unittest.TestCase):
         compose["Config"]["Image"] = "tzyzero186/emby-vision-hub:7.2.31"
         self.assertEqual(self_update.detect_deployment_type(compose)[:2], ("docker_compose", False))
         for labels, expected in (
-            ({"io.portainer.stack.name": "evh"}, "portainer"),
-            ({"com.docker.compose.project.working_dir": "/data/compose/42"}, "portainer"),
+            ({"io.portainer.stack.name": "evh"}, "portainer_compose"),
+            ({"com.docker.compose.project.working_dir": "/data/compose/42"}, "portainer_compose"),
             ({"com.docker.compose.project.working_dir": "/opt/1panel/apps/evh"}, "1panel"),
             ({"com.docker.swarm.service.name": "evh"}, "swarm"),
             ({"io.kubernetes.container.name": "evh"}, "kubernetes"),
@@ -142,6 +161,15 @@ class TransactionalSelfUpdateTests(unittest.TestCase):
             kind, supported, _ = self_update.detect_deployment_type(attrs)
             self.assertEqual(kind, expected)
             self.assertFalse(supported)
+
+        portainer = portainer_attrs()
+        self.assertEqual(self_update.detect_deployment_type(portainer)[:2], ("portainer_compose", True))
+        portainer["Config"]["Labels"]["com.docker.compose.project.working_dir"] = "/srv/lab"
+        portainer["Config"]["Labels"]["com.docker.compose.project.config_files"] = "/srv/lab/compose.yml"
+        portainer["Config"]["Labels"]["io.portainer.stack.name"] = "evh"
+        self.assertEqual(self_update.detect_deployment_type(portainer)[:2], ("portainer_compose", True))
+        portainer["Config"]["Image"] = "tzyzero186/emby-vision-hub:7.2.33"
+        self.assertEqual(self_update.detect_deployment_type(portainer)[:2], ("portainer_compose", False))
 
     def test_config_clone_preserves_runtime_contract(self):
         attrs = container_attrs()
@@ -257,7 +285,7 @@ class TransactionalSelfUpdateTests(unittest.TestCase):
         attrs["Name"] = "/emby-toolkit"
         client = SimpleClient(attrs)
         release = {
-            "version": "v7.2.33",
+            "version": "v7.2.35",
             "draft": False,
             "prerelease": False,
             "source": "release",
@@ -273,9 +301,66 @@ class TransactionalSelfUpdateTests(unittest.TestCase):
                 },
             ), mock.patch.object(self_update, "assert_self_identity"), mock.patch.object(self_update, "start_worker") as start_worker:
                 transaction = self_update.start_update_transaction(client, release)
-        self.assertEqual(transaction["target_version"], "7.2.33")
-        self.assertEqual(transaction["target_image"], "tzyzero186/emby-vision-hub:7.2.33")
+        self.assertEqual(transaction["target_version"], "7.2.35")
+        self.assertEqual(transaction["target_image"], "tzyzero186/emby-vision-hub:7.2.35")
         start_worker.assert_called_once()
+
+    def test_start_accepts_only_strict_single_instance_portainer_latest_stack(self):
+        attrs = portainer_attrs(container_id="source-container")
+        attrs["Name"] = "/emby-toolkit"
+        client = SimpleClient(attrs)
+        release = {
+            "version": "v7.2.34",
+            "draft": False,
+            "prerelease": False,
+            "source": "release",
+            "published_at": "2026-09-20T00:00:00Z",
+        }
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {
+                "APP_DATA_DIR": directory,
+                constants.ENV_VAR_CONTAINER_NAME: "emby-toolkit",
+                constants.ENV_VAR_DOCKER_IMAGE_NAME: "tzyzero186/emby-vision-hub:latest",
+            },
+        ), mock.patch.object(self_update, "assert_self_identity"), mock.patch.object(
+            self_update, "start_worker"
+        ) as start_worker:
+            transaction = self_update.start_update_transaction(client, release)
+        self.assertEqual(transaction["deployment_type"], "portainer_compose")
+        self.assertEqual(
+            transaction["deployment_image_reference"],
+            "tzyzero186/emby-vision-hub:latest",
+        )
+        self.assertRegex(transaction["deployment_identity_fingerprint"], r"^[0-9a-f]{64}$")
+        start_worker.assert_called_once()
+
+    def test_portainer_fixed_tag_is_rejected_with_specific_code(self):
+        attrs = portainer_attrs(
+            container_id="source-container",
+            image_reference="tzyzero186/emby-vision-hub:7.2.33",
+        )
+        client = SimpleClient(attrs)
+        release = {
+            "version": "v7.2.34",
+            "draft": False,
+            "prerelease": False,
+            "source": "release",
+            "published_at": "2026-09-20T00:00:00Z",
+        }
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ,
+            {
+                "APP_DATA_DIR": directory,
+                constants.ENV_VAR_CONTAINER_NAME: "emby-toolkit",
+                constants.ENV_VAR_DOCKER_IMAGE_NAME: "tzyzero186/emby-vision-hub:latest",
+            },
+        ), mock.patch.object(self_update, "assert_self_identity"), mock.patch.object(
+            self_update, "start_worker"
+        ) as start_worker:
+            with self.assertRaisesRegex(self_update.SelfUpdateError, "evh_update_portainer_image_must_be_latest"):
+                self_update.start_update_transaction(client, release)
+        start_worker.assert_not_called()
 
     def test_draft_prerelease_and_downgrade_never_start_worker(self):
         attrs = container_attrs()

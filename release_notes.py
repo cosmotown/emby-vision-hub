@@ -2,6 +2,28 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.34",
+        "published_at": "2026-09-21T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.34",
+        "changelog": """## Portainer Stack 事务性自更新修复
+
+- 修复 Portainer Stack 通过 Docker Compose 部署时，内建更新器只显示“不满足安全更新条件”而无法升级的问题。
+- 仅支持身份完整、单实例、声明官方 `tzyzero186/emby-vision-hub:latest` 的 Portainer Compose Stack；普通 Compose、固定版本 tag、多实例和其他管理器继续 fail closed。
+- 更新前后重复核验当前 EVH 自身身份、Compose project/service/config hash、唯一实例、运行配置和镜像声明。
+- 新容器保留 Portainer/Compose 身份标签，并将 Compose image identity 与实际目标 image ID 同步；后续 Stack reconcile 不会回滚已完成更新。
+- 只有目标 image ID、APP_VERSION、Docker health、完整运行配置及 Compose 身份全部一致时才报告成功；失败继续自动恢复旧容器。
+- 更新预检错误现在返回明确且脱敏的原因，不再把固定 tag、身份不完整、多实例等情况压缩成同一条提示。
+- 不改变 VidHub、Infuse、虚拟库、人物清理、Inventory、MediaInfo、ReviewList、STRM 或数据库结构。
+
+### 首次升级说明
+
+- v7.2.33 仍会拒绝 Portainer Stack，因此本次升级到 v7.2.34 需要在 Portainer 中手动更新并重建一次。
+- v7.2.34 之后，满足上述严格条件且挂载可写 Docker socket 的 Portainer Stack 才可使用内建更新器。
+
+""",
+    },
+
+    {
         "version": "v7.2.33",
         "published_at": "2026-09-20T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.33",

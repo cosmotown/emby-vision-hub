@@ -1,7 +1,8 @@
-"""Permanent regression for the 15 final-audit counterexamples.
+"""Permanent regression for the transactional updater safety counterexamples.
 
-Fake Docker deliberately has no daemon access. Compose's old positive support
-expectation is replaced by the explicitly approved external-manager boundary.
+Fake Docker deliberately has no daemon access. Only a strictly identified,
+single-instance Portainer Compose Stack using the official latest declaration
+is eligible; other managed deployments remain fail-closed.
 """
 import copy
 import json
@@ -123,15 +124,14 @@ class SafetyTests(unittest.TestCase):
         attrs["HostConfig"]["NetworkMode"] = "container:other"
         self.assertFalse(su.detect_deployment_type(attrs)[1])
 
-    def test_09_compose_never_recreated_even_with_complete_labels(self):
+    def test_09_only_strict_portainer_compose_is_recreated(self):
         client = FakeClient()
-        client.source.attrs["Config"]["Labels"].update({"com.docker.compose.project": "audit", "com.docker.compose.service": "evh", "com.docker.compose.oneoff": "False", "com.docker.compose.project.working_dir": "/lab", "com.docker.compose.project.config_files": "/lab/compose.yml"})
-        tx = self.tx(client)
-        with mock.patch.object(client.source, "stop") as stop:
-            result = worker.run_transaction(tx["transaction_id"], client)
-        self.assertEqual(result["state"], "FAILED")
-        stop.assert_not_called()
-        self.assertEqual(client.api.create_count, 0)
+        tx = self.fixture.portainer_transaction(client)
+        result = worker.run_transaction(tx["transaction_id"], client)
+        self.assertEqual(result["state"], "SUCCESS")
+        labels = client.by_name["emby-toolkit"].attrs["Config"]["Labels"]
+        self.assertEqual(labels[su.COMPOSE_IMAGE_LABEL], "sha256:new")
+        self.assertEqual(labels[su.MANAGED_IMAGE_REFERENCE_LABEL], f"{su.OFFICIAL_REPOSITORY}:latest")
 
     def test_10_capability_order_does_not_change_fingerprint(self):
         before = container_attrs()
@@ -401,6 +401,16 @@ class UpdaterRouteSafetyTests(unittest.TestCase):
             self.assertIn(response.status_code, (400, 500, 503))
             self.assertNotIn(marker, response.get_data(as_text=True))
             self.assertNotIn(marker, str(log.call_args_list))
+
+    def test_portainer_preflight_error_is_specific_and_safe(self):
+        error = su.SelfUpdateError("evh_update_portainer_image_must_be_latest")
+        with mock.patch.object(self.routes, "start_system_update", side_effect=error):
+            response = self.client.post("/api/system/update/start")
+        self.assertEqual(response.status_code, 400)
+        payload = response.get_json()
+        self.assertEqual(payload["code"], "evh_update_portainer_image_must_be_latest")
+        self.assertIn("latest", payload["error"])
+        self.assertNotIn("DockerException", payload["error"])
 
     def test_retired_get_never_starts_update(self):
         with mock.patch.object(self.routes, "start_system_update") as start:

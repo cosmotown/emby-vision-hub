@@ -46,6 +46,21 @@ UPDATER_TRANSACTION_LABEL = "com.emby-vision-hub.transaction"
 UPDATER_ROLE_VALUE = "worker"
 UPDATER_SOURCE_LABEL = "com.emby-vision-hub.source-id"
 OWNERSHIP_LABELS = frozenset({UPDATER_ROLE_LABEL, UPDATER_TARGET_LABEL, UPDATER_TRANSACTION_LABEL, UPDATER_SOURCE_LABEL})
+MANAGED_IMAGE_REFERENCE_LABEL = "com.emby-vision-hub.managed-image-reference"
+COMPOSE_IMAGE_LABEL = "com.docker.compose.image"
+COMPOSE_IDENTITY_LABELS = (
+    "com.docker.compose.project",
+    "com.docker.compose.service",
+    "com.docker.compose.container-number",
+    "com.docker.compose.oneoff",
+    "com.docker.compose.config-hash",
+    "com.docker.compose.project.working_dir",
+    "com.docker.compose.project.config_files",
+)
+FINGERPRINT_EXCLUDED_LABELS = OWNERSHIP_LABELS | frozenset({
+    MANAGED_IMAGE_REFERENCE_LABEL,
+    COMPOSE_IMAGE_LABEL,
+})
 _STABLE_VERSION_RE = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 
 
@@ -60,6 +75,25 @@ def safe_error(exc: Exception) -> str:
         if re.fullmatch(r"evh_update_[a-z_]+", value):
             return value
     return "evh_update_operation_failed"
+
+
+SAFE_ERROR_MESSAGES = {
+    "evh_update_active_transaction": "已有更新事务正在进行或需要人工恢复。",
+    "evh_update_portainer_identity_incomplete": "Portainer Stack 身份信息不完整，未执行更新。",
+    "evh_update_portainer_image_must_be_latest": "Portainer Stack 必须声明官方 latest 镜像，才能安全使用内建更新。",
+    "evh_update_portainer_multiple_instances": "Portainer Stack 中该 EVH 服务不是单实例，未执行更新。",
+    "evh_update_portainer_source_mismatch": "Portainer Stack 服务身份与当前 EVH 容器不一致，未执行更新。",
+    "evh_update_deployment_unsupported": "当前部署方式不满足内建更新的安全条件，请使用原部署管理器。",
+    "evh_update_config_mount_required": "内建更新需要唯一、可写且持久化的 /config 挂载。",
+    "evh_update_docker_socket_required": "内建更新需要可写 Docker socket 挂载。",
+    "evh_update_healthcheck_required": "当前 EVH 容器缺少 Docker healthcheck，未执行更新。",
+    "evh_update_lock_filesystem_unknown": "无法确认 /config 锁文件系统类型，未执行更新。",
+    "evh_update_lock_filesystem_unsupported": "/config 所在文件系统不支持可靠事务锁，未执行更新。",
+}
+
+
+def safe_error_message(exc: Exception) -> str:
+    return SAFE_ERROR_MESSAGES.get(safe_error(exc), "无法启动安全更新；当前容器未被修改。")
 
 
 def strict_bool(value: Any) -> bool:
@@ -260,7 +294,7 @@ def update_transaction(transaction_id: str, **changes: Any) -> Dict[str, Any]:
             raise SelfUpdateError("更新事务不存在。")
         if transaction.get("state") in TERMINAL_STATES:
             raise SelfUpdateError("evh_update_terminal_transaction")
-        for key in ("target_image_id", "target_digest", "target_version", "target_image", "source_container_id", "source_image_id", "config_fingerprint_before"):
+        for key in ("target_image_id", "target_digest", "target_version", "target_image", "source_container_id", "source_image_id", "config_fingerprint_before", "deployment_image_reference", "deployment_identity_fingerprint"):
             if key in changes and transaction.get(key) is not None and changes[key] != transaction[key]:
                 raise SelfUpdateError("evh_update_immutable_transaction_field")
         transaction.update(changes)
@@ -285,7 +319,7 @@ def append_transaction_event(
             raise SelfUpdateError("更新事务不存在。")
         if transaction.get("state") in TERMINAL_STATES:
             raise SelfUpdateError("evh_update_terminal_transaction")
-        for key in ("target_image_id", "target_digest", "target_version", "target_image", "source_container_id", "source_image_id", "config_fingerprint_before"):
+        for key in ("target_image_id", "target_digest", "target_version", "target_image", "source_container_id", "source_image_id", "config_fingerprint_before", "deployment_image_reference", "deployment_identity_fingerprint"):
             if key in changes and transaction.get(key) is not None and changes[key] != transaction[key]:
                 raise SelfUpdateError("evh_update_immutable_transaction_field")
         events = list(transaction.get("events") or [])
@@ -356,6 +390,8 @@ def create_transaction(
     target_version: str,
     target_image: str,
     deployment_type: str,
+    deployment_image_reference: Optional[str] = None,
+    deployment_identity_fingerprint: Optional[str] = None,
 ) -> Dict[str, Any]:
     with file_lock("coordinator.lock"):
         root = transaction_root()
@@ -364,9 +400,7 @@ def create_transaction(
         if active_path.exists():
             active = get_active_transaction()
             if not active or active.get("state") == "AMBIGUOUS" or active.get("state") not in TERMINAL_STATES:
-                raise SelfUpdateError(
-                    "已有更新事务正在进行或需要人工恢复。"
-                )
+                raise SelfUpdateError("evh_update_active_transaction")
             try:
                 active_path.unlink()
             except FileNotFoundError:
@@ -390,6 +424,8 @@ def create_transaction(
             "target_platform": None,
             "target_schema_contract": None,
             "deployment_type": deployment_type,
+            "deployment_image_reference": deployment_image_reference,
+            "deployment_identity_fingerprint": deployment_identity_fingerprint,
             "state": "PREPARING",
             "message": "更新事务已创建。",
             "last_error": None,
@@ -415,7 +451,7 @@ def create_transaction(
             descriptor = os.open(active_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError as exc:
             transaction_path(transaction_id).unlink(missing_ok=True)
-            raise SelfUpdateError("已有更新事务正在进行。") from exc
+            raise SelfUpdateError("evh_update_active_transaction") from exc
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump({"transaction_id": transaction_id, "created_at": now}, handle)
             handle.flush()
@@ -472,6 +508,77 @@ def resolve_self_container(client) -> Any:
     )
 
 
+def _portainer_stack_number(labels: Dict[str, Any]) -> Optional[str]:
+    values = (
+        str(labels.get("com.docker.compose.project.working_dir") or ""),
+        str(labels.get("com.docker.compose.project.config_files") or ""),
+    )
+    matches = []
+    for value in values:
+        found = re.search(r"(?:^|[,;])\s*/data/compose/([^/,;]+)(?:/|$)", value)
+        matches.append(found.group(1) if found else None)
+    if matches[0] and matches[0] == matches[1]:
+        return matches[0]
+    return None
+
+
+def portainer_stack_contract(attrs: Dict[str, Any]) -> Dict[str, str]:
+    config = attrs.get("Config") or {}
+    labels = config.get("Labels") or {}
+    if any(not str(labels.get(key) or "").strip() for key in COMPOSE_IDENTITY_LABELS):
+        raise SelfUpdateError("evh_update_portainer_identity_incomplete")
+    explicit_portainer_stack = str(labels.get("io.portainer.stack.name") or "").strip()
+    if _portainer_stack_number(labels) is None and not explicit_portainer_stack:
+        raise SelfUpdateError("evh_update_portainer_identity_incomplete")
+    if str(labels.get("com.docker.compose.oneoff")).lower() != "false":
+        raise SelfUpdateError("evh_update_portainer_identity_incomplete")
+    if str(labels.get("com.docker.compose.container-number")) != "1":
+        raise SelfUpdateError("evh_update_portainer_multiple_instances")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(labels.get("com.docker.compose.config-hash") or "")):
+        raise SelfUpdateError("evh_update_portainer_identity_incomplete")
+    compose_image = str(labels.get(COMPOSE_IMAGE_LABEL) or "")
+    if not compose_image.startswith("sha256:"):
+        raise SelfUpdateError("evh_update_portainer_identity_incomplete")
+
+    configured_reference = str(config.get("Image") or "").strip()
+    if configured_reference.startswith("sha256:"):
+        configured_reference = str(labels.get(MANAGED_IMAGE_REFERENCE_LABEL) or "").strip()
+    repository, tag = split_image_reference(configured_reference)
+    if repository != OFFICIAL_REPOSITORY or tag != "latest":
+        raise SelfUpdateError("evh_update_portainer_image_must_be_latest")
+
+    identity = {key: str(labels[key]) for key in COMPOSE_IDENTITY_LABELS}
+    identity_payload = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {
+        "image_reference": f"{OFFICIAL_REPOSITORY}:latest",
+        "identity_fingerprint": hashlib.sha256(identity_payload.encode("utf-8")).hexdigest(),
+        "project": identity["com.docker.compose.project"],
+        "service": identity["com.docker.compose.service"],
+    }
+
+
+def validate_deployment_scope(client, source_container: Any, attrs: Dict[str, Any], deployment_type: str) -> Dict[str, str]:
+    if deployment_type != "portainer_compose":
+        return {}
+    contract = portainer_stack_contract(attrs)
+    filters = {"label": [
+        f"com.docker.compose.project={contract['project']}",
+        f"com.docker.compose.service={contract['service']}",
+    ]}
+    matches = []
+    for container in client.containers.list(all=True, filters=filters):
+        container.reload()
+        labels = ((container.attrs or {}).get("Config") or {}).get("Labels") or {}
+        if (str(labels.get("com.docker.compose.project")) == contract["project"]
+                and str(labels.get("com.docker.compose.service")) == contract["service"]):
+            matches.append(container)
+    if len(matches) != 1:
+        raise SelfUpdateError("evh_update_portainer_multiple_instances")
+    if matches[0].id != source_container.id:
+        raise SelfUpdateError("evh_update_portainer_source_mismatch")
+    return contract
+
+
 def detect_deployment_type(attrs: Dict[str, Any]) -> Tuple[str, bool, str]:
     labels = ((attrs.get("Config") or {}).get("Labels") or {})
     label_keys = {str(key).lower() for key in labels}
@@ -480,14 +587,19 @@ def detect_deployment_type(attrs: Dict[str, Any]) -> Tuple[str, bool, str]:
         return "kubernetes", False, "Kubernetes 管理的容器不支持内建替换。"
     if "com.docker.swarm.service.name" in label_keys or "com.docker.stack.namespace" in label_keys:
         return "swarm", False, "Docker Swarm/Stack 管理的容器不支持内建替换。"
-    if any("portainer" in value for value in (*label_keys, *label_values)):
-        return "portainer", False, "Portainer 管理标记已存在，请通过 Portainer 升级。"
     compose_paths = [
         str(labels.get("com.docker.compose.project.working_dir") or "").lower(),
         str(labels.get("com.docker.compose.project.config_files") or "").lower(),
     ]
-    if any(re.search(r"(?:^|/|:)data/compose(?:/|$)", value) for value in compose_paths):
-        return "portainer", False, "检测到 Portainer Stack 的 Compose 路径，请通过 Portainer 升级。"
+    if (any(re.search(r"(?:^|/|:)data/compose(?:/|$)", value) for value in compose_paths)
+            or str(labels.get("io.portainer.stack.name") or "").strip()):
+        try:
+            portainer_stack_contract(attrs)
+        except SelfUpdateError as exc:
+            return "portainer_compose", False, safe_error_message(exc)
+        return "portainer_compose", True, "受严格约束的单实例 Portainer Compose Stack。"
+    if any("portainer" in value for value in (*label_keys, *label_values)):
+        return "portainer", False, "Portainer 非 Compose Stack 部署不支持内建替换。"
     if any(
         key.startswith("com.1panel.") or key.startswith("io.1panel.")
         for key in label_keys
@@ -507,10 +619,10 @@ def detect_deployment_type(attrs: Dict[str, Any]) -> Tuple[str, bool, str]:
 def find_config_mount(attrs: Dict[str, Any]) -> Dict[str, Any]:
     matches = [mount for mount in (attrs.get("Mounts") or []) if mount.get("Destination") == "/config"]
     if len(matches) != 1 or not matches[0].get("RW"):
-        raise SelfUpdateError("EVH /config 必须有且仅有一个可写持久化挂载。")
+        raise SelfUpdateError("evh_update_config_mount_required")
     mount = matches[0]
     if mount.get("Type") not in {"bind", "volume"}:
-        raise SelfUpdateError("EVH /config 挂载类型不受支持。")
+        raise SelfUpdateError("evh_update_config_mount_required")
     return mount
 
 
@@ -520,9 +632,7 @@ def find_docker_socket_mount(attrs: Dict[str, Any]) -> Dict[str, Any]:
         if mount.get("Destination") == "/var/run/docker.sock"
     ]
     if len(matches) != 1 or not matches[0].get("RW") or matches[0].get("Type") != "bind":
-        raise SelfUpdateError(
-            "内建更新器需要唯一的可写 /var/run/docker.sock bind mount；未执行容器修改。"
-        )
+        raise SelfUpdateError("evh_update_docker_socket_required")
     return matches[0]
 
 
@@ -631,7 +741,7 @@ def runtime_config_projection(attrs: Dict[str, Any]) -> Dict[str, Any]:
             "DriverOpts": network.get("DriverOpts"),
             "GwPriority": network.get("GwPriority") or 0,
         }
-    labels = {key: value for key, value in (config.get("Labels") or {}).items() if key not in OWNERSHIP_LABELS}
+    labels = {key: value for key, value in (config.get("Labels") or {}).items() if key not in FINGERPRINT_EXCLUDED_LABELS}
     projection = {
         "Env": sorted(config.get("Env") or []),
         "Cmd": config.get("Cmd"),
@@ -838,7 +948,13 @@ def start_update_transaction(client, release: Dict[str, Any]) -> Dict[str, Any]:
     assert_self_identity(source_container)
     deployment_type, supported, reason = detect_deployment_type(attrs)
     if not supported:
-        raise SelfUpdateError(reason)
+        if deployment_type == "portainer_compose":
+            try:
+                portainer_stack_contract(attrs)
+            except SelfUpdateError:
+                raise
+        raise SelfUpdateError("evh_update_deployment_unsupported")
+    deployment_contract = validate_deployment_scope(client, source_container, attrs, deployment_type)
     find_config_mount(attrs)
     find_docker_socket_mount(attrs)
     require_healthcheck(attrs)
@@ -864,6 +980,8 @@ def start_update_transaction(client, release: Dict[str, Any]) -> Dict[str, Any]:
         target_version=target_version,
         target_image=target_image_for_version(target_version),
         deployment_type=deployment_type,
+        deployment_image_reference=deployment_contract.get("image_reference"),
+        deployment_identity_fingerprint=deployment_contract.get("identity_fingerprint"),
     )
     try:
         start_worker(client, transaction, source_container)

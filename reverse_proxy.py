@@ -788,6 +788,21 @@ def handle_get_mimicked_library_items(user_id, mimicked_id, params):
         defined_sort_by = definition.get('default_sort_by')
         defined_sort_order = definition.get('default_sort_order')
 
+        rules = definition.get('rules', [])
+        logic = definition.get('logic', 'AND')
+        item_types = definition.get('item_type', ['Movie'])
+        target_library_ids = definition.get('target_library_ids', [])
+        normalized_item_types = {
+            str(item_type).strip().casefold()
+            for item_type in (item_types if isinstance(item_types, list) else [item_types])
+            if str(item_type).strip()
+        }
+        use_effective_recent_at = _is_recent_mixed_virtual_collection(
+            collection_info,
+            definition,
+            normalized_item_types,
+        )
+
         # 逻辑：如果DB定义了且不是none，强制劫持；否则使用客户端请求
         if defined_sort_by and defined_sort_by != 'none':
             # 强制劫持模式
@@ -800,21 +815,23 @@ def handle_get_mimicked_library_items(user_id, mimicked_id, params):
             sort_order = req_sort_order or 'Descending'
             is_native_mode = True
 
+        # Recent Movie+Series is an EVH semantic sort.  Keep the collection's
+        # existing direction/window, but rank a Series by its newest live
+        # Episode instead of proxying the parent DateCreated sort back to Emby.
+        if use_effective_recent_at:
+            sort_by = 'DateLastContentAdded'
+
         # 核心判断：是否需要 Emby 原生排序
         # 当使用原生排序(is_native_mode=True)时，如果排序字段不是数据库能完美处理的(如DateCreated)，
         # 必须强制走 Emby 代理排序。
         is_emby_proxy_sort_required = (
             collection_type in ['ai_recommendation', 'ai_recommendation_global'] or 
-            'DateLastContentAdded' in sort_by or
-            (is_native_mode and sort_by not in ['DateCreated', 'Random'])
+            ('DateLastContentAdded' in sort_by and not use_effective_recent_at) or
+            (is_native_mode and sort_by not in ['DateCreated', 'Random'] and not use_effective_recent_at)
         )
 
         # 3. 准备基础查询参数
         tmdb_ids_filter = None
-        rules = definition.get('rules', [])
-        logic = definition.get('logic', 'AND')
-        item_types = definition.get('item_type', ['Movie'])
-        target_library_ids = definition.get('target_library_ids', [])
 
         # 4. 分流处理逻辑
         
@@ -964,7 +981,8 @@ def handle_get_mimicked_library_items(user_id, mimicked_id, params):
                 limit=sql_limit, offset=sql_offset,
                 sort_by=sql_sort, sort_order=sort_order,
                 item_types=item_types, target_library_ids=target_library_ids,
-                tmdb_ids=tmdb_ids_filter
+                tmdb_ids=tmdb_ids_filter,
+                use_effective_recent_at=use_effective_recent_at,
             )
 
             reported_total_count = min(total_count, defined_limit) if defined_limit else total_count
@@ -1066,6 +1084,16 @@ def handle_get_latest_items(user_id, params):
             # parent rows by DateCreated first can permanently discard an old Series
             # before Emby ever sees the candidate list.
             item_types = definition.get('item_type', ['Movie'])
+            normalized_item_types = {
+                str(item_type).strip().casefold()
+                for item_type in (item_types if isinstance(item_types, list) else [item_types])
+                if str(item_type).strip()
+            }
+            use_effective_recent_at = _is_recent_mixed_virtual_collection(
+                collection_info,
+                definition,
+                normalized_item_types,
+            )
 
             # SQL 过滤权限和规则
             items, total_count = queries_db.query_virtual_library_items(
@@ -1073,7 +1101,8 @@ def handle_get_latest_items(user_id, params):
                 user_id=user_id, limit=candidate_limit, offset=0,
                 sort_by='DateLastContentAdded', sort_order=sort_order,
                 item_types=item_types, target_library_ids=definition.get('target_library_ids', []),
-                tmdb_ids=tmdb_ids_filter  # <--- 传入 TMDb ID 限制
+                tmdb_ids=tmdb_ids_filter,  # <--- 传入 TMDb ID 限制
+                use_effective_recent_at=use_effective_recent_at,
             )
             
             if not items: return Response(json.dumps([]), mimetype='application/json')
@@ -1107,6 +1136,20 @@ def handle_get_latest_items(user_id, params):
                     continue
 
                 definition = coll.get('definition_json')
+                if isinstance(definition, str):
+                    definition = json.loads(definition)
+                definition = definition if isinstance(definition, dict) else {}
+                item_types = definition.get('item_type', ['Movie'])
+                normalized_item_types = {
+                    str(item_type).strip().casefold()
+                    for item_type in (item_types if isinstance(item_types, list) else [item_types])
+                    if str(item_type).strip()
+                }
+                use_effective_recent_at = _is_recent_mixed_virtual_collection(
+                    coll,
+                    definition,
+                    normalized_item_types,
+                )
                 items, _ = queries_db.query_virtual_library_items(
                     rules=definition.get('rules', []),
                     logic=definition.get('logic', 'AND'),
@@ -1115,9 +1158,10 @@ def handle_get_latest_items(user_id, params):
                     offset=0,
                     sort_by='DateLastContentAdded',
                     sort_order=sort_order,
-                    item_types=definition.get('item_type', ['Movie']),
+                    item_types=item_types,
                     target_library_ids=definition.get('target_library_ids', []),
-                    tmdb_ids=tmdb_ids_filter # <--- 传入 TMDb ID 限制
+                    tmdb_ids=tmdb_ids_filter, # <--- 传入 TMDb ID 限制
+                    use_effective_recent_at=use_effective_recent_at,
                 )
                 all_latest.extend(items)
             

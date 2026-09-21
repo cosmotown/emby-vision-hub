@@ -58,8 +58,8 @@ class VirtualLatestQueryTests(unittest.TestCase):
             )
 
         query_sql = cursor.executed[-1][0]
-        self.assertIn('SELECT MAX(ep.date_added)', query_sql)
-        self.assertIn("ep.parent_series_tmdb_id = m.tmdb_id", query_sql)
+        self.assertIn('MAX(ep.date_added)', query_sql)
+        self.assertIn("latest_episode.parent_series_tmdb_id = m.tmdb_id", query_sql)
         self.assertLess(query_sql.index('ORDER BY'), query_sql.index('LIMIT'))
         self.assertEqual(items[0]['Id'], 'old-series')
         self.assertEqual(items[0]['latest_sort_at'], newest)
@@ -146,6 +146,82 @@ class VirtualLatestRouteTests(unittest.TestCase):
         self.assertEqual([item['Id'] for item in response.get_json()], ['middle'])
         self.assertEqual(query.call_args.kwargs['limit'], 2)
         self.assertEqual(query.call_args.kwargs['sort_order'], 'Ascending')
+
+    def test_recent_items_uses_effective_date_without_emby_resort(self):
+        collection = {
+            'type': 'filter',
+            'definition_json': {
+                'item_type': ['Movie', 'Series'],
+                'rules': [
+                    {'field': 'date_added', 'operator': 'in_last_days', 'value': 30},
+                ],
+                'default_sort_by': 'DateCreated',
+                'default_sort_order': 'Descending',
+            },
+        }
+        ranked = [
+            {'Id': 'old-series-new-episode', 'effective_recent_at': '2026-09-21T10:00:00Z'},
+            {'Id': 'new-movie', 'effective_recent_at': '2026-09-20T10:00:00Z'},
+        ]
+        details = [
+            {'Id': 'new-movie', 'Type': 'Movie'},
+            {'Id': 'old-series-new-episode', 'Type': 'Series'},
+        ]
+        with reverse_proxy.proxy_app.test_request_context('/Users/user-1/Items'):
+            with patch.object(
+                reverse_proxy.custom_collection_db,
+                'get_custom_collection_by_id',
+                return_value=collection,
+            ), patch.object(
+                reverse_proxy.queries_db,
+                'query_virtual_library_items',
+                return_value=(ranked, 2),
+            ) as query, patch.object(
+                reverse_proxy,
+                '_fetch_sorted_items_via_emby_proxy',
+            ) as emby_sort, patch.object(
+                reverse_proxy,
+                '_fetch_items_in_chunks',
+                return_value=details,
+            ):
+                response = reverse_proxy.handle_get_mimicked_library_items(
+                    'user-1', reverse_proxy.to_mimicked_id(7), {'Limit': '20'},
+                )
+
+        self.assertEqual(
+            [item['Id'] for item in response.get_json()['Items']],
+            ['old-series-new-episode', 'new-movie'],
+        )
+        self.assertEqual(query.call_args.kwargs['sort_by'], 'DateLastContentAdded')
+        self.assertTrue(query.call_args.kwargs['use_effective_recent_at'])
+        emby_sort.assert_not_called()
+
+    def test_non_recent_filter_keeps_existing_date_created_contract(self):
+        collection = {
+            'type': 'filter',
+            'definition_json': {
+                'item_type': ['Movie', 'Series'],
+                'rules': [],
+                'default_sort_by': 'DateCreated',
+                'default_sort_order': 'Descending',
+            },
+        }
+        with reverse_proxy.proxy_app.test_request_context('/Users/user-1/Items'):
+            with patch.object(
+                reverse_proxy.custom_collection_db,
+                'get_custom_collection_by_id',
+                return_value=collection,
+            ), patch.object(
+                reverse_proxy.queries_db,
+                'query_virtual_library_items',
+                return_value=([], 0),
+            ) as query:
+                reverse_proxy.handle_get_mimicked_library_items(
+                    'user-1', reverse_proxy.to_mimicked_id(8), {'Limit': '20'},
+                )
+
+        self.assertEqual(query.call_args.kwargs['sort_by'], 'DateCreated')
+        self.assertFalse(query.call_args.kwargs['use_effective_recent_at'])
 
 
 if __name__ == '__main__':

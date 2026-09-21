@@ -15,6 +15,22 @@ import utils
 
 logger = logging.getLogger(__name__)
 
+
+def get_logical_episode_date_created(versions: List[Dict[str, Any]]) -> Optional[str]:
+    """Return the first Emby library-add timestamp for one logical Episode.
+
+    Emby can expose more than one media version for the same S/E coordinate.
+    Adding a later duplicate/version must not make an existing Episode look newly
+    added, so the logical Episode uses the earliest stable ``DateCreated`` value.
+    Metadata timestamps such as ``DateModified`` are intentionally ignored.
+    """
+    values = [
+        str(version.get("DateCreated") or "").strip()
+        for version in (versions or [])
+        if isinstance(version, dict) and str(version.get("DateCreated") or "").strip()
+    ]
+    return min(values) if values else None
+
 AUDIO_SUBTITLE_KEYWORD_MAP = {
     "chi": ["Mandarin", "CHI", "ZHO", "国语", "国配", "国英双语", "公映", "台配", "京译", "上译", "央译"],
     "yue": ["Cantonese", "YUE", "粤语"],

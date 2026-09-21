@@ -1,12 +1,92 @@
 # database/connection.py
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from datetime import datetime, timezone
+import json
 import logging
 
 import config_manager
 import constants
 
 logger = logging.getLogger(__name__)
+
+_EPISODE_DATE_ADDED_BACKFILL_KEY = 'recent_episode_date_added_backfill_v1'
+
+
+def _parse_emby_date_created(value):
+    """Parse an Emby DateCreated value without accepting metadata timestamps."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    if normalized.endswith('Z'):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def backfill_episode_date_added(cursor) -> int:
+    """One-time, idempotent backfill from persisted Emby DateCreated evidence.
+
+    Older EVH versions persisted Episode DateCreated in each asset as
+    ``date_added_to_library`` but left ``media_metadata.date_added`` empty.
+    The earliest date across media versions represents when the logical Episode
+    first entered the library; later duplicate versions must not bump Recent.
+    """
+    cursor.execute(
+        "SELECT 1 FROM app_settings WHERE setting_key = %s",
+        (_EPISODE_DATE_ADDED_BACKFILL_KEY,),
+    )
+    if cursor.fetchone():
+        return 0
+
+    cursor.execute("""
+        SELECT tmdb_id, asset_details_json
+        FROM media_metadata
+        WHERE item_type = 'Episode'
+          AND in_library = TRUE
+          AND date_added IS NULL
+          AND asset_details_json IS NOT NULL
+    """)
+    updates = []
+    for row in cursor.fetchall():
+        assets = row.get('asset_details_json')
+        if isinstance(assets, str):
+            try:
+                assets = json.loads(assets)
+            except (TypeError, ValueError):
+                assets = []
+        if not isinstance(assets, list):
+            continue
+        timestamps = [
+            parsed
+            for asset in assets
+            if isinstance(asset, dict)
+            for parsed in [_parse_emby_date_created(asset.get('date_added_to_library'))]
+            if parsed is not None
+        ]
+        if timestamps:
+            updates.append((min(timestamps), str(row['tmdb_id'])))
+
+    if updates:
+        cursor.executemany("""
+            UPDATE media_metadata
+            SET date_added = %s
+            WHERE tmdb_id = %s
+              AND item_type = 'Episode'
+              AND date_added IS NULL
+        """, updates)
+
+    cursor.execute("""
+        INSERT INTO app_settings (setting_key, value_json, last_updated_at)
+        VALUES (%s, 'true'::jsonb, NOW())
+        ON CONFLICT (setting_key) DO NOTHING
+    """, (_EPISODE_DATE_ADDED_BACKFILL_KEY,))
+    return len(updates)
 
 # ======================================================================
 # 模块: 中央数据访问 
@@ -1377,6 +1457,23 @@ def init_db():
 
                 except Exception as e_index:
                     logger.error(f"  ➜ 创建索引时出错: {e_index}", exc_info=True)
+
+                try:
+                    backfilled_episode_count = backfill_episode_date_added(cursor)
+                    if backfilled_episode_count:
+                        logger.info(
+                            "    ➜ [数据库升级] 已从持久化 DateCreated 证据回填 %s 条 Episode 入库时间。",
+                            backfilled_episode_count,
+                        )
+                except Exception as e_backfill:
+                    # Do not leave a partial migration marker.  The surrounding
+                    # transaction will roll back and retry safely next startup.
+                    logger.error(
+                        "  ➜ [数据库升级] Episode 入库时间回填失败: %s",
+                        type(e_backfill).__name__,
+                        exc_info=True,
+                    )
+                    raise
                 logger.trace("  ➜ 数据库升级检查完成。")
 
                 # ======================================================================

@@ -146,28 +146,58 @@ def query_virtual_library_items(
     item_types: List[str] = None,
     target_library_ids: List[str] = None,
     tmdb_ids: List[str] = None,
-    max_rating_override: Optional[int] = None  
+    max_rating_override: Optional[int] = None,
+    use_effective_recent_at: bool = False,
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
     【核心函数】根据筛选规则 + 用户实时权限，查询媒体项。
     """
     primary_sort = str(sort_by or 'DateCreated').split(',')[0]
+    use_latest_episode_content = (
+        primary_sort == 'DateLastContentAdded' or bool(use_effective_recent_at)
+    )
+    latest_episode_cte = """
+        WITH latest_episode_content AS (
+            SELECT
+                ep.parent_series_tmdb_id,
+                MAX(ep.date_added) AS added_at,
+                (ARRAY_AGG(
+                    ep.emby_item_ids_json->>0
+                    ORDER BY ep.date_added DESC NULLS LAST, ep.tmdb_id ASC
+                ))[1] AS source_item_id
+            FROM media_metadata ep
+            WHERE ep.item_type = 'Episode'
+              AND ep.in_library = TRUE
+              AND ep.parent_series_tmdb_id IS NOT NULL
+              AND ep.date_added IS NOT NULL
+            GROUP BY ep.parent_series_tmdb_id
+        )
+    """ if use_latest_episode_content else ""
+    latest_episode_join = """
+        LEFT JOIN latest_episode_content latest_episode
+          ON m.item_type = 'Series'
+         AND latest_episode.parent_series_tmdb_id = m.tmdb_id
+    """ if use_latest_episode_content else ""
     latest_content_expr = """
         CASE
-            WHEN m.item_type = 'Series' THEN COALESCE(
-                (
-                    SELECT MAX(ep.date_added)
-                    FROM media_metadata ep
-                    WHERE ep.item_type = 'Episode'
-                      AND ep.in_library = TRUE
-                      AND ep.parent_series_tmdb_id = m.tmdb_id
-                ),
-                m.date_added
-            )
+            WHEN m.item_type = 'Series' AND latest_episode.added_at IS NOT NULL
+                THEN CASE
+                    WHEN m.date_added IS NULL THEN latest_episode.added_at
+                    ELSE GREATEST(m.date_added, latest_episode.added_at)
+                END
             ELSE m.date_added
         END
     """
-    selected_sort_expr = latest_content_expr if primary_sort == 'DateLastContentAdded' else "m.date_added"
+    selected_sort_expr = latest_content_expr if use_latest_episode_content else "m.date_added"
+    recent_time_source_expr = """
+        CASE
+            WHEN m.item_type = 'Series'
+             AND latest_episode.added_at IS NOT NULL
+             AND (m.date_added IS NULL OR latest_episode.added_at > m.date_added)
+                THEN 'episode:' || COALESCE(latest_episode.source_item_id, 'unknown')
+            ELSE LOWER(m.item_type)
+        END
+    """ if use_latest_episode_content else "LOWER(m.item_type)"
     
     # 1. 基础 SQL 结构
     if user_id:
@@ -175,28 +205,42 @@ def query_virtual_library_items(
             SELECT 
                 m.emby_item_ids_json->>0 as emby_id,
                 m.tmdb_id,
-                {selected_sort_expr} AS latest_sort_at
+                {selected_sort_expr} AS latest_sort_at,
+                {recent_time_source_expr} AS recent_time_source
             FROM media_metadata m
+            {latest_episode_join}
             JOIN emby_users u ON u.id = %s
-        """.format(selected_sort_expr=selected_sort_expr)
+        """.format(
+            selected_sort_expr=selected_sort_expr,
+            recent_time_source_expr=recent_time_source_expr,
+            latest_episode_join=latest_episode_join,
+        )
         base_count = """
             SELECT COUNT(*) 
             FROM media_metadata m
+            {latest_episode_join}
             JOIN emby_users u ON u.id = %s
-        """
+        """.format(latest_episode_join=latest_episode_join)
         params = [user_id]
     else:
         base_select = """
             SELECT 
                 m.emby_item_ids_json->>0 as emby_id,
                 m.tmdb_id,
-                {selected_sort_expr} AS latest_sort_at
+                {selected_sort_expr} AS latest_sort_at,
+                {recent_time_source_expr} AS recent_time_source
             FROM media_metadata m
-        """.format(selected_sort_expr=selected_sort_expr)
+            {latest_episode_join}
+        """.format(
+            selected_sort_expr=selected_sort_expr,
+            recent_time_source_expr=recent_time_source_expr,
+            latest_episode_join=latest_episode_join,
+        )
         base_count = """
             SELECT COUNT(*) 
             FROM media_metadata m
-        """
+            {latest_episode_join}
+        """.format(latest_episode_join=latest_episode_join)
         params = []
 
     where_clauses = []
@@ -578,7 +622,11 @@ def query_virtual_library_items(
 
         # --- 7. 日期偏移 ---
         elif field in ['date_added', 'release_date']:
-            column = f"m.{field}"
+            column = (
+                latest_content_expr
+                if field == 'date_added' and use_effective_recent_at
+                else f"m.{field}"
+            )
             try:
                 days = int(value)
                 if op == 'in_last_days':
@@ -716,7 +764,7 @@ def query_virtual_library_items(
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cursor:
-                final_count_sql = f"{base_count} WHERE {full_where}"
+                final_count_sql = f"{latest_episode_cte} {base_count} WHERE {full_where}"
                 cursor.execute(final_count_sql, tuple(params))
                 row = cursor.fetchone()
                 total_count = row['count'] if row else 0
@@ -725,6 +773,7 @@ def query_virtual_library_items(
                     return [], 0
 
                 final_query_sql = f"""
+                    {latest_episode_cte}
                     {base_select}
                     WHERE {full_where}
                     ORDER BY {db_sort_col} {db_sort_dir}, m.date_added {db_sort_dir}, m.tmdb_id ASC
@@ -739,7 +788,9 @@ def query_virtual_library_items(
                     {
                         'Id': row['emby_id'], 
                         'tmdb_id': row['tmdb_id'],
-                        'latest_sort_at': row.get('latest_sort_at')
+                        'latest_sort_at': row.get('latest_sort_at'),
+                        'effective_recent_at': row.get('latest_sort_at'),
+                        'recent_time_source': row.get('recent_time_source'),
                     } 
                     for row in rows if row['emby_id']
                 ]

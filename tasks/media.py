@@ -19,7 +19,12 @@ import handler.tmdb as tmdb
 import handler.emby as emby
 import handler.telegram as telegram
 from database import connection, settings_db, media_db, queries_db, strm_ingest_db
-from .helpers import parse_full_asset_details, reconstruct_metadata_from_db, translate_tmdb_metadata_recursively
+from .helpers import (
+    get_logical_episode_date_created,
+    parse_full_asset_details,
+    reconstruct_metadata_from_db,
+    translate_tmdb_metadata_recursively,
+)
 from extensions import UPDATING_METADATA
 
 logger = logging.getLogger(__name__)
@@ -1161,6 +1166,7 @@ def task_populate_metadata_cache(processor, batch_size: int = 10, force_full_upd
                             "season_number": s_n,
                             "episode_number": e_n,
                             "in_library": True,
+                            "date_added": get_logical_episode_date_created(versions),
                             "release_date": ep_release_date,
                             "rating": emby_ep.get('CommunityRating'),
                             "emby_item_ids_json": json.dumps([v.get('Id') for v in versions]),

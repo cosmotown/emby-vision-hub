@@ -19,7 +19,13 @@ from database.connection import get_db_connection
 from database import media_db, maintenance_db, settings_db
 import handler.emby as emby
 import handler.tmdb as tmdb
-from tasks.helpers import parse_full_asset_details, calculate_ancestor_ids, construct_metadata_payload, translate_tmdb_metadata_recursively
+from tasks.helpers import (
+    calculate_ancestor_ids,
+    construct_metadata_payload,
+    get_logical_episode_date_created,
+    parse_full_asset_details,
+    translate_tmdb_metadata_recursively,
+)
 import utils
 import constants
 import logging
@@ -1427,7 +1433,8 @@ class MediaProcessor:
                         "title": episode.get('name'), "overview": episode.get('overview'), 
                         "release_date": episode.get('air_date'), 
                         "season_number": s_num, "episode_number": e_num,
-                        "runtime_minutes": final_runtime
+                        "runtime_minutes": final_runtime,
+                        "date_added": get_logical_episode_date_created(versions_of_episode),
                     }
                     
                     if not is_pending and versions_of_episode:

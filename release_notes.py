@@ -2,6 +2,23 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.35",
+        "published_at": "2026-09-22T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.35",
+        "changelog": """## 近期入库电视剧按最新 Episode 排序
+
+- 修复老电视剧新增 Episode 后，父 Series 未在“近期入库”中重新置顶的问题。
+- Movie 继续使用自身实际入库时间；Series 使用自身入库时间与当前仍在库 Episode 最新入库时间的较新值。
+- Recent 顶层仍只展示唯一的父 Series，不会把 Season 或 Episode 展开为顶层项目。
+- Episode 入库时间只取 Emby `DateCreated`，不会因刮削、海报、NFO、演员或普通 metadata refresh 重新置顶。
+- 最新 Episode 删除后会自动回退到剩余 Episode 的最新入库时间或 Series 自身入库时间。
+- 旧 Episode 入库时间从既有持久化 `DateCreated` 证据幂等回填；不修改 Emby 原始元数据，不新增数据库表或字段。
+- Recent 时间窗口、数量、分页、Movie 行为以及 VidHub/Infuse Mixed 虚拟库兼容保持不变。
+
+""",
+    },
+
+    {
         "version": "v7.2.34",
         "published_at": "2026-09-21T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.34",

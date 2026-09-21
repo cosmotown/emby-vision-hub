@@ -310,7 +310,7 @@ class TransactionalSelfUpdateTests(unittest.TestCase):
         attrs["Name"] = "/emby-toolkit"
         client = SimpleClient(attrs)
         release = {
-            "version": "v7.2.34",
+            "version": "v7.2.36",
             "draft": False,
             "prerelease": False,
             "source": "release",

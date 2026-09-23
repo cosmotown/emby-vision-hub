@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 import docker
+import gevent
 
 import config_manager
 import constants
@@ -14,6 +15,7 @@ from services import self_update
 
 
 logger = logging.getLogger(__name__)
+WORKER_CLEANUP_RETRY_DELAYS = (2, 5, 10, 20, 40, 60)
 
 
 def fetch_latest_stable_release():
@@ -34,7 +36,10 @@ def start_system_update(client=None):
     docker_client = client or docker.from_env()
     try:
         release = fetch_latest_stable_release()
-        return self_update.start_update_transaction(docker_client, release)
+        transaction = self_update.start_update_transaction(docker_client, release)
+        if own_client:
+            schedule_terminal_updater_worker_cleanup(transaction.get("source_container_name"))
+        return transaction
     finally:
         if own_client:
             docker_client.close()
@@ -49,6 +54,27 @@ def cleanup_stale_updater_containers(target_container_name=None, client=None):
     finally:
         if own_client:
             docker_client.close()
+
+
+def monitor_terminal_updater_workers(
+    target_container_name=None,
+    *,
+    delays=WORKER_CLEANUP_RETRY_DELAYS,
+    sleep_fn=gevent.sleep,
+):
+    """Retry exact, ownership-verified worker cleanup across terminal races."""
+    removed = 0
+    for delay in delays:
+        sleep_fn(delay)
+        removed += cleanup_stale_updater_containers(target_container_name)
+        if removed:
+            break
+    return removed
+
+
+def schedule_terminal_updater_worker_cleanup(target_container_name=None):
+    """Run the bounded cleanup monitor outside the request/task greenlet."""
+    return gevent.spawn(monitor_terminal_updater_workers, target_container_name)
 
 
 def recover_interrupted_system_update(client=None):

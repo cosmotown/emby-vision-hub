@@ -30,6 +30,7 @@ import constants
 OFFICIAL_REPOSITORY = "tzyzero186/emby-vision-hub"
 TRANSACTION_SCHEMA = 1
 TERMINAL_STATES = frozenset({"SUCCESS", "ALREADY_CURRENT", "ROLLED_BACK", "FAILED", "AMBIGUOUS"})
+CLEANUP_TERMINAL_STATES = frozenset({"SUCCESS", "ALREADY_CURRENT", "ROLLED_BACK", "FAILED"})
 ACTIVE_STATES = frozenset({
     "PREPARING",
     "PULLING",
@@ -734,10 +735,15 @@ def runtime_config_projection(attrs: Dict[str, Any]) -> Dict[str, Any]:
     networks = {}
     generated = {str(attrs.get("Id") or ""), str(attrs.get("Id") or "")[:12], str(attrs.get("Name") or "").lstrip("/")}
     for name, network in ((attrs.get("NetworkSettings") or {}).get("Networks") or {}).items():
+        # Docker Compose records an unspecified endpoint IPAM contract as {},
+        # while a semantically identical raw Docker create is inspected as
+        # null.  Only normalize the empty form; non-empty static IPAM remains
+        # observable (and is rejected by safe_container_config()).
+        ipam_config = network.get("IPAMConfig") or None
         networks[name] = {
             "Aliases": sorted(alias for alias in (network.get("Aliases") or []) if alias not in generated),
             "Links": network.get("Links") or [],
-            "IPAMConfig": network.get("IPAMConfig"),
+            "IPAMConfig": ipam_config,
             "DriverOpts": network.get("DriverOpts"),
             "GwPriority": network.get("GwPriority") or 0,
         }
@@ -1051,9 +1057,11 @@ def cleanup_terminal_workers(client, target_container_name: Optional[str] = None
             if target_container_name and target != target_container_name:
                 continue
             transaction = load_transaction(transaction_id) if transaction_id else None
-            if not transaction or transaction.get("state") not in TERMINAL_STATES:
+            if not transaction or transaction.get("state") not in CLEANUP_TERMINAL_STATES:
                 continue
             if worker.status not in {"created", "exited", "dead"}:
+                continue
+            if transaction.get("worker_container_id") != worker.id:
                 continue
             verify_object(worker, transaction, "worker")
             worker.remove(force=True)

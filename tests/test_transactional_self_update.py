@@ -192,6 +192,18 @@ class TransactionalSelfUpdateTests(unittest.TestCase):
         after["HostConfig"]["PortBindings"]["5257/tcp"][0]["HostPort"] = "9999"
         self.assertNotEqual(self_update.runtime_config_fingerprint(before), self_update.runtime_config_fingerprint(after))
 
+    def test_runtime_fingerprint_normalizes_empty_network_ipam(self):
+        before = container_attrs(container_id="a" * 64)
+        after = container_attrs(container_id="b" * 64)
+        after["Name"] = "/emby-toolkit"
+        after["Config"]["Hostname"] = "b" * 12
+        before["NetworkSettings"]["Networks"]["evh-net"]["IPAMConfig"] = {}
+        after["NetworkSettings"]["Networks"]["evh-net"]["IPAMConfig"] = None
+        self.assertEqual(
+            self_update.runtime_config_fingerprint(before),
+            self_update.runtime_config_fingerprint(after),
+        )
+
     def test_config_mount_must_be_one_persistent_rw_mount(self):
         attrs = container_attrs()
         self.assertEqual(self_update.find_config_mount(attrs)["Destination"], "/config")

@@ -192,6 +192,18 @@ class TransactionalSelfUpdateTests(unittest.TestCase):
         after["HostConfig"]["PortBindings"]["5257/tcp"][0]["HostPort"] = "9999"
         self.assertNotEqual(self_update.runtime_config_fingerprint(before), self_update.runtime_config_fingerprint(after))
 
+    def test_runtime_fingerprint_normalizes_empty_network_ipam(self):
+        before = container_attrs(container_id="a" * 64)
+        after = container_attrs(container_id="b" * 64)
+        after["Name"] = "/emby-toolkit"
+        after["Config"]["Hostname"] = "b" * 12
+        before["NetworkSettings"]["Networks"]["evh-net"]["IPAMConfig"] = {}
+        after["NetworkSettings"]["Networks"]["evh-net"]["IPAMConfig"] = None
+        self.assertEqual(
+            self_update.runtime_config_fingerprint(before),
+            self_update.runtime_config_fingerprint(after),
+        )
+
     def test_config_mount_must_be_one_persistent_rw_mount(self):
         attrs = container_attrs()
         self.assertEqual(self_update.find_config_mount(attrs)["Destination"], "/config")
@@ -285,7 +297,7 @@ class TransactionalSelfUpdateTests(unittest.TestCase):
         attrs["Name"] = "/emby-toolkit"
         client = SimpleClient(attrs)
         release = {
-            "version": "v7.2.35",
+            "version": "v7.2.36",
             "draft": False,
             "prerelease": False,
             "source": "release",
@@ -301,8 +313,8 @@ class TransactionalSelfUpdateTests(unittest.TestCase):
                 },
             ), mock.patch.object(self_update, "assert_self_identity"), mock.patch.object(self_update, "start_worker") as start_worker:
                 transaction = self_update.start_update_transaction(client, release)
-        self.assertEqual(transaction["target_version"], "7.2.35")
-        self.assertEqual(transaction["target_image"], "tzyzero186/emby-vision-hub:7.2.35")
+        self.assertEqual(transaction["target_version"], "7.2.36")
+        self.assertEqual(transaction["target_image"], "tzyzero186/emby-vision-hub:7.2.36")
         start_worker.assert_called_once()
 
     def test_start_accepts_only_strict_single_instance_portainer_latest_stack(self):

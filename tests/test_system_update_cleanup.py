@@ -103,6 +103,56 @@ class SystemUpdateCleanupTests(unittest.TestCase):
         self.assertEqual(removed, 0)
         self.assertFalse(worker.removed)
 
+    def test_ambiguous_transaction_worker_is_preserved(self):
+        transaction = self._transaction("AMBIGUOUS")
+        worker = FakeContainer(
+            "terminal-worker",
+            "exited",
+            {
+                self_update.UPDATER_ROLE_LABEL: self_update.UPDATER_ROLE_VALUE,
+                self_update.UPDATER_TARGET_LABEL: "emby-toolkit",
+                self_update.UPDATER_TRANSACTION_LABEL: transaction["transaction_id"],
+                self_update.UPDATER_SOURCE_LABEL: "source-id",
+            },
+        )
+        removed = system_update.cleanup_stale_updater_containers(
+            "emby-toolkit", client=FakeClient([worker])
+        )
+        self.assertEqual(removed, 0)
+        self.assertFalse(worker.removed)
+
+    def test_worker_id_must_match_persisted_transaction(self):
+        transaction = self._transaction("ROLLED_BACK")
+        worker = FakeContainer(
+            "different-worker-id",
+            "exited",
+            {
+                self_update.UPDATER_ROLE_LABEL: self_update.UPDATER_ROLE_VALUE,
+                self_update.UPDATER_TARGET_LABEL: "emby-toolkit",
+                self_update.UPDATER_TRANSACTION_LABEL: transaction["transaction_id"],
+                self_update.UPDATER_SOURCE_LABEL: "source-id",
+            },
+        )
+        removed = system_update.cleanup_stale_updater_containers(
+            "emby-toolkit", client=FakeClient([worker])
+        )
+        self.assertEqual(removed, 0)
+        self.assertFalse(worker.removed)
+
+    def test_cleanup_monitor_retries_terminal_race(self):
+        with mock.patch.object(
+            system_update,
+            "cleanup_stale_updater_containers",
+            side_effect=[0, 0, 1],
+        ) as cleanup:
+            removed = system_update.monitor_terminal_updater_workers(
+                "emby-toolkit",
+                delays=(0, 0, 0, 0),
+                sleep_fn=lambda _delay: None,
+            )
+        self.assertEqual(removed, 1)
+        self.assertEqual(cleanup.call_count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

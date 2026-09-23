@@ -47,7 +47,7 @@ from routes.media_cleanup import media_cleanup_bp
 from routes.person_cleanup import person_cleanup_bp
 from routes.user_management import user_management_bp
 from routes.webhook import webhook_bp, resume_persistent_webhook_queue
-from tasks.system_update import cleanup_stale_updater_containers, recover_interrupted_system_update
+from tasks.system_update import cleanup_stale_updater_containers, recover_interrupted_system_update, schedule_terminal_updater_worker_cleanup
 from routes.unified_auth import unified_auth_bp
 from routes.user_portal import user_portal_bp
 from routes.discover import discover_bp
@@ -454,6 +454,7 @@ def main_app_start():
             recover_interrupted_system_update()
             container_name = config_manager.get_container_name()
             cleanup_stale_updater_containers(container_name)
+            schedule_terminal_updater_worker_cleanup(container_name)
         except Exception as exc:
             logger.warning("启动时恢复/清理更新事务失败，已停止自动操作；请查看持久化事务状态。")
 

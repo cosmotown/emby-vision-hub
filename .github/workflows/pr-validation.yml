@@ -56,6 +56,15 @@ jobs:
           EVH_TEST_POSTGRES_DB: evh_test
         run: python -m unittest discover -s tests -p 'test_*.py' -v
 
+      - name: Run real Docker self-updater integration
+        env:
+          APP_DATA_DIR: ${{ runner.temp }}/evh-docker-integration-data
+          EVH_RUN_DOCKER_INTEGRATION: "1"
+          EVH_DOCKER_TEST_IMAGE: alpine:3.20
+        run: |
+          docker pull alpine:3.20
+          python -m unittest tests.test_self_update_docker_integration -v
+
   frontend:
     runs-on: ubuntu-latest
     timeout-minutes: 30

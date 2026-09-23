@@ -2,6 +2,26 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.36",
+        "published_at": "2026-09-23T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.36",
+        "changelog": """## 事务性内建更新器热修复
+
+- 修复 Docker Compose / Portainer Stack 在重建 stopped candidate 时，Docker daemon 将空 `IPAMConfig` 在 `{}` 与 `null` 之间等价规范化，却被运行配置指纹误判为 `evh_update_config_mismatch` 的问题。
+- 只归一化未指定的空 IPAM 表达；非空静态 IPAM、mount、端口、network alias、restart policy、healthcheck 与 Compose/Portainer 身份仍继续严格校验。
+- 增加真实 Docker source inspect → safe clone → stopped candidate inspect 集成测试，覆盖 bind mount、named volume、只读 mount、published port、bridge network、alias、healthcheck 及 Compose/Portainer labels。
+- 为 `SUCCESS` / `ALREADY_CURRENT` / `ROLLED_BACK` / `FAILED` 终态事务增加有界重试清理；只在 exact worker ID 和全部 ownership labels 一致时删除 exited worker。
+- `AMBIGUOUS` 继续保留现场，不会被自动清理。本版本未放宽 image ID、APP_VERSION、health、配置指纹、对象归属或 rollback 安全门。
+
+### 首次升级说明
+
+- 当前 v7.2.35 内的 worker 仍包含旧指纹比较代码；已在真实 daemon 上命中该规范化差异的部署，首次升级到 v7.2.36 仍需通过原 Portainer/Compose 管理器重建一次。v7.2.36 之后的内建更新才使用本热修复。
+- 本版本不修改 Recent、VidHub、Infuse、虚拟库、人物清理或业务数据库逻辑。
+
+""",
+    },
+
+    {
         "version": "v7.2.35",
         "published_at": "2026-09-22T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.35",

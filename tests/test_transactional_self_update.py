@@ -297,7 +297,7 @@ class TransactionalSelfUpdateTests(unittest.TestCase):
         attrs["Name"] = "/emby-toolkit"
         client = SimpleClient(attrs)
         release = {
-            "version": "v7.2.35",
+            "version": "v7.2.36",
             "draft": False,
             "prerelease": False,
             "source": "release",
@@ -313,8 +313,8 @@ class TransactionalSelfUpdateTests(unittest.TestCase):
                 },
             ), mock.patch.object(self_update, "assert_self_identity"), mock.patch.object(self_update, "start_worker") as start_worker:
                 transaction = self_update.start_update_transaction(client, release)
-        self.assertEqual(transaction["target_version"], "7.2.35")
-        self.assertEqual(transaction["target_image"], "tzyzero186/emby-vision-hub:7.2.35")
+        self.assertEqual(transaction["target_version"], "7.2.36")
+        self.assertEqual(transaction["target_image"], "tzyzero186/emby-vision-hub:7.2.36")
         start_worker.assert_called_once()
 
     def test_start_accepts_only_strict_single_instance_portainer_latest_stack(self):

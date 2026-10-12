@@ -743,6 +743,15 @@ def handle_get_home_discovery(user_id, section_id=None):
                     'IncludeNextUpInResume': True,
                     'Query': {'StudioIds': [], 'TagIds': [], 'GenreIds': [], 'CollectionTypes': []},
                 })
+        # Latest rows follow Views (collection sort_order and native placement).
+        # Only exchange latest-media slots; resume/onnow/etc stay untouched.
+        view_order = {str(view['Id']): index for index, view in enumerate(views)}
+        latest_slots = [i for i, section in enumerate(result)
+                        if section.get('SectionType') == 'latestmedia']
+        ordered_latest = sorted((result[i] for i in latest_slots),
+                                key=lambda section: view_order[str(section['ParentId'])])
+        for index, section in zip(latest_slots, ordered_latest):
+            result[index] = section
         return Response(json.dumps(result), mimetype='application/json')
     except (ValueError, TypeError):
         return "Invalid home discovery data", 502

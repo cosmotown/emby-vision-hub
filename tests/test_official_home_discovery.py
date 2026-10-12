@@ -84,6 +84,56 @@ class OfficialHomeDiscoveryTests(unittest.TestCase):
         with patch.object(proxy.requests, 'get', side_effect=[upstream({'Id': 'u'}), upstream(self.sections[:2])]):
             self.assertEqual(self.get('HomeSections').get_json(), self.sections[:2])
 
+    def test_latest_order_follows_views_for_native_before_and_after(self):
+        # Upstream order deliberately differs from Views. Names are not identities.
+        second = dict(self.coll, id=6, name='Movie')
+        collections = [second, self.coll]
+        sections = [self.sections[0], self.sections[-1], self.sections[1], self.sections[2]]
+        for prefix in ('', '/emby'):
+            for placement in ('before', 'after'):
+                with self.subTest(prefix=prefix, placement=placement), patch.dict(
+                    proxy.config_manager.APP_CONFIG,
+                    {'proxy_native_view_order': placement, 'proxy_native_view_selection': ['20', '22']}
+                ), patch.object(proxy.custom_collection_db, 'get_all_active_custom_collections',
+                                return_value=collections), patch.object(
+                    proxy.custom_collection_db, 'get_custom_collection_by_id',
+                    side_effect=lambda i: next((c for c in collections if c['id'] == i), None)
+                ), patch.object(proxy.requests, 'get', side_effect=[upstream({'Id': 'u'}), upstream(sections)]):
+                    result = self.get('HomeSections', prefix).get_json()
+                    latest = [s for s in result if s.get('SectionType') == 'latestmedia']
+                    expected = (['20', '22', '-900006', '-900005'] if placement == 'before'
+                                else ['-900006', '-900005', '20', '22'])
+                    self.assertEqual([s['ParentId'] for s in latest], expected)
+                    self.assertEqual(result[0], sections[0])
+                    self.assertEqual(result[2], sections[2])  # resume is not moved
+                    self.assertEqual(next(s for s in latest if s['ParentId'] == '22'), self.sections[-1])
+
+    def test_latest_reflects_reordered_collections_on_next_request(self):
+        second = dict(self.coll, id=6, name='Other')
+        collections = [self.coll, second]
+        with patch.dict(proxy.config_manager.APP_CONFIG, {'proxy_native_view_order': 'after'}), \
+                patch.object(proxy.custom_collection_db, 'get_all_active_custom_collections',
+                             side_effect=lambda: list(collections)), \
+                patch.object(proxy.custom_collection_db, 'get_custom_collection_by_id',
+                             side_effect=lambda i: next((c for c in collections if c['id'] == i), None)):
+            for expected in (['-900005', '-900006', '22'], ['-900006', '-900005', '22']):
+                with patch.object(proxy.requests, 'get', side_effect=[upstream({'Id': 'u'}), upstream(self.sections)]):
+                    result = self.get('HomeSections').get_json()
+                self.assertEqual([s['ParentId'] for s in result if s.get('SectionType') == 'latestmedia'], expected)
+                collections.reverse()
+
+    def test_latest_reorder_keeps_visibility_and_latest_opt_out(self):
+        disabled = dict(self.coll, id=6, definition_json={'item_type': ['Movie'], 'show_in_latest': False})
+        forbidden = dict(self.coll, id=7, allowed_user_ids=['other'])
+        collections = [disabled, forbidden, self.coll]
+        with patch.dict(proxy.config_manager.APP_CONFIG, {'proxy_native_view_order': 'after'}), \
+                patch.object(proxy.custom_collection_db, 'get_all_active_custom_collections', return_value=collections), \
+                patch.object(proxy.custom_collection_db, 'get_custom_collection_by_id',
+                             side_effect=lambda i: next((c for c in collections if c['id'] == i), None)), \
+                patch.object(proxy.requests, 'get', side_effect=[upstream({'Id': 'u'}), upstream(self.sections)]):
+            result = self.get('HomeSections').get_json()
+        self.assertEqual([s['ParentId'] for s in result if s.get('SectionType') == 'latestmedia'], ['-900005', '22'])
+
     def test_show_in_latest_false(self):
         self.coll['definition_json']['show_in_latest'] = False
         with patch.object(proxy.requests, 'get', side_effect=[upstream({'Id': 'u'}), upstream(self.sections)]):

@@ -2,6 +2,20 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.38",
+        "published_at": "2026-10-13T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.38",
+        "changelog": """## 官方 Emby 首页最新内容排序修复
+
+- 修复 7.2.37 将原生库最新内容固定放在虚拟库之前的问题。
+- 最新内容分区复用现有 Views 顺序，跟随自建合集排序及原生库前置/后置配置。
+- 仅重排 latestmedia 分区，不移动继续观看、正在播放等其他首页分区，不改变分区内容。
+- 保持隐藏原生库、用户权限、show_in_latest 设置和 VidHub / Infuse 既有兼容行为。
+- 不修改 Items、Recent 时间排序、图片、详情、播放、人物治理或数据库结构。
+
+""",
+    },
+    {
         "version": "v7.2.37",
         "published_at": "2026-10-12T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.37",

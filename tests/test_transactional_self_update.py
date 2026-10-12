@@ -311,7 +311,7 @@ class TransactionalSelfUpdateTests(unittest.TestCase):
                     constants.ENV_VAR_CONTAINER_NAME: "emby-toolkit",
                     constants.ENV_VAR_DOCKER_IMAGE_NAME: "tzyzero186/emby-vision-hub:latest",
                 },
-            ), mock.patch.object(self_update, "assert_self_identity"), mock.patch.object(self_update, "start_worker") as start_worker:
+            ), mock.patch.object(constants, "APP_VERSION", "7.2.35"), mock.patch.object(self_update, "assert_self_identity"), mock.patch.object(self_update, "start_worker") as start_worker:
                 transaction = self_update.start_update_transaction(client, release)
         self.assertEqual(transaction["target_version"], "7.2.36")
         self.assertEqual(transaction["target_image"], "tzyzero186/emby-vision-hub:7.2.36")
@@ -335,7 +335,7 @@ class TransactionalSelfUpdateTests(unittest.TestCase):
                 constants.ENV_VAR_CONTAINER_NAME: "emby-toolkit",
                 constants.ENV_VAR_DOCKER_IMAGE_NAME: "tzyzero186/emby-vision-hub:latest",
             },
-        ), mock.patch.object(self_update, "assert_self_identity"), mock.patch.object(
+        ), mock.patch.object(constants, "APP_VERSION", "7.2.35"), mock.patch.object(self_update, "assert_self_identity"), mock.patch.object(
             self_update, "start_worker"
         ) as start_worker:
             transaction = self_update.start_update_transaction(client, release)

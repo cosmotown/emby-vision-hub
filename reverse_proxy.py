@@ -575,7 +575,7 @@ def get_virtual_collection_type(collection, http_request):
             return 'movies'
     return _virtual_library_collection_type(definition)
 
-def handle_get_views():
+def handle_get_views(user_id=None):
     """
     获取用户的主页视图列表。
     """
@@ -584,10 +584,11 @@ def handle_get_views():
         return "Proxy is not ready", 503
 
     try:
-        user_id_match = re.search(r'/(?:emby/)?Users/([^/]+)/Views', request.path)
-        if not user_id_match:
-            return "Could not determine user from request path", 400
-        user_id = user_id_match.group(1)
+        if user_id is None:
+            user_id_match = re.search(r'/(?:emby/)?Users/([^/]+)/Views', request.path)
+            if not user_id_match:
+                return "Could not determine user from request path", 400
+            user_id = user_id_match.group(1)
 
         # 1. 获取原生库
         user_visible_native_libs = emby.get_emby_libraries(
@@ -652,6 +653,102 @@ def handle_get_views():
     except Exception as e:
         logger.error(f"[PROXY] 获取视图数据时出错: {e}", exc_info=True)
         return "Internal Proxy Error", 500
+
+def _home_client_get(path):
+    """Read a home endpoint with client credentials, never the server API key."""
+    base_url, _ = _get_real_emby_url_and_key()
+    headers = {k: v for k, v in request.headers if k.lower() not in {'host', 'accept-encoding'}}
+    return requests.get(
+        f"{base_url}/{path.lstrip('/')}", headers=headers,
+        params=request.args, timeout=15,
+    )
+
+
+def handle_get_home_discovery(user_id, section_id=None):
+    """Adapt only the observed 4.10 home discovery endpoints to existing Views.
+
+    Sections bypassed Views in the official Web UI. Reuse the same visibility,
+    order and virtual DTOs; do not redefine library identity or client types.
+    """
+    try:
+        profile = _home_client_get(f'Users/{user_id}')
+        if profile.status_code != 200 or profile.json().get('Id') != user_id:
+            return "Forbidden", 403
+        views_response = handle_get_views(user_id)
+        if not isinstance(views_response, Response) or views_response.status_code != 200:
+            return views_response
+        views = views_response.get_json()['Items']
+        by_id = {str(view['Id']): view for view in views}
+
+        if section_id == 'smalllibrarytiles':
+            # Paginate only after the exact same Views selection and ordering.
+            offset = max(0, int(request.args.get('StartIndex', 0)))
+            limit = max(0, int(request.args.get('Limit', len(views))))
+            return Response(json.dumps({
+                'Items': views[offset:offset + limit], 'TotalRecordCount': len(views),
+            }), mimetype='application/json')
+
+        if section_id is not None:
+            parent_id = section_id.removeprefix('latestmedia_')
+            if parent_id not in by_id:
+                return "Not Found", 404
+            if is_mimicked_id(parent_id):
+                params = request.args.to_dict()
+                params['ParentId'] = parent_id
+                params.pop('customViewId', None)
+                latest = handle_get_latest_items(user_id, params)
+                if not isinstance(latest, Response) or latest.status_code != 200:
+                    return latest
+                items = latest.get_json()
+                return Response(json.dumps({
+                    'Items': items, 'TotalRecordCount': len(items),
+                }), mimetype='application/json')
+            upstream = _home_client_get(request.path)
+            return Response(upstream.content, status=upstream.status_code,
+                            mimetype='application/json')
+
+        upstream = _home_client_get(request.path)
+        if upstream.status_code != 200:
+            return Response(upstream.content, status=upstream.status_code,
+                            mimetype='application/json')
+        sections = upstream.json()
+        if not isinstance(sections, list) or not all(isinstance(s, dict) for s in sections):
+            return "Invalid home sections response", 502
+        result = []
+        has_latest = any(s.get('SectionType') == 'latestmedia' for s in sections)
+        for section in sections:
+            if section.get('SectionType') == 'latestmedia':
+                if str(section.get('ParentId', '')) not in by_id:
+                    continue
+            result.append(section)
+        # Honor the user's choice to have no latest-media home sections.
+        if has_latest:
+            for view in views:
+                if not is_mimicked_id(view['Id']):
+                    continue
+                coll = custom_collection_db.get_custom_collection_by_id(from_mimicked_id(view['Id']))
+                if not coll or not _collection_allowed_for_user(coll, user_id):
+                    continue
+                definition = coll.get('definition_json') or {}
+                if isinstance(definition, str):
+                    definition = json.loads(definition)
+                if not definition.get('show_in_latest', True):
+                    continue
+                result.append({
+                    'Id': f"latestmedia_{view['Id']}", 'Name': view['Name'],
+                    'SectionType': 'latestmedia', 'CollectionType': view['CollectionType'],
+                    'ParentId': view['Id'], 'ParentItem': view,
+                    'Monitor': ['markplayed', 'videoplayback'], 'ItemTypes': [],
+                    'ExcludedFolders': [], 'CardSizeOffset': 0,
+                    'IncludeNextUpInResume': True,
+                    'Query': {'StudioIds': [], 'TagIds': [], 'GenreIds': [], 'CollectionTypes': []},
+                })
+        return Response(json.dumps(result), mimetype='application/json')
+    except (ValueError, TypeError):
+        return "Invalid home discovery data", 502
+    except requests.RequestException:
+        return "Home discovery upstream unavailable", 502
+
 
 def handle_get_mimicked_library_details(user_id, mimicked_id):
     try:
@@ -1304,6 +1401,14 @@ def proxy_all(path):
                     resp = send_file(img_file_path, mimetype='image/jpeg')
                     resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
                     return resp
+
+        # Official 4.10 Web reads home tiles/sections independently of Views.
+        home_match = re.fullmatch(
+            r'(?:emby/)?Users/([^/]+)/(?:HomeSections|Sections/(smalllibrarytiles|latestmedia_-?\d+)/Items)',
+            path,
+        )
+        if request.method == 'GET' and home_match:
+            return handle_get_home_discovery(home_match.group(1), home_match.group(2))
 
         # --- 拦截 B: 视图列表 (Views) ---
         if path.endswith('/Views') and (

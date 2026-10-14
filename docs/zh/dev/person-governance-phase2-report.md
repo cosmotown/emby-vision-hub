@@ -204,3 +204,23 @@ Mac EVH 仍为正式 7.2.38、healthy，本治理分支未部署。
 这不是新 Person 自动创建能力或历史清理资格的批准；
 不提供服务端 CAS / 全局第三方并发原子性的承诺。
 尚未发布，也没有将该代码部署到 NAS。
+
+## v7.2.39 发布前集成验证
+
+用户随后授权正式发布。功能提交：`f11a40aa6548af80aec127b95ca35b16cddca992`。
+已合入正式 main `f1f3919e0ac1aa675d21481a71f0bc43265fdd80`，完整保留
+v7.2.37/38 官方 Emby 虚拟库及首页排序修复；与 main 比较没有 reverse_proxy、
+Nginx、数据库 schema、更新器或删除安全合同改动。
+
+新增一项超限遗留关联 HOLD 测试及三项编辑页身份合同；PG 用例支持 CI 的
+隔离测试连接，仍只建连接级 TEMP fixture 表。CI 前端执行全部合同测试。
+
+集成后的最终回归：后端 + PostgreSQL 755 个，754 PASS、1 opt-in SKIP；
+治理定向 88/88，前端 71/71，Vite（7.2.39）、compileall、diff-check PASS。
+Mac 真实 pipeline 再执行两次，Persons 124 → 124 → 124，Series 8，Episode 44，
+guest 36，provider mappings 8，编辑页冻结目标 8，新 orphan 0，新重复身份 0。
+仅使用唯一 Mac Emby 样本；公网 TMDb/Douban、图片备份及 NAS 不在本测试范围。
+
+发布包装仅修改版本、发布说明和 Docker workflow 默认 tag；正式镜像由
+GitHub Actions 从提交源码重新构建，不将本地测试镜像重新打 tag 发布。
+existing-only、持久 HOLD 与第三方并发非原子性支持边界保持不变。

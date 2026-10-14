@@ -12,6 +12,7 @@ from handler.emby import get_emby_item_details, get_emby_items_by_id
 from config_manager import APP_CONFIG
 import extensions 
 import utils
+from services.person_sync_safety import classify_identity_match
 logger = logging.getLogger(__name__)
 
 # ======================================================================
@@ -345,6 +346,9 @@ class ActorDBManager:
             logger.warning("upsert_person 调用缺少 TMDb/Douban 外部身份，跳过。")
             return -1, "SKIPPED"
 
+        incoming_identity = {'tmdb_person_id': tmdb_id, 'douban_celebrity_id': douban_id,
+                             'imdb_id': imdb_id, 'emby_person_id': emby_id}
+
         if not name and emby_id:
             details = get_emby_item_details(emby_id, emby_config['url'], emby_config['api_key'], emby_config['user_id'], fields="Name")
             name = details.get("Name") if details else "Unknown Actor"
@@ -354,10 +358,13 @@ class ActorDBManager:
         try:
             if douban_id:
                 cursor.execute(
-                    "SELECT * FROM person_identity_map WHERE douban_celebrity_id = %s",
+                    "SELECT * FROM person_identity_map WHERE douban_celebrity_id = %s FOR UPDATE",
                     (douban_id,),
                 )
                 douban_record = cursor.fetchone()
+                if douban_record and classify_identity_match(douban_record, incoming_identity) != 'SAFE_EXACT_MATCH':
+                    logger.warning('人物身份需要复核，拒绝覆盖已有 Douban 映射。')
+                    return -1, "CONFLICT_ERROR"
                 if douban_record and tmdb_id:
                     existing_tmdb_id = douban_record.get('tmdb_person_id')
                     if existing_tmdb_id and int(existing_tmdb_id) != tmdb_id:
@@ -412,10 +419,12 @@ class ActorDBManager:
                         emby_person_id = COALESCE(EXCLUDED.emby_person_id, person_identity_map.emby_person_id),
                         imdb_id = COALESCE(EXCLUDED.imdb_id, person_identity_map.imdb_id),
                         last_updated_at = NOW()
-                    WHERE
+                    WHERE (
                         person_identity_map.primary_name IS DISTINCT FROM EXCLUDED.primary_name OR
                         person_identity_map.emby_person_id IS DISTINCT FROM COALESCE(EXCLUDED.emby_person_id, person_identity_map.emby_person_id) OR
                         person_identity_map.imdb_id IS DISTINCT FROM COALESCE(EXCLUDED.imdb_id, person_identity_map.imdb_id)
+                    ) AND (person_identity_map.emby_person_id IS NULL OR EXCLUDED.emby_person_id IS NULL OR person_identity_map.emby_person_id = EXCLUDED.emby_person_id)
+                      AND (person_identity_map.imdb_id IS NULL OR EXCLUDED.imdb_id IS NULL OR person_identity_map.imdb_id = EXCLUDED.imdb_id)
                     RETURNING map_id, (CASE xmax WHEN 0 THEN 'INSERTED' ELSE 'UPDATED' END) as action
                 """
                 cursor.execute(sql, (name, emby_id, imdb_id, douban_id))
@@ -423,13 +432,15 @@ class ActorDBManager:
                 if result:
                     return result['map_id'], result['action']
                 cursor.execute(
-                    "SELECT map_id FROM person_identity_map WHERE douban_celebrity_id = %s",
+                    "SELECT * FROM person_identity_map WHERE douban_celebrity_id = %s",
                     (douban_id,),
                 )
                 existing_record = cursor.fetchone()
                 if not existing_record:
                     logger.error("未能写入或找到 Douban 人物身份 %s。", douban_id)
                     return -1, "ERROR"
+                if classify_identity_match(existing_record, incoming_identity) != 'SAFE_EXACT_MATCH':
+                    return -1, "CONFLICT_ERROR"
                 return existing_record['map_id'], "UNCHANGED"
 
             sql = """
@@ -446,12 +457,15 @@ class ActorDBManager:
                     douban_celebrity_id = COALESCE(EXCLUDED.douban_celebrity_id, person_identity_map.douban_celebrity_id),
                     
                     last_updated_at = NOW()
-                WHERE
+                WHERE (
                     -- 使用 IS DISTINCT FROM 来正确处理 NULL 值，确保只有在数据实际变化时才更新
                     person_identity_map.primary_name IS DISTINCT FROM EXCLUDED.primary_name OR
                     person_identity_map.emby_person_id IS DISTINCT FROM COALESCE(EXCLUDED.emby_person_id, person_identity_map.emby_person_id) OR
                     person_identity_map.imdb_id IS DISTINCT FROM COALESCE(EXCLUDED.imdb_id, person_identity_map.imdb_id) OR
                     person_identity_map.douban_celebrity_id IS DISTINCT FROM COALESCE(EXCLUDED.douban_celebrity_id, person_identity_map.douban_celebrity_id)
+                ) AND (person_identity_map.emby_person_id IS NULL OR EXCLUDED.emby_person_id IS NULL OR person_identity_map.emby_person_id = EXCLUDED.emby_person_id)
+                  AND (person_identity_map.imdb_id IS NULL OR EXCLUDED.imdb_id IS NULL OR person_identity_map.imdb_id = EXCLUDED.imdb_id)
+                  AND (person_identity_map.douban_celebrity_id IS NULL OR EXCLUDED.douban_celebrity_id IS NULL OR person_identity_map.douban_celebrity_id = EXCLUDED.douban_celebrity_id)
                 RETURNING map_id, (CASE xmax WHEN 0 THEN 'INSERTED' ELSE 'UPDATED' END) as action;
             """
             
@@ -470,11 +484,13 @@ class ActorDBManager:
                 # 如果没有返回结果，说明存在冲突但 WHERE 条件不满足，数据未发生变化
                 action = "UNCHANGED"
                 # 需要手动查询一下 map_id，以便后续流程使用
-                cursor.execute("SELECT map_id FROM person_identity_map WHERE tmdb_person_id = %s", (tmdb_id,))
+                cursor.execute("SELECT * FROM person_identity_map WHERE tmdb_person_id = %s", (tmdb_id,))
                 existing_record = cursor.fetchone()
                 if not existing_record:
                     logger.error(f"upsert_person 逻辑错误: 未能更新也未能找到现有演员记录 for tmdb_id={tmdb_id}")
                     return -1, "ERROR"
+                if classify_identity_match(existing_record, incoming_identity) != 'SAFE_EXACT_MATCH':
+                    return -1, "CONFLICT_ERROR"
                 map_id = existing_record['map_id']
                 logger.trace(f"  ➜ 演员 '{name}' (TMDb: {tmdb_id}) 数据无变化，标记为 UNCHANGED。")
 

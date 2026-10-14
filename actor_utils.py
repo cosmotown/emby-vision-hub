@@ -27,6 +27,7 @@ from services.actor_enrichment_safety import (
     select_cast_by_source_order,
 )
 from utils import contains_chinese
+from services.person_sync_safety import classify_identity_match
 
 logger = logging.getLogger(__name__)
 
@@ -532,7 +533,12 @@ def enrich_all_actor_aliases_task(
                             for imdb_id, tmdb_id in imdb_updates_to_commit:
                                 try:
                                     cursor.execute("SAVEPOINT imdb_update_savepoint")
-                                    cursor.execute("UPDATE person_identity_map SET imdb_id = %s WHERE tmdb_person_id = %s", (imdb_id, tmdb_id))
+                                    cursor.execute(
+                                        "UPDATE person_identity_map SET imdb_id = %s WHERE tmdb_person_id = %s AND (imdb_id IS NULL OR imdb_id = %s)",
+                                        (imdb_id, tmdb_id, imdb_id),
+                                    )
+                                    if cursor.rowcount == 0:
+                                        logger.warning('人物 IMDb 补充未改写既有身份，需复核；tmdb_id=%s', tmdb_id)
                                     cursor.execute("RELEASE SAVEPOINT imdb_update_savepoint")
                                 except psycopg2.IntegrityError as ie:
                                     cursor.execute("ROLLBACK TO SAVEPOINT imdb_update_savepoint")
@@ -548,46 +554,18 @@ def enrich_all_actor_aliases_task(
                                             logger.warning(f"  🚫 合并中止：源或目标记录不存在，或它们本就是同一条记录。")
                                             continue
 
-                                        target_map_id = target_actor['map_id']
-                                        source_map_id = source_actor['map_id']
-                                        logger.info(f"  ➜ 准备合并：源(map_id:{source_map_id}, tmdb:{tmdb_id}) -> 目标(map_id:{target_map_id}, imdb:{imdb_id})")
-
-                                        # --- 定义一个可重用的、安全的ID合并函数 ---
-                                        def safe_merge_id(id_field_name: str, id_value: Any, source_id: int, target_id: int):
-                                            if not id_value or target_actor.get(id_field_name):
-                                                return # 如果源ID为空，或目标已有同类ID，则不合并
-
-                                            # 预检查：这个ID是否已存在于其他记录中？
-                                            cursor.execute(f"SELECT map_id FROM person_identity_map WHERE {id_field_name} = %s", (id_value,))
-                                            conflicting_record = cursor.fetchone()
-                                            
-                                            if conflicting_record and conflicting_record['map_id'] != target_id:
-                                                # 存在冲突！这个ID属于另一个记录。我们需要先把它从旧记录上剥离。
-                                                logger.warning(f"  ➜ 检测到 {id_field_name} '{id_value}' 存在于第三方记录 (map_id: {conflicting_record['map_id']})。将从旧记录中移除。")
-                                                cursor.execute(f"UPDATE person_identity_map SET {id_field_name} = NULL WHERE map_id = %s", (conflicting_record['map_id'],))
-
-                                            # 现在可以安全地更新到目标记录了
-                                            logger.info(f"  ➜ 正在将 {id_field_name} '{id_value}' 合并到目标记录 (map_id: {target_id})。")
-                                            cursor.execute(f"UPDATE person_identity_map SET {id_field_name} = %s WHERE map_id = %s", (id_value, target_id))
-
-                                        # --- 依次安全地合并各个ID ---
-                                        # 1. 合并 TMDb ID
-                                        safe_merge_id('tmdb_person_id', source_actor.get('tmdb_person_id'), source_map_id, target_map_id)
-                                        # 2. 合并 Douban ID
-                                        safe_merge_id('douban_celebrity_id', source_actor.get('douban_celebrity_id'), source_map_id, target_map_id)
-                                        # 3. 合并 Emby ID
-                                        safe_merge_id('emby_person_id', source_actor.get('emby_person_id'), source_map_id, target_map_id)
-
-                                        # 4. 最后，删除现在已经为空壳的源记录
-                                        logger.info(f"  ➜ 所有ID合并完成，准备删除源记录 (map_id: {source_map_id})。")
-                                        cursor.execute("DELETE FROM person_identity_map WHERE map_id = %s", (source_map_id,))
-                                        logger.info(f"  ➜ 成功将记录 (map_id:{source_map_id}) 合并到 (map_id:{target_map_id})。")
+                                        disposition = classify_identity_match(source_actor, target_actor)
+                                        logger.warning(
+                                            '人物身份冲突待复核：source_map_id=%s target_map_id=%s state=%s；禁止自动合并或迁移身份。',
+                                            source_actor['map_id'], target_actor['map_id'], disposition,
+                                        )
+                                        continue
                                     else:
                                         # 如果是其他类型的唯一键冲突，则重新抛出异常
                                         raise ie
 
                             if invalid_tmdb_ids:
-                                cursor.executemany("UPDATE person_identity_map SET tmdb_person_id = NULL WHERE tmdb_person_id = %s", [(tid,) for tid in invalid_tmdb_ids])
+                                logger.warning('TMDb 查询未确认 %s 条身份，保留原映射并等待复核，不自动清空。', len(invalid_tmdb_ids))
 
                             conn.commit()
                             logger.info("  ✅ 数据库更改已成功提交。")

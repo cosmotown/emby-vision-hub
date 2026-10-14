@@ -1,4 +1,7 @@
 import unittest
+import os
+import tempfile
+from services.person_write_safety import PersonOperationJournal
 from unittest.mock import MagicMock, patch
 
 from core_processor import MediaProcessor
@@ -31,164 +34,93 @@ class DoubanOnlyActorIngestTests(unittest.TestCase):
         self.assertIn('ON CONFLICT (douban_celebrity_id)', executed_sql)
         self.assertNotIn("'None'", executed_sql)
 
-    @patch('core_processor.emby.upload_item_primary_image_from_url')
-    @patch('core_processor.emby.update_person_details')
-    @patch('core_processor.emby.update_emby_item_details', return_value=True)
-    @patch('core_processor.emby.get_emby_item_details')
-    @patch('core_processor.emby.get_people_by_provider_ids')
-    def test_existing_douban_person_is_reused_and_verified(
-        self,
-        get_people,
-        get_details,
-        update_item,
-        update_person,
-        upload_avatar,
-    ):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        env = patch.dict(os.environ, APP_DATA_DIR=self.temp.name)
+        env.start()
+        self.addCleanup(env.stop)
+
+    def processor(self):
         processor = MediaProcessor.__new__(MediaProcessor)
+        processor.config = {}
         processor.emby_url = 'http://emby.invalid'
         processor.emby_api_key = 'hidden'
         processor.emby_user_id = 'u1'
         processor.actor_db_manager = MagicMock()
-        processor.actor_db_manager.find_person_by_any_id.return_value = None
         processor.actor_db_manager.upsert_person.return_value = (9, 'UPDATED')
-        cursor = MagicMock()
-        actor = {
-            'id': None,
-            'douban_id': '5678',
-            'name': '已有演员',
-            'character': '角色甲',
-            'profile_path': 'https://img1.doubanio.com/p5678.jpg',
-        }
-        person = {
-            'Id': 'person-1',
-            'Name': '已有演员',
-            'ProviderIds': {'Douban': '5678'},
-            'ImageTags': {'Primary': 'tag'},
-        }
-        get_people.return_value = [person]
-        get_details.side_effect = [
-            person,
-            person,
-            {'Id': 'media-1', 'People': []},
-            {'Id': 'media-1', 'People': [{'Id': 'person-1', 'Type': 'Actor'}]},
-        ]
+        return processor
 
-        synced = processor._sync_douban_only_cast_to_emby(
-            'media-1', [actor], cursor
-        )
+    def actor(self):
+        return {'douban_id': '5678', 'name': 'Different display name', 'character': 'Role'}
 
-        self.assertEqual(synced, 1)
-        self.assertEqual(actor['emby_person_id'], 'person-1')
-        update_item.assert_called_once()
-        update_person.assert_not_called()
-        upload_avatar.assert_not_called()
+    def person(self):
+        return {'Id': 'person-1', 'Name': 'Existing', 'Type': 'Person',
+                'ProviderIds': {'Douban': '5678'}}
 
-    @patch('core_processor.emby.upload_item_primary_image_from_url', return_value=True)
-    @patch('core_processor.emby.update_person_details', return_value=True)
-    @patch('core_processor.emby.update_emby_item_details', return_value=True)
-    @patch('core_processor.emby.get_emby_item_details')
-    @patch('core_processor.emby.get_people_by_provider_ids', return_value=[])
-    def test_new_person_uses_unique_temporary_name_then_locks_douban_id(
-        self,
-        _get_people,
-        get_details,
-        update_item,
-        update_person,
-        upload_avatar,
-    ):
-        processor = MediaProcessor.__new__(MediaProcessor)
-        processor.emby_url = 'http://emby.invalid'
-        processor.emby_api_key = 'hidden'
-        processor.emby_user_id = 'u1'
-        processor.actor_db_manager = MagicMock()
-        processor.actor_db_manager.find_person_by_any_id.return_value = None
-        processor.actor_db_manager.upsert_person.return_value = (10, 'UPDATED')
-        cursor = MagicMock()
-        actor = {
-            'id': None,
-            'douban_id': '9012',
-            'name': '新演员',
-            'character': '角色乙',
-            'profile_path': 'https://img1.doubanio.com/p9012.jpg',
-        }
-        temp_person = {
-            'Id': 'person-2',
-            'Name': '__ETK_DOUBAN_9012__',
-            'ProviderIds': {},
-            'ImageTags': {},
-        }
-        verified_person = {
-            'Id': 'person-2',
-            'Name': '新演员',
-            'ProviderIds': {'Douban': '9012'},
-            'ImageTags': {},
-        }
-        get_details.side_effect = [
-            {'Id': 'media-2', 'People': []},
-            {'Id': 'media-2', 'People': [temp_person]},
-            temp_person,
-            verified_person,
-            {'Id': 'media-2', 'People': [temp_person.copy()]},
-            {'Id': 'media-2', 'People': [{'Id': 'person-2', 'Type': 'Actor'}]},
-        ]
+    def test_existing_exact_identity_reused_without_rename_or_creation(self):
+        processor = self.processor()
+        person = self.person()
+        with patch('core_processor.emby.resolve_exact_person_identity', return_value=[person]), \
+             patch('core_processor.emby.get_emby_item_details', side_effect=[
+                 person, {'Id': 'm', 'Type': 'Movie', 'People': []},
+                 {'Id': 'm', 'People': [{'Id': 'person-1'}]},
+             ]), patch('core_processor.emby.update_emby_item_details', return_value=True) as update, \
+             patch('core_processor.emby.update_person_details') as rename:
+            self.assertEqual(processor._sync_douban_only_cast_to_emby('m', [self.actor()], MagicMock()), 1)
+        self.assertEqual(update.call_count, 1)
+        self.assertEqual(update.call_args.args[1]['People'][0]['Id'], 'person-1')
+        rename.assert_not_called()
 
-        synced = processor._sync_douban_only_cast_to_emby(
-            'media-2', [actor], cursor
-        )
+    def test_absent_person_is_durably_quarantined_without_name_create(self):
+        processor = self.processor()
+        with patch('core_processor.emby.resolve_exact_person_identity', return_value=[]) as resolve, \
+             patch('core_processor.emby.update_emby_item_details') as update, \
+             patch('core_processor.emby.update_person_details') as person_write:
+            for _ in range(2):
+                self.assertEqual(processor._sync_douban_only_cast_to_emby('m', [self.actor()], MagicMock()), 0)
+        resolve.assert_called_once()
+        update.assert_not_called()
+        person_write.assert_not_called()
+        state = PersonOperationJournal(processor.emby_url, 'douban', '5678').read()
+        self.assertEqual(state['failure_stage'], 'name_only_create_blocked')
+        self.assertIsNone(state['created_person_id'])
+        self.assertTrue(state['operation_id'])
 
-        self.assertEqual(synced, 1)
-        self.assertEqual(actor['emby_person_id'], 'person-2')
-        self.assertEqual(update_item.call_count, 2)
-        update_person.assert_called_once()
-        person_update = update_person.call_args.args[1]
-        self.assertEqual(person_update['Name'], '新演员')
-        self.assertEqual(person_update['ProviderIds']['Douban'], '9012')
-        upload_avatar.assert_called_once()
+    def test_failed_attach_is_not_detached_or_replayed(self):
+        processor = self.processor()
+        person = self.person()
+        with patch('core_processor.emby.resolve_exact_person_identity', return_value=[person]), \
+             patch('core_processor.emby.get_emby_item_details', side_effect=[
+                 person, {'Id': 'm', 'Type': 'Movie', 'People': [{'Id': 'existing'}]},
+             ]), patch('core_processor.emby.update_emby_item_details', return_value=False) as update:
+            self.assertEqual(processor._sync_douban_only_cast_to_emby('m', [self.actor()], MagicMock()), 0)
+            self.assertEqual(processor._sync_douban_only_cast_to_emby('m', [self.actor()], MagicMock()), 0)
+        update.assert_called_once()
+        self.assertEqual(update.call_args.args[1]['People'][0]['Id'], 'existing')
+        state = PersonOperationJournal(processor.emby_url, 'douban', '5678').read()
+        self.assertEqual(state['failure_stage'], 'association_result_unknown')
+        self.assertEqual(state['target_person_id'], 'person-1')
 
-    @patch('core_processor.time_module.sleep')
-    @patch('core_processor.emby.update_emby_item_details', return_value=True)
-    @patch('core_processor.emby.get_emby_item_details')
-    @patch('core_processor.emby.get_people_by_provider_ids', return_value=[])
-    def test_unconfirmed_temporary_person_is_detached(
-        self,
-        _get_people,
-        get_details,
-        update_item,
-        _sleep,
-    ):
-        processor = MediaProcessor.__new__(MediaProcessor)
-        processor.emby_url = 'http://emby.invalid'
-        processor.emby_api_key = 'hidden'
-        processor.emby_user_id = 'u1'
-        processor.actor_db_manager = MagicMock()
-        processor.actor_db_manager.find_person_by_any_id.return_value = None
-        cursor = MagicMock()
-        actor = {
-            'id': None,
-            'douban_id': '3456',
-            'name': '待确认演员',
-            'character': '角色丙',
-            'profile_path': 'https://img1.doubanio.com/p3456.jpg',
-        }
-        temporary_person_without_id = {
-            'Name': '__ETK_DOUBAN_3456__',
-            'Type': 'Actor',
-        }
-        get_details.side_effect = [
-            {'Id': 'media-3', 'People': []},
-            {'Id': 'media-3', 'People': [temporary_person_without_id]},
-            {'Id': 'media-3', 'People': [temporary_person_without_id]},
-            {'Id': 'media-3', 'People': [temporary_person_without_id]},
-            {'Id': 'media-3', 'People': [temporary_person_without_id]},
-        ]
+    def test_ambiguous_provider_blocks_all_writes(self):
+        processor = self.processor()
+        people = [self.person(), dict(self.person(), Id='second')]
+        with patch('core_processor.emby.resolve_exact_person_identity', return_value=people), \
+             patch('core_processor.emby.update_emby_item_details') as update:
+            self.assertEqual(processor._sync_douban_only_cast_to_emby('m', [self.actor()], MagicMock()), 0)
+        update.assert_not_called()
 
-        synced = processor._sync_douban_only_cast_to_emby(
-            'media-3', [actor], cursor
-        )
-
-        self.assertEqual(synced, 0)
-        self.assertEqual(update_item.call_count, 2)
-        self.assertEqual(update_item.call_args.args[1]['People'], [])
+    def test_two_workers_cannot_create_duplicate(self):
+        from concurrent.futures import ThreadPoolExecutor
+        processor = self.processor()
+        with patch('core_processor.emby.resolve_exact_person_identity', return_value=[]) as resolve, \
+             patch('core_processor.emby.update_emby_item_details') as update:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda _: processor._sync_douban_only_cast_to_emby(
+                    'm', [self.actor()], MagicMock()), range(2)))
+        self.assertEqual(results, [0, 0])
+        resolve.assert_called_once()
+        update.assert_not_called()  # Unsupported creation is zero, not a claimed get-or-create.
 
 
 if __name__ == '__main__':

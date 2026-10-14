@@ -496,7 +496,8 @@ const handleSaveChanges = async () => {
         tmdbId: actor.tmdbId, // 确保发送 tmdbId
         name: actor.name,     // 发送 name
         role: actor.role,      // 发送 role
-        emby_person_id: actor.emby_person_id
+        emby_person_id: actor.emby_person_id,
+        provider_identity_snapshot: actor.provider_identity_snapshot
       };
     });
 

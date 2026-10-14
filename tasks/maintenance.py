@@ -9,6 +9,7 @@ from typing import List, Dict, Any
 from database import connection, maintenance_db
 from psycopg2 import sql
 from psycopg2.extras import execute_values, Json
+from services.person_sync_safety import classify_identity_match
 
 logger = logging.getLogger(__name__)
 
@@ -139,77 +140,51 @@ def _share_import_table_data(cursor, table_name: str, columns: List[str], data: 
 
 # ★★★ 辅助函数 4: 专门用于合并 person_identity_map 的智能函数 ★★★
 def _merge_person_identity_map_data(cursor, table_name: str, columns: List[str], data: List[tuple]) -> dict:
-    """
-    【V2 - 终极修复版】为 person_identity_map 表提供一个健壮的合并策略。
-    """
-    logger.info(f"  ➜ 执行智能合并模式：将合并数据到表 '{table_name}'...")
-    
-    stats = {'inserted': 0, 'updated': 0, 'merged_and_deleted': 0}
-    
-    data_dicts = [dict(zip(columns, row)) for row in data]
-
-    for row_to_merge in data_dicts:
-        ids_to_check = {
-            'tmdb_person_id': row_to_merge.get('tmdb_person_id'),
-            'imdb_id': row_to_merge.get('imdb_id'),
-            'douban_celebrity_id': row_to_merge.get('douban_celebrity_id')
-        }
-        
-        query_parts = []
-        params = []
-        for key, value in ids_to_check.items():
-            if value:
-                query_parts.append(sql.SQL("{} = %s").format(sql.Identifier(key)))
-                params.append(value)
-            
-        if not query_parts:
+    """Additive import only; conflicting rows are returned for review, never merged."""
+    stats = {'inserted': 0, 'updated': 0, 'merged_and_deleted': 0,
+             'review_required': 0, 'conflicts': 0, 'review_items': []}
+    for row in [dict(zip(columns, values)) for values in data]:
+        ids = {key: row.get(key) for key in ('tmdb_person_id', 'imdb_id', 'douban_celebrity_id')}
+        predicates = [sql.SQL("{} = %s").format(sql.Identifier(key)) for key, value in ids.items() if value]
+        records = []
+        if predicates:
+            cursor.execute(sql.SQL("SELECT * FROM person_identity_map WHERE {} FOR UPDATE").format(
+                sql.SQL(' OR ').join(predicates)), tuple(value for value in ids.values() if value))
+            records = cursor.fetchall()
+        states = [classify_identity_match(existing, row) for existing in records]
+        # A stable exact ID permits enriching ONE row, never merging two rows.
+        state = ('CONFLICT' if 'CONFLICT' in states else
+                 'REVIEW_REQUIRED' if len(records) > 1 else
+                 states[0] if states else classify_identity_match(row, row))
+        if state != 'SAFE_EXACT_MATCH':
+            stats['conflicts' if state == 'CONFLICT' else 'review_required'] += 1
+            stats['review_items'].append({'state': state, 'identities': ids,
+                                         'existing_map_ids': [r['map_id'] for r in records]})
+            logger.warning('人物共享导入 %s，保留全部既有映射；map_ids=%s',
+                           state, [r['map_id'] for r in records])
             continue
-
-        find_sql = sql.SQL("SELECT * FROM person_identity_map WHERE {}").format(sql.SQL(' OR ').join(query_parts))
-        cursor.execute(find_sql, tuple(params))
-        existing_records = cursor.fetchall()
-
-        if not existing_records:
-            all_cols_in_order = [col for col in columns if col != 'map_id']
-            values_to_insert = [row_to_merge.get(col) for col in all_cols_in_order]
-
-            insert_sql = sql.SQL("INSERT INTO person_identity_map ({}) VALUES ({})").format(
-                sql.SQL(', ').join(map(sql.Identifier, all_cols_in_order)),
-                sql.SQL(', ').join(sql.Placeholder() * len(all_cols_in_order))
-            )
-            cursor.execute(insert_sql, values_to_insert)
-            stats['inserted'] += 1
-        else:
-            sorted_records = sorted(existing_records, key=lambda r: r['map_id'])
-            master_record_original = dict(sorted_records[0])
-            records_to_delete = sorted_records[1:]
-            
-            merged_data = master_record_original.copy()
-            all_sources = records_to_delete + [row_to_merge]
-            
-            for source in all_sources:
-                for key, value in source.items():
-                    if key in ['tmdb_person_id', 'imdb_id', 'douban_celebrity_id', 'primary_name'] and value and not merged_data.get(key):
-                        merged_data[key] = value
-
-            if records_to_delete:
-                ids_to_delete = [r['map_id'] for r in records_to_delete]
-                delete_sql = sql.SQL("DELETE FROM person_identity_map WHERE map_id = ANY(%s)")
-                cursor.execute(delete_sql, (ids_to_delete,))
-                stats['merged_and_deleted'] += len(ids_to_delete)
-
-            updates = {
-                k: v for k, v in merged_data.items() 
-                if k != 'map_id' and v != master_record_original.get(k)
-            }
-            
-            if updates:
-                set_clauses = [sql.SQL("{} = %s").format(sql.Identifier(k)) for k in updates.keys()]
-                update_sql = sql.SQL("UPDATE person_identity_map SET {} WHERE map_id = %s").format(sql.SQL(', ').join(set_clauses))
-                cursor.execute(update_sql, tuple(updates.values()) + (merged_data['map_id'],))
-                stats['updated'] += 1
-            
-    logger.info(f"  ➜ 智能合并完成：新增 {stats['inserted']} 条，更新 {stats['updated']} 条，合并删除 {stats['merged_and_deleted']} 条记录。")
+        if not records:
+            chosen = [key for key in columns if key not in {'map_id', 'emby_person_id'}]
+            cursor.execute(sql.SQL(
+                "INSERT INTO person_identity_map ({}) VALUES ({}) ON CONFLICT DO NOTHING RETURNING map_id"
+            ).format(sql.SQL(', ').join(map(sql.Identifier, chosen)),
+                     sql.SQL(', ').join(sql.Placeholder() for _ in chosen)),
+                tuple(row.get(key) for key in chosen))
+            if cursor.fetchone():
+                stats['inserted'] += 1
+            else:
+                stats['review_required'] += 1
+                stats['review_items'].append({'state': 'REVIEW_REQUIRED', 'identities': ids,
+                                             'reason': 'concurrent_identity_conflict'})
+            continue
+        existing = records[0]
+        updates = {key: row[key] for key in ('tmdb_person_id', 'imdb_id', 'douban_celebrity_id', 'primary_name')
+                   if row.get(key) and not existing.get(key)}
+        if updates:
+            cursor.execute(sql.SQL("UPDATE person_identity_map SET {} WHERE map_id = %s").format(
+                sql.SQL(', ').join(sql.SQL("{} = %s").format(sql.Identifier(key)) for key in updates)),
+                tuple(updates.values()) + (existing['map_id'],))
+            stats['updated'] += 1
     return stats
 
 # ★★★ 辅助函数 5: 同步主键序列 ★★★
@@ -356,7 +331,7 @@ def task_import_database(processor, file_content: str, tables_to_import: List[st
                         
                         if table_name.lower() == 'person_identity_map':
                             merge_stats = _merge_person_identity_map_data(cursor, table_name, columns, prepared_data)
-                            summary_lines.append(f"  - 表 '{cn_name}': 智能合并完成 (新增 {merge_stats['inserted']}, 更新 {merge_stats['updated']}, 清理 {merge_stats['merged_and_deleted']})。")
+                            summary_lines.append(f"  - 表 '{cn_name}': 仅增补 (新增 {merge_stats['inserted']}, 更新 {merge_stats['updated']}, 待复核 {merge_stats['review_required']}, 冲突 {merge_stats['conflicts']}, 合并/删除 0)。")
                         else:
                             inserted_count = _share_import_table_data(cursor, table_name, columns, prepared_data)
                             summary_lines.append(f"  - 表 '{cn_name}': 成功合并 {inserted_count} / {len(prepared_data)} 条新记录。")

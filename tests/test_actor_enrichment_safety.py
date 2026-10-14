@@ -189,7 +189,7 @@ class ActorEnrichmentSafetyTests(unittest.TestCase):
             ['TMDb lead', 'Douban-only lead', 'Supporting actor'],
         )
 
-    def test_name_is_only_candidate_retrieval_and_birthday_confirms_identity(self):
+    def test_name_and_birthday_are_discovery_only_not_write_identity(self):
         douban_profile = build_douban_identity_profile(
             {'DoubanCelebrityId': '101', 'Name': '赵丽颖'},
             {
@@ -210,8 +210,8 @@ class ActorEnrichmentSafetyTests(unittest.TestCase):
             [tmdb_profile],
         )
 
-        self.assertEqual(resolution['status'], 'confirmed')
-        self.assertEqual(resolution['tmdb_id'], '123')
+        self.assertEqual(resolution['status'], 'ambiguous')
+        self.assertIsNone(resolution['tmdb_id'])
 
     def test_matching_name_without_birthday_is_deferred(self):
         resolution = resolve_douban_actor_against_tmdb_cast(

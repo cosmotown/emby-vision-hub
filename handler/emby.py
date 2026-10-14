@@ -23,6 +23,7 @@ import config_manager
 import constants
 from typing import Optional, List, Dict, Any, Generator, Tuple, Set, Callable, Iterable
 import logging
+from services.person_sync_safety import PersonEnumeration, PersonResultScope
 logger = logging.getLogger(__name__)
 
 class EmbyAPIClient:
@@ -574,37 +575,154 @@ def get_item_people_detail_strict(
 
 
 # ✨✨✨ 更新一个 Person 条目本身的信息 ✨✨✨
-def update_person_details(person_id: str, new_data: Dict[str, Any], emby_server_url: str, emby_api_key: str, user_id: str) -> bool:
-    if not all([person_id, new_data, emby_server_url, emby_api_key, user_id]):
-        logger.error("update_person_details: 参数不足 (需要 user_id)。")
+def resolve_exact_person_identity(base_url, api_key, provider, identity):
+    """Complete, exact provider query. None means unknown, never absence."""
+    from services.person_write_safety import provider_identity, provider_snapshot
+    try:
+        pair = provider_identity(provider, identity)
+        response = emby_client.get(
+            f"{base_url.rstrip('/')}/Items",
+            headers={'X-Emby-Token': api_key},
+            params={'IncludeItemTypes': 'Person', 'Recursive': 'true',
+                    'AnyProviderIdEquals': '.'.join(pair), 'Fields': 'ProviderIds',
+                    'Limit': 2, 'EnableTotalRecordCount': 'true'}, timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+        items, total = data.get('Items'), data.get('TotalRecordCount')
+        if not isinstance(items, list) or type(total) is not int or total != len(items):
+            return None
+        for item in items:
+            if item.get('Type') != 'Person' or not item.get('Id') or pair not in provider_snapshot(item):
+                return None
+        return items
+    except Exception:
+        return None
+
+
+def resolve_frozen_person_target(base_url, api_key, target):
+    """Every frozen provider pair must uniquely resolve to the same object."""
+    primary = None
+    for provider, identity in target.provider_ids:
+        matches = resolve_exact_person_identity(base_url, api_key, provider, identity)
+        if matches is None or len(matches) != 1:
+            return matches
+        if str(matches[0].get('Id') or '') != target.emby_person_id:
+            return matches
+        primary = matches
+    return primary
+
+
+def read_person_identity_batch(base_url, api_key, person_ids):
+    """Read current instance mappings in bounded batches; no Name resolution."""
+    wanted = sorted({str(value) for value in person_ids if value})
+    result = {}
+    try:
+        for start in range(0, len(wanted), 200):
+            chunk = wanted[start:start + 200]
+            response = emby_client.get(
+                f"{base_url.rstrip('/')}/Items", headers={'X-Emby-Token': api_key},
+                params={'Ids': ','.join(chunk), 'IncludeItemTypes': 'Person',
+                        'Fields': 'ProviderIds', 'Limit': len(chunk),
+                        'EnableTotalRecordCount': 'true'}, timeout=20,
+            )
+            response.raise_for_status()
+            data = response.json()
+            values = data.get('Items')
+            if not isinstance(values, list) or type(data.get('TotalRecordCount')) is not int or data.get('TotalRecordCount') != len(chunk):
+                return None
+            for person in values:
+                pid = str(person.get('Id') or '')
+                if person.get('Type') != 'Person' or pid not in chunk or pid in result:
+                    return None
+                if not isinstance(person.get('ProviderIds'), dict):
+                    return None
+                result[pid] = person
+            if set(chunk) - result.keys():
+                return None
+        return result
+    except Exception:
+        return None
+
+
+def is_person_name_write_safe(base_url, api_key, name, person_id, *, allow_absent=False):
+    """A deny-only collision check; Name can never resolve/authorize the target."""
+    if not isinstance(name, str) or not name.strip() or not person_id:
+        return False
+    try:
+        params = {'IncludeItemTypes': 'Person', 'Recursive': 'true',
+                  'SearchTerm': name, 'Fields': 'ProviderIds', 'Limit': 200,
+                  'EnableTotalRecordCount': 'true'}
+        def read(extra=None):
+            response = emby_client.get(
+                f"{base_url.rstrip('/')}/Items", headers={'X-Emby-Token': api_key},
+                params=dict(params, **(extra or {})), timeout=20,
+            )
+            response.raise_for_status()
+            return response.json()
+        data = read()
+        items, total = data.get('Items'), data.get('TotalRecordCount')
+        if not isinstance(items, list) or type(total) is not int or total > 200 or len(items) >= 200:
+            return False
+        if total != len(items):
+            # Mac Emby 4.10.1.0 reports count=0 with a non-empty Korean-name
+            # search result. Do not reinterpret that count as absence. Require
+            # an explicit empty tail and an identical repeated bounded head.
+            if total != 0 or not items:
+                return False
+            tail = read({'StartIndex': len(items), 'Limit': 1})
+            repeated = read()
+            fingerprint = lambda rows: sorted(
+                (str(row.get('Id') or ''), str(row.get('Name') or ''), row.get('Type'))
+                for row in rows
+            )
+            if tail.get('Items') != [] or fingerprint(repeated.get('Items') or []) != fingerprint(items):
+                return False
+        if any(item.get('Type') != 'Person' or not item.get('Id') for item in items):
+            return False
+        exact = {str(item['Id']) for item in items
+                 if str(item.get('Name') or '').strip().casefold() == name.strip().casefold()}
+        return exact == {str(person_id)} or (allow_absent and not exact)
+    except Exception:
         return False
 
-    api_url = f"{emby_server_url.rstrip('/')}/Users/{user_id}/Items/{person_id}"
-    headers = {'X-Emby-Token': emby_api_key}
-    wait_for_server_idle(emby_server_url, emby_api_key)
-    try:
-        logger.trace(f"准备获取 Person 详情 (ID: {person_id}, UserID: {user_id}) at {api_url}")
-        response_get = emby_client.get(api_url, headers=headers)
-        response_get.raise_for_status()
-        person_to_update = response_get.json()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"更新Person前获取其详情失败 (ID: {person_id}, UserID: {user_id}): {e}")
+
+def update_person_details(person_id: str, new_data: Dict[str, Any], emby_server_url: str,
+                          emby_api_key: str, user_id: str, *, target=None) -> bool:
+    from services.person_write_safety import (
+        ExactPersonTarget, identity_lock, validate_person_write_target, audit,
+    )
+    if not isinstance(target, ExactPersonTarget):
+        audit(target, 'person_update', 'DENY', 'identity_missing')
         return False
-
-    for key, value in new_data.items():
-        person_to_update[key] = value
-    
-    update_url = f"{emby_server_url.rstrip('/')}/Items/{person_id}"
-    headers = {'Content-Type': 'application/json', 'X-Emby-Token': emby_api_key}
-
-    logger.trace(f"  ➜ 准备更新 Person (ID: {person_id}) 的信息，新数据: {new_data}")
+    if str(person_id) != target.emby_person_id:
+        audit(target, 'person_update', 'DENY', 'stale_emby_mapping')
+        return False
     try:
-        response_post = emby_client.post(update_url, json=person_to_update, headers=headers)
-        response_post.raise_for_status()
-        logger.trace(f"  ➜ 成功更新 Person (ID: {person_id}) 的信息。")
-        return True
-    except requests.exceptions.RequestException as e:
-        logger.error(f"  ➜ 更新 Person (ID: {person_id}) 时发生错误: {e}")
+        with identity_lock(emby_server_url, target.provider_name, target.provider_person_id):
+            wait_for_server_idle(emby_server_url, emby_api_key)
+            matches = resolve_frozen_person_target(emby_server_url, emby_api_key, target)
+            # Last remote read before POST; full frozen provider snapshot, not Name.
+            current = get_emby_item_details(person_id, emby_server_url, emby_api_key, user_id)
+            denial = validate_person_write_target(target, current, matches, new_data)
+            if denial:
+                audit(target, 'person_update', 'DENY', denial)
+                return False
+            if 'Name' in new_data and not is_person_name_write_safe(
+                emby_server_url, emby_api_key, new_data['Name'], person_id, allow_absent=True,
+            ):
+                audit(target, 'person_update', 'DENY', 'person_name_collision_or_unknown')
+                return False
+            payload = dict(current, **new_data)
+            response = emby_client.post(
+                f"{emby_server_url.rstrip('/')}/Items/{person_id}", json=payload,
+                headers={'Content-Type': 'application/json', 'X-Emby-Token': emby_api_key},
+            )
+            response.raise_for_status()
+            audit(target, 'person_update', 'ALLOW', 'exact_identity_verified')
+            return True
+    except Exception:
+        audit(target, 'person_update', 'DENY', 'update_failed_or_unknown')
         return False
 
 # ✨✨✨ 获取 Emby 用户可见媒体库列表 ✨✨✨
@@ -1322,6 +1440,9 @@ def refresh_emby_item_metadata(item_emby_id: str,
         if not item_data:
             logger.error(f"  🚫 无法获取 {log_identifier} 的详情，所有操作中止。")
             return False
+        if item_data.get('Type') == 'Person':
+            logger.warning('[PERSON_GOVERNANCE] DENY generic_person_refresh identity_target_required')
+            return False
 
         item_needs_update = False
         
@@ -1731,14 +1852,17 @@ def get_all_persons_from_emby(
     stop_event: Optional[threading.Event] = None,
     batch_size: int = 500,
     update_status_callback: Optional[Callable] = None,
-    force_full_scan: bool = False
+    force_full_scan: bool = False,
+    enumeration: Optional[PersonEnumeration] = None,
 ) -> Generator[List[Dict[str, Any]], None, None]:
     """
     【V6.0 - 4.9+ 终极兼容版】
     - 修正了全量扫描模式，使其在 Emby 4.9+ 上能正常工作。
     - 同样切换到 /Items 端点并移除了 UserId 参数。
     """
+    enumeration = enumeration if enumeration is not None else PersonEnumeration()
     if not user_id:
+        enumeration.fail('missing_user')
         logger.error("  🚫 获取所有演员需要提供 User ID，但未提供。任务中止。")
         return
 
@@ -1748,6 +1872,7 @@ def get_all_persons_from_emby(
     # 模式一：尝试按媒体库进行精准扫描 (如果配置了媒体库且未强制全量)
     # ======================================================================
     if library_ids and not force_full_scan:
+        enumeration.scope = PersonResultScope.FILTERED_RESULT
         logger.info(f"  ➜ 检测到配置了 {len(library_ids)} 个媒体库，将优先尝试精准扫描...")
         
         media_items = get_emby_library_items(
@@ -1807,10 +1932,14 @@ def get_all_persons_from_emby(
         count_params = {"api_key": api_key, "IncludeItemTypes": "Person", "Recursive": "true", "Limit": 0}
         response = emby_client.get(count_url, params=count_params)
         response.raise_for_status()
-        total_count = response.json().get("TotalRecordCount", 0)
+        total_count = response.json().get("TotalRecordCount")
         logger.info(f"  ➜ Emby 演员 总数: {total_count}")
     except Exception as e:
         logger.error(f"  ➜ 获取 Emby 演员 总数失败: {e}")
+        total_count = None
+
+    enumeration.begin_full(total_count)
+    total_count = enumeration.expected_count
     
     # ★★★ 核心修正: 切换到 /Items 端点 ★★★
     api_url = f"{base_url.rstrip('/')}/Items"
@@ -1825,6 +1954,7 @@ def get_all_persons_from_emby(
 
     while True:
         if stop_event and stop_event.is_set():
+            enumeration.fail('stopped')
             logger.info("  🚫 Emby Person 获取任务被中止。")
             return
 
@@ -1835,20 +1965,30 @@ def get_all_persons_from_emby(
         try:
             response = emby_client.get(api_url, headers=headers, params=request_params)
             response.raise_for_status()
-            items = response.json().get("Items", [])
+            page = response.json()
+            if not enumeration.record_page(page):
+                return
+            items = page['Items']
             
             if not items:
+                final_response = emby_client.get(count_url, params=count_params)
+                final_response.raise_for_status()
+                enumeration.finish_full(final_response.json().get('TotalRecordCount'))
                 break
 
             yield items
             start_index += len(items)
 
             if update_status_callback:
-                progress = int((start_index / total_count) * 95) if total_count > 0 else 5
-                update_status_callback(progress, f"已扫描 {start_index}/{total_count if total_count > 0 else '未知'} 名演员...")
+                progress = int((start_index / total_count) * 95) if total_count and total_count > 0 else 5
+                update_status_callback(progress, f"已扫描 {start_index}/{total_count if total_count is not None else '未知'} 名演员...")
 
         except requests.exceptions.RequestException as e:
+            enumeration.fail('request_failed')
             logger.error(f"请求 Emby API 失败 (批次 StartIndex={start_index}): {e}", exc_info=True)
+            return
+        except (TypeError, ValueError, AttributeError):
+            enumeration.fail('invalid_response')
             return
 
 # ✨✨✨ 获取剧集下所有子项目 ✨✨✨
@@ -2739,7 +2879,7 @@ def get_library_root_for_item(item_id: str, base_url: str, api_key: str, user_id
         return None
 
 # --- 更新媒体项详情 ---    
-def update_emby_item_details(item_id: str, new_data: Dict[str, Any], emby_server_url: str, emby_api_key: str, user_id: str) -> bool:
+def update_emby_item_details(item_id: str, new_data: Dict[str, Any], emby_server_url: str, emby_api_key: str, user_id: str, *, person_targets=()) -> bool:
     if not all([item_id, new_data, emby_server_url, emby_api_key, user_id]):
         return False
     wait_for_server_idle(emby_server_url, emby_api_key)
@@ -2748,6 +2888,40 @@ def update_emby_item_details(item_id: str, new_data: Dict[str, Any], emby_server
         current_item_details = get_emby_item_details(item_id, emby_server_url, emby_api_key, user_id)
         if not current_item_details:
             return False
+        if current_item_details.get('Type') == 'Person':
+            logger.warning('[PERSON_GOVERNANCE] DENY generic_item_update identity_target_required')
+            return False
+        if 'People' in new_data:
+            from services.person_write_safety import ExactPersonTarget, validate_person_write_target, audit
+            old_people = current_item_details.get('People')
+            new_people = new_data['People']
+            if not isinstance(old_people, list) or not isinstance(new_people, list):
+                return False
+            old_ids = {str(p.get('Id')) for p in old_people if p.get('Id')}
+            intents = {t.emby_person_id: t for t in person_targets if isinstance(t, ExactPersonTarget)}
+            for member in new_people:
+                member_id = str(member.get('Id') or '')
+                if not member_id:
+                    logger.warning('[PERSON_GOVERNANCE] DENY relation_update name_only_match')
+                    return False
+                if member_id in old_ids:
+                    continue
+                target = intents.get(member_id)
+                if target is None or target.source_item_id != str(item_id):
+                    audit(target, 'relation_update', 'DENY', 'identity_missing')
+                    return False
+                matches = resolve_frozen_person_target(emby_server_url, emby_api_key, target)
+                current_person = get_emby_item_details(member_id, emby_server_url, emby_api_key, user_id)
+                denial = validate_person_write_target(target, current_person, matches)
+                if denial:
+                    audit(target, 'relation_update', 'DENY', denial)
+                    return False
+                if member.get('Name') != current_person.get('Name'):
+                    audit(target, 'relation_update', 'DENY', 'stale_person_display')
+                    return False
+                if not is_person_name_write_safe(emby_server_url, emby_api_key, current_person.get('Name'), member_id):
+                    audit(target, 'relation_update', 'DENY', 'person_name_collision_or_unknown')
+                    return False
         
         # 2. 合并新数据
         item_to_update = current_item_details.copy()
@@ -3235,9 +3409,18 @@ def upload_item_primary_image_from_url(
     base_url: str,
     api_key: str,
     max_bytes: int = 10 * 1024 * 1024,
+    *,
+    target=None,
+    user_id=None,
 ) -> bool:
     """Download a trusted Douban image and upload it as an Emby item avatar."""
     from services.actor_enrichment_safety import normalize_douban_avatar_url
+    from services.person_write_safety import (
+        ExactPersonTarget, identity_lock, validate_person_write_target, audit,
+    )
+    if not isinstance(target, ExactPersonTarget) or not user_id or str(item_id) != target.emby_person_id:
+        audit(target, 'person_image', 'DENY', 'identity_missing')
+        return False
 
     current_url = normalize_douban_avatar_url(image_url)
     if not item_id or not current_url or not base_url or not api_key:
@@ -3296,17 +3479,21 @@ def upload_item_primary_image_from_url(
 
     upload_url = f"{base_url.rstrip('/')}/Items/{item_id}/Images/Primary"
     try:
-        upload_response = emby_client.post(
-            upload_url,
-            headers={
-                'X-Emby-Token': api_key,
-                'Content-Type': content_type,
-            },
-            data=image_data,
-            timeout=60,
-        )
-        upload_response.raise_for_status()
-        return True
+        with identity_lock(base_url, target.provider_name, target.provider_person_id):
+            matches = resolve_frozen_person_target(base_url, api_key, target)
+            current = get_emby_item_details(item_id, base_url, api_key, user_id)
+            denial = validate_person_write_target(target, current, matches)
+            if denial:
+                audit(target, 'person_image', 'DENY', denial)
+                return False
+            upload_response = emby_client.post(
+                upload_url,
+                headers={'X-Emby-Token': api_key, 'Content-Type': content_type},
+                data=image_data, timeout=60,
+            )
+            upload_response.raise_for_status()
+            audit(target, 'person_image', 'ALLOW', 'exact_identity_verified')
+            return True
     except Exception as exc:
         logger.warning(f"上传 Emby 人物头像失败 (PersonID: {item_id}): {type(exc).__name__}")
         return False

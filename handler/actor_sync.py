@@ -7,6 +7,7 @@ import handler.emby as emby
 from database.actor_db import ActorDBManager
 from database import connection
 import logging
+from services.person_sync_safety import PersonEnumeration
 logger = logging.getLogger(__name__)
 
 class UnifiedSyncHandler:
@@ -20,11 +21,11 @@ class UnifiedSyncHandler:
         
     def sync_emby_person_map_to_db(self, update_status_callback: Optional[Callable] = None, stop_event: Optional[threading.Event] = None):
         """
-        【V4 - 增量更新与清理版】
-        - 同步 Emby 中的演员信息到本地数据库（添加与更新）。
-        - 新增清理功能：将在本地数据库中存在、但已从 Emby 中删除的演员记录的 emby_person_id 字段置为 NULL。
+        Additive identity synchronization. Absence is reported, never reconciled
+        destructively: a full API inventory alone is not a business protection
+        snapshot and does not authorize removing an existing mapping.
         """
-        logger.trace("  ➜ 开始执行演员数据双向同步任务 (Emby -> 本地数据库，并清理过时关联)")
+        logger.trace("  ➜ 开始增补人物映射 (Emby -> 本地数据库，缺失映射仅报告不解绑)")
         
         stats = {
             "total_from_emby": 0, "processed": 0, "db_inserted": 0, "db_updated": 0, 
@@ -49,9 +50,11 @@ class UnifiedSyncHandler:
                     emby_server_ids = set() # 用于存储从 Emby 服务器获取到的所有 ID
                     emby_config_for_upsert = {"url": self.emby_url, "api_key": self.emby_api_key, "user_id": self.emby_user_id}
 
+                    enumeration = PersonEnumeration()
                     person_generator = emby.get_all_persons_from_emby(
                         self.emby_url, self.emby_api_key, self.emby_user_id, stop_event,
-                        update_status_callback=update_status_callback
+                        update_status_callback=update_status_callback,
+                        enumeration=enumeration,
                     )
                     
                     for person_batch in person_generator:
@@ -89,14 +92,16 @@ class UnifiedSyncHandler:
                                 stats['errors'] += 1
                                 logger.error(f"处理演员 {person_name} (ID: {emby_pid}) 的 upsert 时失败: {e_upsert}")
 
-                    # --- 阶段三：计算差异并清理本地数据库中过时的 Emby ID 关联 ---
+                    # Even a complete enumeration is not permission to destroy
+                    # identity mappings. Keep missing identities for review.
                     ids_to_clean = local_emby_ids - emby_server_ids
                     if ids_to_clean:
-                        logger.info(f"  ➜ 发现 {len(ids_to_clean)} 个演员已从 Emby 中移除，正在清理本地关联...")
-                        if update_status_callback: update_status_callback(95, f"正在清理 {len(ids_to_clean)} 个关联...")
-                        
-                        cleaned_count = self.actor_db_manager.disassociate_emby_ids(cursor, ids_to_clean)
-                        stats['db_cleaned'] = cleaned_count
+                        logger.warning(
+                            '人物同步保留 %s 条未在本次结果中出现的映射；scope=%s complete=%s reason=%s，仅报告不解绑。',
+                            len(ids_to_clean), enumeration.scope.value,
+                            enumeration.complete, enumeration.error or 'business_review_required',
+                        )
+                        stats['missing_mapping_review_count'] = len(ids_to_clean)
                     else:
                         logger.info("  ➜ 未发现需要清理的 Emby 演员关联。")
 
@@ -118,5 +123,5 @@ class UnifiedSyncHandler:
         logger.info(f"  📊 : 新增 {stats['db_inserted']}, 更新 {stats['db_updated']}, 清理关联 {stats['db_cleaned']}.")
 
         if update_status_callback:
-            final_message = f"同步完成！新增 {stats['db_inserted']}, 更新 {stats['db_updated']}, 清理 {stats['db_cleaned']}。"
+            final_message = f"增补完成：新增 {stats['db_inserted']}, 更新 {stats['db_updated']}, 待复核缺失映射 {stats.get('missing_mapping_review_count', 0)}；未解绑映射。"
             update_status_callback(100, final_message)

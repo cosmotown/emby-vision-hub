@@ -38,6 +38,13 @@ from ai_translator import AITranslator
 from watchlist_processor import WatchlistProcessor
 from handler.douban import DoubanApi
 from services.emby_ingest import get_confirmed_media_items, refresh_and_verify_paths
+from services.person_write_safety import (
+    ExactPersonTarget, actor_cap, audit as person_write_audit,
+    select_person_candidates, series_main_cast, cap_episode_credits,
+    manual_person_target, validate_person_write_target,
+    restrict_series_cached_cast,
+    provider_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 try:
@@ -90,37 +97,8 @@ def _read_local_json(file_path: str) -> Optional[Dict[str, Any]]:
         return None
 
 def _aggregate_series_cast_from_tmdb_data(series_data: Dict[str, Any], all_episodes_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    【新】从内存中的TMDB数据聚合一个剧集的所有演员。
-    """
-    logger.debug(f"【演员聚合】开始为 '{series_data.get('name')}' 从内存中的TMDB数据聚合演员...")
-    aggregated_cast_map = {}
-
-    # 1. 优先处理主剧集的演员列表
-    main_cast = series_data.get("credits", {}).get("cast", [])
-    for actor in main_cast:
-        actor_id = actor.get("id")
-        if actor_id:
-            aggregated_cast_map[actor_id] = actor
-    logger.debug(f"  ➜ 从主剧集数据中加载了 {len(aggregated_cast_map)} 位主演员。")
-
-    # 2. 聚合所有分集的演员和客串演员
-    for episode_data in all_episodes_data:
-        credits_data = episode_data.get("credits", {})
-        actors_to_process = credits_data.get("cast", []) + credits_data.get("guest_stars", [])
-        
-        for actor in actors_to_process:
-            actor_id = actor.get("id")
-            if actor_id and actor_id not in aggregated_cast_map:
-                if 'order' not in actor:
-                    actor['order'] = 999  # 为客串演员设置高order值
-                aggregated_cast_map[actor_id] = actor
-
-    full_aggregated_cast = list(aggregated_cast_map.values())
-    full_aggregated_cast.sort(key=lambda x: x.get('order', 999))
-    
-    logger.info(f"  ➜ 共为 '{series_data.get('name')}' 聚合了 {len(full_aggregated_cast)} 位独立演员。")
-    return full_aggregated_cast
+    """Compatibility entry point: Series main cast only, never Episode guests."""
+    return series_main_cast(series_data)
 class MediaProcessor:
     def __init__(self, config: Dict[str, Any], ai_translator=None, douban_api=None):
         # ★★★ 然后，从这个 config 字典里，解析出所有需要的属性 ★★★
@@ -288,6 +266,15 @@ class MediaProcessor:
             main_json_filename = "all.json" if item_type == "Movie" else "series.json"
             main_json_path = os.path.join(base_override_dir, main_json_filename)
             file_exists = os.path.exists(main_json_path)
+            series_main_snapshot = None
+            if item_type == 'Series':
+                # DB/file caches from older releases may contain episode guests.
+                # One Series-level GET validates their scope before reuse.
+                series_main_snapshot = tmdb.get_tv_details(
+                    int(tmdb_id), self.tmdb_api_key, append_to_response='credits',
+                ) if self.tmdb_api_key else None
+                if not series_main_snapshot:
+                    raise ValueError('series_main_scope_unavailable')
 
             # 2. 数据库查询 (获取完整元数据 + 演员表)
             db_record = None
@@ -341,9 +328,11 @@ class MediaProcessor:
                             logger.warning(f"  ➜ [实时监控] 从数据库解析演员失败: {e}")
 
             # 3. 决策逻辑分支
+            if item_type == 'Series':
+                db_actors = restrict_series_cached_cast(db_actors, series_main_snapshot)
             
             # --- 分支 A: 数据库有，文件没有 -> 生成文件 (纸质存档缺失) ---
-            if db_record and not file_exists and db_actors:
+            if db_record and not file_exists and db_actors and item_type != 'Series':
                 logger.info(f"  ➜ [实时监控] 命中数据库缓存 (ID:{tmdb_id})，但覆盖缓存缺失。正在从数据库生成覆盖缓存文件...")
                 try:
                     # 1. 生成主 payload
@@ -425,6 +414,8 @@ class MediaProcessor:
                     if override_data:
                         # 提取演员
                         cast_data = (override_data.get('casts', {}) or override_data.get('credits', {})).get('cast', [])
+                        if item_type == 'Series':
+                            cast_data = restrict_series_cached_cast(cast_data, series_main_snapshot)
                         
                         # 构造伪造的 Emby 对象用于 upsert
                         fake_item_details = {
@@ -447,7 +438,7 @@ class MediaProcessor:
                             )
                             conn.commit()
                         
-                        should_skip_full_processing = True
+                        should_skip_full_processing = item_type != 'Series'
                         logger.info(f"  ➜ [实时监控] 数据库记录已补全。跳过在线刮削。")
                 except Exception as e:
                     logger.error(f"  ➜ [实时监控] 反哺数据库失败: {e}，将回退到在线刮削。")
@@ -460,7 +451,7 @@ class MediaProcessor:
                 else:
                      logger.info(f"  ➜ [实时监控] 数据双全且在线 (ID:{tmdb_id})。可能是洗版/追更，跳过元数据处理，仅通知 Emby 刷新。")
                 
-                should_skip_full_processing = True
+                should_skip_full_processing = item_type != 'Series'
 
             # --- 分支 D: 都没有 -> 继续后续的 TMDb 在线流程 ---
             else:
@@ -595,8 +586,7 @@ class MediaProcessor:
                         all_episodes = list(aggregated_tmdb_data.get("episodes_details", {}).values())
                         authoritative_cast_source = _aggregate_series_cast_from_tmdb_data(details, all_episodes)
                     else:
-                        credits_source = details.get('aggregate_credits') or details.get('credits') or {}
-                        authoritative_cast_source = credits_source.get('cast', [])
+                        authoritative_cast_source = series_main_cast(details)
 
                 with get_db_connection() as conn:
                     cursor = conn.cursor()
@@ -2046,12 +2036,13 @@ class MediaProcessor:
                         all_episodes = list(aggregated_tmdb_data.get("episodes_details", {}).values())
                         authoritative_cast_source = _aggregate_series_cast_from_tmdb_data(fresh_data, all_episodes)
                     else:
-                        credits_source = fresh_data.get('aggregate_credits') or fresh_data.get('credits') or {}
-                        authoritative_cast_source = credits_source.get('cast', [])
+                        authoritative_cast_source = series_main_cast(fresh_data)
 
             # =========================================================
             # ★★★ 步骤 2: 移除无头像演员 ★★★
             # =========================================================
+            if item_type == 'Series' and not fresh_data:
+                raise ValueError('series_main_scope_unavailable')
             if self.config.get(constants.CONFIG_OPTION_REMOVE_ACTORS_WITHOUT_AVATARS, True) and authoritative_cast_source:
                 original_count = len(authoritative_cast_source)
                 
@@ -2087,6 +2078,8 @@ class MediaProcessor:
                         override_data = _read_local_json(override_json_path)
                         if override_data:
                             cast_data = (override_data.get('casts', {}) or override_data.get('credits', {})).get('cast', [])
+                            if item_type == 'Series':
+                                cast_data = restrict_series_cached_cast(cast_data, fresh_data)
                             if cast_data:
                                 logger.info(f"  ➜ [快速模式] 成功从文件加载 {len(cast_data)} 位演员和元数据...")
                                 final_processed_cast = cast_data
@@ -2306,7 +2299,10 @@ class MediaProcessor:
                     cursor = conn.cursor()
                     
                     all_emby_people = item_details_from_emby.get("People", [])
-                    current_emby_cast_raw = [p for p in all_emby_people if p.get("Type") == "Actor"]
+                    current_emby_cast_raw = self._select_related_person_targets(
+                        [p for p in all_emby_people if p.get("Type") == "Actor"],
+                        authoritative_cast_source, item_type,
+                    )
                     emby_config = {"url": self.emby_url, "api_key": self.emby_api_key, "user_id": self.emby_user_id}
                     enriched_emby_cast = self.actor_db_manager.enrich_actors_with_provider_ids(cursor, current_emby_cast_raw, emby_config)
                     douban_cast_raw, _ = self._get_douban_data_with_local_cache(item_details_from_emby)
@@ -2348,13 +2344,15 @@ class MediaProcessor:
                     # 写入 override 文件
                     # 注意：sync_single_item_assets 内部已经有针对 episode_ids_to_sync 的优化，
                     # 它只会下载新分集的图片，并复制新分集的 JSON，不会重新下载全套图片。
-                    self.sync_single_item_assets(
+                    assets_synced = self.sync_single_item_assets(
                         item_id=item_id,
                         update_description="主流程处理完成" if not specific_episode_ids else f"追更: {len(specific_episode_ids)}个分集",
                         final_cast_override=final_processed_cast,
                         episode_ids_to_sync=specific_episode_ids,
                         metadata_override=tmdb_details_for_extra 
                     )
+                    if assets_synced is False:
+                        raise ValueError('person_metadata_gate_denied')
 
                     # 通知 Emby 刷新
                     logger.info(f"  ➜ 处理完成，正在通知 Emby 刷新...")
@@ -2577,6 +2575,43 @@ class MediaProcessor:
         return True
 
     # --- 核心处理器 ---
+    def _select_related_person_targets(self, people, provider_cast, item_type):
+        """Cheap batch identity resolution, then scope/order/cap before enrichment."""
+        current = emby.read_person_identity_batch(
+            self.emby_url, self.emby_api_key, [p.get('Id') for p in people],
+        )
+        if current is None:
+            raise ValueError('source_people_identity_batch_incomplete')
+        source_order = {str(actor.get('id')): actor.get('order', 999)
+                        for actor in provider_cast if actor.get('id')}
+        selected = []
+        seen = set()
+        for member in people:
+            person = current.get(str(member.get('Id') or ''))
+            if not person:
+                raise ValueError('source_people_identity_batch_incomplete')
+            try:
+                snapshot = provider_snapshot(person)
+            except ValueError:
+                continue
+            pairs = dict(snapshot)
+            if item_type == 'Series' and pairs.get('tmdb') not in source_order:
+                continue
+            identity = snapshot
+            if identity in seen:
+                continue
+            seen.add(identity)
+            order = source_order.get(pairs.get('tmdb'), 999)
+            if not isinstance(order, (int, float)):
+                order = 999
+            selected.append((order, snapshot, str(person['Id']), {
+                **member, 'ProviderIds': person['ProviderIds'], 'Name': person.get('Name'),
+            }))
+        selected.sort(key=lambda entry: entry[:3])
+        return [entry[3] for entry in selected[:actor_cap(
+            self.config.get(constants.CONFIG_OPTION_MAX_ACTORS_TO_PROCESS, 50)
+        )]]
+
     def _process_cast_list(self, tmdb_cast_people: List[Dict[str, Any]],
                                     emby_cast_people: List[Dict[str, Any]],
                                     douban_cast_list: List[Dict[str, Any]],
@@ -2591,6 +2626,29 @@ class MediaProcessor:
         """
         # --- 在所有处理开始前，仅按 TMDb 身份去重；同名异人必须保留 ---
         logger.debug("  ➜ 预处理：按 TMDb Person ID 清洗重复演员，保留同名异人。")
+        limit = actor_cap(self.config.get(constants.CONFIG_OPTION_MAX_ACTORS_TO_PROCESS, 50))
+        direct_ids = [
+            (p.get('ProviderIds') or {}).get('Tmdb') for p in emby_cast_people
+            if isinstance(p, dict)
+        ]
+        # Freeze the processing budget before remote identity/avatar enrichment.
+        tmdb_cast_people = select_person_candidates(tmdb_cast_people, limit, direct_ids)
+        frozen_name_targets = {}
+        source_id = str(item_details_from_emby.get('Id') or '')
+        if source_id and source_id != 'pending':
+            # Freeze object/provider evidence before enrichment and translation.
+            for actor in tmdb_cast_people:
+                matches = emby.resolve_exact_person_identity(
+                    self.emby_url, self.emby_api_key, 'tmdb', actor['id'],
+                )
+                if matches is None or len(matches) != 1:
+                    continue
+                try:
+                    frozen_name_targets[str(actor['id'])] = ExactPersonTarget.from_person(
+                        matches[0], source_id, item_details_from_emby.get('Type'),
+                    )
+                except ValueError:
+                    continue
         cleaned_tmdb_cast = []
         seen_tmdb_person_ids = set()
         
@@ -2669,6 +2727,20 @@ class MediaProcessor:
         # 步骤 2: ★★★ “一对一匹配”逻辑 ★★★
         # ======================================================================
         douban_candidates = actor_utils.format_douban_cast(douban_cast_list)
+        # Enrich selected TMDb identities; only unused slots may admit additional
+        # exact Douban identities. A cap is never a target to fill by searching.
+        known_douban = [a for a in douban_candidates
+                        if str(a.get('TmdbPersonId') or '') in original_tmdb_ids]
+        additional_douban = select_person_candidates(
+            [dict(a, douban_id=a.get('DoubanCelebrityId'), order=a.get('DoubanOrder', 999))
+             for a in douban_candidates if a not in known_douban],
+            max(1, limit - len(tmdb_cast_people)),
+        ) if len(tmdb_cast_people) < limit else []
+        douban_candidates = known_douban + additional_douban
+        if item_details_from_emby.get('Type') == 'Series':
+            # Title-wide Douban cast has no episode/main scope proof. Only
+            # enrich provider-confirmed Series main cast; do not add guests.
+            douban_candidates = known_douban
         unmatched_local_actors = list(final_cast_list)
         merged_actors = []
         unmatched_douban_actors = []
@@ -2878,24 +2950,7 @@ class MediaProcessor:
                                     )
                                 )
                                 resolution_status = candidate_resolution.get("status")
-                                resolved_tmdb_id = str(
-                                    candidate_resolution.get("tmdb_id") or ""
-                                ).strip()
-                                if (
-                                    profiles_complete
-                                    and resolution_status == "confirmed"
-                                    and resolved_tmdb_id in final_cast_map
-                                ):
-                                    merge_confirmed_douban_actor(
-                                        final_cast_map[resolved_tmdb_id],
-                                        d_actor,
-                                    )
-                                    match_found = True
-                                    logger.info(
-                                        f"    ├─ 双信号确认: 豆瓣演员 '{d_actor.get('Name')}' "
-                                        "与当前 TMDb 演员的别名及生日一致，已合并身份。"
-                                    )
-                                elif profiles_complete and resolution_status == "no_candidate":
+                                if profiles_complete and resolution_status == "no_candidate":
                                     identity_checked_without_bridge = True
                                 else:
                                     logger.warning(
@@ -3138,17 +3193,13 @@ class MediaProcessor:
         # ======================================================================
         # 步骤 6：智能截断逻辑 (Smart Truncation) ★★★
         # ======================================================================
-        max_actors = self.config.get(constants.CONFIG_OPTION_MAX_ACTORS_TO_PROCESS, 30)
-        try:
-            limit = int(max_actors)
-            if limit <= 0: limit = 30
-        except (ValueError, TypeError):
-            limit = 30
+        limit = actor_cap(self.config.get(constants.CONFIG_OPTION_MAX_ACTORS_TO_PROCESS, 50))
 
         original_count = len(current_cast_list)
-        current_cast_list = actor_utils.select_cast_by_source_order(
+        current_cast_list = select_person_candidates(
             current_cast_list,
             limit,
+            direct_ids,
         )
         if original_count > limit:
             logger.info(
@@ -3285,6 +3336,8 @@ class MediaProcessor:
             if tmdb_id_str in tmdb_to_emby_id_map:
                 actor["emby_person_id"] = tmdb_to_emby_id_map[tmdb_id_str]
         for actor in final_cast_perfect:
+            if str(actor.get('id') or '') in frozen_name_targets:
+                actor['_person_write_target'] = frozen_name_targets[str(actor['id'])]
             actor["provider_ids"] = {
                 key: value
                 for key, value in {
@@ -3321,291 +3374,102 @@ class MediaProcessor:
 
         return final_cast_perfect
 
-    def _sync_douban_only_cast_to_emby(
-        self,
-        item_id: str,
-        final_cast: List[Dict[str, Any]],
-        cursor: psycopg2.extensions.cursor,
-    ) -> int:
-        """Provision and attach Douban-only people, accepting only verified identities."""
-        candidates = [
-            actor for actor in final_cast
-            if not actor.get('id')
-            and actor.get('douban_id')
-            and actor.get('profile_path')
-        ]
-        if not candidates or not item_id or item_id == 'pending':
+    def _sync_douban_only_cast_to_emby(self, item_id, final_cast, cursor) -> int:
+        """Reuse exact existing people; quarantine unsupported name-only creation.
+
+        Emby's People-by-name creation provides neither an exact create result
+        nor ownership/CAS. Never create a temporary-name Person or detach on
+        failure. This deliberately blocks new Douban-only provisioning until a
+        provider-identity preserving create protocol is available.
+        """
+        from services.person_write_safety import (
+            identity_lock, PersonOperationJournal, validate_person_write_target,
+        )
+        if not item_id or item_id == 'pending':
             return 0
-
-        def detach_unverified_temporary_person(person_id: str, temporary_name: str) -> None:
-            item_details = emby.get_emby_item_details(
-                item_id, self.emby_url, self.emby_api_key, self.emby_user_id
-            )
-            if not item_details:
-                return
-            people = list(item_details.get('People') or [])
-            cleaned_people = [
-                person for person in people
-                if not (
-                    str(person.get('Id') or '').strip() == person_id
-                    or (
-                        not person_id
-                        and str(person.get('Name') or '') == temporary_name
-                    )
-                )
-            ]
-            if len(cleaned_people) != len(people):
-                emby.update_emby_item_details(
-                    item_id,
-                    {'People': cleaned_people},
-                    self.emby_url,
-                    self.emby_api_key,
-                    self.emby_user_id,
-                )
-
-        synced_count = 0
+        synced = 0
+        candidates = select_person_candidates(
+            [a for a in final_cast if not a.get('id') and a.get('douban_id')],
+            actor_cap(self.config.get(constants.CONFIG_OPTION_MAX_ACTORS_TO_PROCESS, 50)),
+        )
         for actor in candidates:
-            douban_id = str(actor.get('douban_id') or '').strip()
-            desired_name = str(actor.get('name') or '').strip()
-            desired_role = str(actor.get('character') or '演员').strip() or '演员'
-            if not douban_id or not desired_name:
-                continue
-
-            identity_entry = self.actor_db_manager.find_person_by_any_id(
-                cursor, douban_id=douban_id
-            )
-            if identity_entry and identity_entry.get('tmdb_person_id'):
-                logger.warning(
-                    f"  ➜ Douban {douban_id} 已绑定 TMDb 身份，拒绝按豆瓣独立人物入库。"
-                )
-                continue
-
-            provider_matches = emby.get_people_by_provider_ids(
-                self.emby_url,
-                self.emby_api_key,
-                [f"douban.{douban_id}"],
-                limit=10,
-            )
-            if provider_matches is None:
-                continue
-            provider_match_ids = {
-                str(person.get('Id') or '').strip()
-                for person in provider_matches
-                if str(person.get('Id') or '').strip()
-            }
-            if len(provider_match_ids) > 1:
-                logger.error(
-                    f"  ➜ Douban {douban_id} 在 Emby 中命中多个人物，拒绝自动入库。"
-                )
-                continue
-
-            mapped_emby_id = str(
-                (identity_entry or {}).get('emby_person_id') or ''
-            ).strip()
-            provider_emby_id = next(iter(provider_match_ids), '')
-            if mapped_emby_id and provider_emby_id and mapped_emby_id != provider_emby_id:
-                logger.error(
-                    f"  ➜ Douban {douban_id} 的本地映射与 Emby 外部身份冲突，已跳过。"
-                )
-                continue
-
-            person_id = provider_emby_id or mapped_emby_id
-            person_details = None
-            if person_id:
-                person_details = emby.get_emby_item_details(
-                    person_id,
-                    self.emby_url,
-                    self.emby_api_key,
-                    self.emby_user_id,
-                    fields="Name,ProviderIds,ImageTags",
-                    silent_404=True,
-                )
-                if not person_details:
-                    person_id = ''
-                else:
-                    existing_douban_id = str(
-                        (person_details.get('ProviderIds') or {}).get('Douban') or ''
-                    ).strip()
-                    if existing_douban_id and existing_douban_id != douban_id:
-                        logger.error(
-                            f"  ➜ Emby Person {person_id} 已绑定其他 Douban ID，已跳过。"
-                        )
+            identity = str(actor['douban_id'])
+            target = None
+            try:
+                with identity_lock(self.emby_url, 'douban', identity):
+                    journal = PersonOperationJournal(self.emby_url, 'douban', identity)
+                    target = ExactPersonTarget.for_intent(
+                        'douban', identity, item_id, 'Media', actor.get('name'), journal.operation_id,
+                    )
+                    prior = journal.read()
+                    if prior and prior.get('failure_stage') != 'complete':
+                        person_write_audit(target, 'QUARANTINE', 'DENY', 'operation_requires_review')
                         continue
-
-            created_here = False
-            if not person_id:
-                temporary_name = f"__ETK_DOUBAN_{douban_id}__"
-                item_details = emby.get_emby_item_details(
-                    item_id, self.emby_url, self.emby_api_key, self.emby_user_id
-                )
-                if not item_details:
-                    continue
-                people = list(item_details.get('People') or [])
-                if not any(str(person.get('Name') or '') == temporary_name for person in people):
-                    people.append({
-                        'Name': temporary_name,
-                        'Role': desired_role,
-                        'Type': 'Actor',
+                    matches = emby.resolve_exact_person_identity(
+                        self.emby_url, self.emby_api_key, 'douban', identity,
+                    )
+                    if matches is None or len(matches) != 1:
+                        reason = ('identity_unavailable' if matches is None else
+                                  'identity_ambiguous' if matches else 'name_only_create_blocked')
+                        journal.record(item_id, reason)
+                        person_write_audit(target, 'QUARANTINE', 'DENY', reason)
+                        continue
+                    person = matches[0]
+                    target = ExactPersonTarget.from_person(person, item_id, 'Media', journal.operation_id)
+                    matches = emby.resolve_frozen_person_target(self.emby_url, self.emby_api_key, target)
+                    current_person = emby.get_emby_item_details(
+                        target.emby_person_id, self.emby_url, self.emby_api_key, self.emby_user_id,
+                    )
+                    denial = validate_person_write_target(target, current_person, matches)
+                    if denial:
+                        journal.record(item_id, denial, target.emby_person_id)
+                        person_write_audit(target, 'SKIP', 'DENY', denial)
+                        continue
+                    media = emby.get_emby_item_details(
+                        item_id, self.emby_url, self.emby_api_key, self.emby_user_id,
+                    )
+                    if not media or media.get('Type') not in {'Movie', 'Series', 'Episode'}:
+                        journal.record(item_id, 'source_item_unavailable', target.emby_person_id)
+                        continue
+                    people = copy.deepcopy(media.get('People'))
+                    if not isinstance(people, list):
+                        journal.record(item_id, 'source_people_unavailable', target.emby_person_id)
+                        continue
+                    if not any(str(p.get('Id')) == target.emby_person_id for p in people):
+                        # Keep every existing relation. Never revert an old People
+                        # snapshot or remove the last association after a failure.
+                        people.append({'Id': target.emby_person_id, 'Name': current_person['Name'],
+                                       'Type': 'Actor', 'Role': str(actor.get('character') or ''),
+                                       'ProviderIds': dict(current_person['ProviderIds'])})
+                        journal.record(item_id, 'association_reserved', target.emby_person_id)
+                        if not emby.update_emby_item_details(
+                            item_id, {'People': people}, self.emby_url, self.emby_api_key, self.emby_user_id,
+                            person_targets=(target,),
+                        ):
+                            journal.record(item_id, 'association_result_unknown', target.emby_person_id)
+                            continue
+                    check = emby.get_emby_item_details(
+                        item_id, self.emby_url, self.emby_api_key, self.emby_user_id,
+                    )
+                    if not any(str(p.get('Id')) == target.emby_person_id
+                               for p in (check or {}).get('People', [])):
+                        journal.record(item_id, 'association_not_verified', target.emby_person_id)
+                        continue
+                    actor['emby_person_id'] = target.emby_person_id
+                    journal.record(item_id, 'mapping_pending', target.emby_person_id)
+                    map_id, action = self.actor_db_manager.upsert_person(cursor, actor, {
+                        'url': self.emby_url, 'api_key': self.emby_api_key, 'user_id': self.emby_user_id,
                     })
-                    if not emby.update_emby_item_details(
-                        item_id,
-                        {'People': people},
-                        self.emby_url,
-                        self.emby_api_key,
-                        self.emby_user_id,
-                    ):
+                    if map_id <= 0 or action in {'ERROR', 'CONFLICT_ERROR', 'SKIPPED'}:
+                        journal.record(item_id, 'mapping_not_verified', target.emby_person_id)
                         continue
-
-                temporary_matches = []
-                for attempt in range(3):
-                    refreshed_item = emby.get_emby_item_details(
-                        item_id, self.emby_url, self.emby_api_key, self.emby_user_id
-                    )
-                    temporary_matches = [
-                        person for person in (refreshed_item or {}).get('People', [])
-                        if str(person.get('Name') or '') == temporary_name
-                        and str(person.get('Id') or '').strip()
-                    ]
-                    if len(temporary_matches) == 1:
-                        break
-                    if attempt < 2:
-                        time_module.sleep(0.4)
-                if len(temporary_matches) != 1:
-                    logger.error(
-                        f"  ➜ 未能唯一确认 Douban {douban_id} 的临时 Emby Person，已跳过。"
-                    )
-                    detach_unverified_temporary_person('', temporary_name)
-                    continue
-                person_id = str(temporary_matches[0]['Id'])
-                person_details = emby.get_emby_item_details(
-                    person_id,
-                    self.emby_url,
-                    self.emby_api_key,
-                    self.emby_user_id,
-                    fields="Name,ProviderIds,ImageTags",
-                )
-                if not person_details:
-                    detach_unverified_temporary_person(person_id, temporary_name)
-                    continue
-                provider_ids = dict(person_details.get('ProviderIds') or {})
-                provider_ids['Douban'] = douban_id
-                if not emby.update_person_details(
-                    person_id,
-                    {'Name': desired_name, 'ProviderIds': provider_ids},
-                    self.emby_url,
-                    self.emby_api_key,
-                    self.emby_user_id,
-                ):
-                    detach_unverified_temporary_person(person_id, temporary_name)
-                    continue
-                created_here = True
-            else:
-                provider_ids = dict((person_details or {}).get('ProviderIds') or {})
-                if not provider_ids.get('Douban'):
-                    provider_ids['Douban'] = douban_id
-                    if not emby.update_person_details(
-                        person_id,
-                        {'ProviderIds': provider_ids},
-                        self.emby_url,
-                        self.emby_api_key,
-                        self.emby_user_id,
-                    ):
-                        continue
-
-            verified_person = emby.get_emby_item_details(
-                person_id,
-                self.emby_url,
-                self.emby_api_key,
-                self.emby_user_id,
-                fields="Name,ProviderIds,ImageTags",
-            )
-            if str(
-                ((verified_person or {}).get('ProviderIds') or {}).get('Douban') or ''
-            ).strip() != douban_id:
-                logger.error(
-                    f"  ➜ Douban {douban_id} 写入 Emby Person 后复核失败，已停止挂载。"
-                )
-                if created_here:
-                    detach_unverified_temporary_person(
-                        person_id, f"__ETK_DOUBAN_{douban_id}__"
-                    )
-                continue
-
-            item_details = emby.get_emby_item_details(
-                item_id, self.emby_url, self.emby_api_key, self.emby_user_id
-            )
-            if not item_details:
-                continue
-            original_people = copy.deepcopy(list(item_details.get('People') or []))
-            people = copy.deepcopy(original_people)
-            attached = False
-            for person in people:
-                if str(person.get('Id') or '').strip() == person_id:
-                    person['Role'] = desired_role
-                    person['Type'] = 'Actor'
-                    attached = True
-                    break
-            if not attached:
-                people.append({
-                    'Id': person_id,
-                    'Name': str((verified_person or {}).get('Name') or desired_name),
-                    'Role': desired_role,
-                    'Type': 'Actor',
-                })
-            if not emby.update_emby_item_details(
-                item_id,
-                {'People': people},
-                self.emby_url,
-                self.emby_api_key,
-                self.emby_user_id,
-            ):
-                continue
-
-            attached_item = emby.get_emby_item_details(
-                item_id, self.emby_url, self.emby_api_key, self.emby_user_id
-            )
-            if not any(
-                str(person.get('Id') or '').strip() == person_id
-                for person in (attached_item or {}).get('People', [])
-            ):
-                logger.error(
-                    f"  ➜ Emby 未确认挂载 Person {person_id}，不写入本地身份映射。"
-                )
-                emby.update_emby_item_details(
-                    item_id,
-                    {'People': original_people},
-                    self.emby_url,
-                    self.emby_api_key,
-                    self.emby_user_id,
-                )
-                continue
-
-            if created_here and not (verified_person or {}).get('ImageTags'):
-                emby.upload_item_primary_image_from_url(
-                    person_id,
-                    actor.get('profile_path'),
-                    self.emby_url,
-                    self.emby_api_key,
-                )
-
-            actor['emby_person_id'] = person_id
-            map_id, action = self.actor_db_manager.upsert_person(
-                cursor,
-                actor,
-                {
-                    'url': self.emby_url,
-                    'api_key': self.emby_api_key,
-                    'user_id': self.emby_user_id,
-                },
-            )
-            if map_id > 0 and action not in {'ERROR', 'CONFLICT_ERROR', 'SKIPPED'}:
-                synced_count += 1
-
-        if synced_count:
-            logger.info(
-                f"  ➜ 已按 Douban Celebrity ID 创建/复用并复核 {synced_count} 位 Emby 演员。"
-            )
-        return synced_count
+                    journal.record(item_id, 'complete', target.emby_person_id)
+                    person_write_audit(target, 'UPDATE', 'ALLOW', 'exact_existing_relation_verified')
+                    synced += 1
+            except Exception:
+                # Reserved records survive process death; no unsafe compensation.
+                person_write_audit(target, 'QUARANTINE', 'DENY', 'operation_failed')
+        return synced
     
     # --- 一键翻译 ---
     def translate_cast_list_for_editing(self, 
@@ -3737,16 +3601,40 @@ class MediaProcessor:
         logger.info(f"  ➜ 手动处理流程启动：ItemID: {item_id} ('{item_name}')")
         
         try:
+            if len(manual_cast_list) > actor_cap(
+                self.config.get(constants.CONFIG_OPTION_MAX_ACTORS_TO_PROCESS, 50)
+            ):
+                raise ValueError('actor_limit_exceeded')
             item_details = emby.get_emby_item_details(item_id, self.emby_url, self.emby_api_key, self.emby_user_id)
             if not item_details: raise ValueError(f"无法获取项目 {item_id} 的详情。")
             
             raw_emby_actors = [p for p in item_details.get("People", []) if p.get("Type") == "Actor"]
+            frozen_manual_targets = {}
+            for actor in manual_cast_list:
+                target = manual_person_target(actor, item_id, item_details.get('Type'))
+                # An unrelated object cannot be substituted into this editor.
+                if not any(str(p.get('Id')) == target.emby_person_id for p in raw_emby_actors):
+                    raise ValueError('stale_emby_mapping')
+                current = emby.get_emby_item_details(
+                    target.emby_person_id, self.emby_url, self.emby_api_key, self.emby_user_id,
+                )
+                matches = emby.resolve_frozen_person_target(self.emby_url, self.emby_api_key, target)
+                denial = validate_person_write_target(target, current, matches)
+                if denial:
+                    person_write_audit(target, 'manual_edit', 'DENY', denial)
+                    raise ValueError(denial)
+                frozen_manual_targets[target.emby_person_id] = target
             emby_config = {"url": self.emby_url, "api_key": self.emby_api_key, "user_id": self.emby_user_id}
 
             # ★★★ 核心修改: 在所有操作开始前，一次性获取所有 enriched_actors ★★★
             with get_central_db_connection() as conn:
                 cursor = conn.cursor()
-                enriched_actors = self.actor_db_manager.enrich_actors_with_provider_ids(cursor, raw_emby_actors, emby_config)
+                enriched_actors = self.actor_db_manager.enrich_actors_with_provider_ids(
+                    cursor,
+                    [person for person in raw_emby_actors
+                     if str(person.get('Id') or '') in frozen_manual_targets],
+                    emby_config,
+                )
 
             # ======================================================================
             # 步骤 1: 数据准备与定位 (现在只负责构建映射)
@@ -3839,38 +3727,18 @@ class MediaProcessor:
             # 步骤 3: API前置操作 (更新演员名)
             # ======================================================================
             logger.info(f"  ➜ 手动处理：步骤 3/6: 通过API更新现有演员的名字...")
-            # 构建 TMDb ID -> Emby Person ID 和 Emby Person ID -> 当前名字的映射
-            emby_id_to_name_map = {}
-            for person in enriched_actors: # ★★★ 直接使用 enriched_actors
-                person_emby_id = person.get("Id")
-                if person_emby_id:
-                    emby_id_to_name_map[person_emby_id] = person.get("Name")
-            
-            tmdb_to_emby_map = {}
-            emby_id_to_name_map = {}
-            for person in enriched_actors:
-                person_tmdb_id = (person.get("ProviderIds") or {}).get("Tmdb")
-                person_emby_id = person.get("Id")
-                if person_tmdb_id and person_emby_id:
-                    tmdb_to_emby_map[str(person_tmdb_id)] = person_emby_id
-                    emby_id_to_name_map[person_emby_id] = person.get("Name")
-
             updated_names_count = 0
             for actor_from_frontend in manual_cast_list:
-                tmdb_id_str = str(actor_from_frontend.get("tmdbId"))
-                
-                # 只处理在映射中能找到的、已存在的演员
-                actor_emby_id = tmdb_to_emby_map.get(tmdb_id_str)
-                if not actor_emby_id: continue
-
-                new_name = actor_from_frontend.get("name")
-                original_name = emby_id_to_name_map.get(actor_emby_id)
-                
-                if new_name and original_name and new_name != original_name:
-                    emby.update_person_details(
-                        person_id=actor_emby_id, new_data={"Name": new_name},
-                        emby_server_url=self.emby_url, emby_api_key=self.emby_api_key, user_id=self.emby_user_id
-                    )
+                actor_emby_id = str(actor_from_frontend.get('emby_person_id') or '')
+                target = frozen_manual_targets[actor_emby_id]
+                new_name = actor_from_frontend.get('name')
+                if new_name:
+                    if not emby.update_person_details(
+                        person_id=actor_emby_id, new_data={'Name': new_name},
+                        emby_server_url=self.emby_url, emby_api_key=self.emby_api_key,
+                        user_id=self.emby_user_id, target=target,
+                    ):
+                        raise ValueError('manual_person_write_denied')
                     updated_names_count += 1
             
             if updated_names_count > 0:
@@ -3962,6 +3830,7 @@ class MediaProcessor:
                 new_cast_built, is_animation, self.config, mode='manual'
             )
             # _build_cast_from_final_data 确保了所有字段都存在，即使是None
+            final_formatted_cast = self._prepare_person_metadata_cast(final_formatted_cast, item_details)
             final_cast_for_json = self._build_cast_from_final_data(final_formatted_cast)
 
             if 'casts' in data:
@@ -4065,6 +3934,16 @@ class MediaProcessor:
                 override_data = json.load(f)
             
             cast_from_override = (override_data.get('casts', {}) or override_data.get('credits', {})).get('cast', [])
+            if item_type == 'Series':
+                main_scope = tmdb.get_tv_details(
+                    int(tmdb_id), self.tmdb_api_key, append_to_response='credits',
+                ) if self.tmdb_api_key else None
+                if not main_scope:
+                    raise ValueError('series_main_scope_unavailable')
+                cast_from_override = restrict_series_cached_cast(cast_from_override, main_scope)
+            cast_from_override = select_person_candidates(
+                cast_from_override, actor_cap(self.config.get(constants.CONFIG_OPTION_MAX_ACTORS_TO_PROCESS, 50)),
+            )
             logger.debug(f"  ➜ 成功从 override 文件为 '{item_name_for_log}' 加载了 {len(cast_from_override)} 位演员。")
 
             # 步骤 3: 构建 TMDb ID -> emby_person_id 的映射
@@ -4084,7 +3963,30 @@ class MediaProcessor:
                     actor_tmdb_id = actor_data.get('id')
                     if not actor_tmdb_id: continue
                     
-                    emby_person_id = tmdb_to_emby_map.get(str(actor_tmdb_id))
+                    exact_matches = emby.resolve_exact_person_identity(
+                        self.emby_url, self.emby_api_key, 'tmdb', actor_tmdb_id,
+                    )
+                    source_ids = {str(p.get('Id')) for p in emby_details.get('People', []) if p.get('Id')}
+                    emby_person_id = (
+                        str(exact_matches[0]['Id'])
+                        if exact_matches is not None and len(exact_matches) == 1
+                        and str(exact_matches[0]['Id']) in source_ids else None
+                    )
+                    provider_identity_snapshot = None
+                    if emby_person_id:
+                        exact_person = emby.get_emby_item_details(
+                            emby_person_id, self.emby_url, self.emby_api_key, self.emby_user_id,
+                        )
+                        try:
+                            frozen = ExactPersonTarget.from_person(exact_person, item_id, item_type)
+                            if ('tmdb', str(actor_tmdb_id)) not in frozen.provider_ids:
+                                raise ValueError('stale_emby_mapping')
+                            matches = emby.resolve_frozen_person_target(self.emby_url, self.emby_api_key, frozen)
+                            if validate_person_write_target(frozen, exact_person, matches):
+                                raise ValueError('identity_ambiguous')
+                            provider_identity_snapshot = dict(frozen.provider_ids)
+                        except ValueError:
+                            emby_person_id = None
                     
                     # 从本地数据库获取头像
                     image_url = None
@@ -4109,7 +4011,8 @@ class MediaProcessor:
                         "name": actor_data.get('name'),
                         "role": cleaned_role_for_display,
                         "imageUrl": image_url,
-                        "emby_person_id": emby_person_id
+                        "emby_person_id": emby_person_id,
+                        "provider_identity_snapshot": provider_identity_snapshot,
                     })
                     
             # 步骤 5: 缓存会话数据并准备最终响应
@@ -4197,9 +4100,11 @@ class MediaProcessor:
                 conn.commit()
             
             logger.trace(f"--- {log_prefix} 成功完成 (ItemID: {item_id}) ---")
+            return True
 
         except Exception as e:
             logger.error(f"{log_prefix} 执行时发生错误 (ItemID: {item_id}): {e}", exc_info=True)
+            return False
 
     # --- 备份图片 ---
     def sync_item_images(self, item_details: Dict[str, Any], update_description: Optional[str] = None, episode_ids_to_sync: Optional[List[str]] = None) -> bool:
@@ -4496,6 +4401,25 @@ class MediaProcessor:
         target_override_dir = os.path.join(self.local_data_path, "override", cache_folder_name, tmdb_id)
         main_json_filename = "all.json" if item_type == "Movie" else "series.json"
         main_json_path = os.path.join(target_override_dir, main_json_filename)
+        # Every path, including asset-only refresh and old file caches, must
+        # cross the same actor-bearing file gate before changing the file.
+        if final_cast_override is None:
+            previous = _read_local_json(main_json_path) if os.path.exists(main_json_path) else {}
+            raw = metadata_override or previous or {}
+            final_cast_override = (raw.get('casts') or raw.get('credits') or {}).get('cast', [])
+        if item_type == 'Series':
+            scope = tmdb.get_tv_details(
+                int(tmdb_id), self.tmdb_api_key, append_to_response='credits',
+            ) if self.tmdb_api_key else None
+            if not scope:
+                raise ValueError('series_main_scope_unavailable')
+            final_cast_override = restrict_series_cached_cast(final_cast_override, scope)
+        final_cast_override = self._prepare_person_metadata_cast(final_cast_override, item_details)
+        existing_crew = self._prepare_existing_person_crew(item_details)
+        safe_crew = [
+            {key: member[key] for key in ('id', 'name', 'job', 'department')}
+            for member in existing_crew
+        ]
 
         # 确保目标目录存在
         os.makedirs(target_override_dir, exist_ok=True)
@@ -4691,6 +4615,18 @@ class MediaProcessor:
                     del data_to_write[k]
 
             # 3. 写入净化后的数据
+            safe_cast = self._build_cast_from_final_data(final_cast_override)
+            data_to_write['created_by'] = [
+                {'id': member['id'], 'name': member['name']} for member in existing_crew
+                if member['job'] == 'Director'
+            ]
+            data_to_write.pop('guest_stars', None)
+            for node in ('credits', 'casts', 'aggregate_credits'):
+                if isinstance(data_to_write.get(node), dict):
+                    data_to_write[node]['cast'] = safe_cast
+                    data_to_write[node]['crew'] = safe_crew
+                    data_to_write[node].pop('guest_stars', None)
+            self._revalidate_person_metadata_batch(final_cast_override + existing_crew, item_details)
             with open(main_json_path, 'w', encoding='utf-8') as f:
                 json.dump(data_to_write, f, ensure_ascii=False, indent=2)
 
@@ -4709,7 +4645,18 @@ class MediaProcessor:
 
             if 'casts' in data: data['casts']['cast'] = perfect_cast_for_injection
             else: data.setdefault('credits', {})['cast'] = perfect_cast_for_injection
+            for node in ('credits', 'casts', 'aggregate_credits'):
+                if isinstance(data.get(node), dict):
+                    data[node]['cast'] = perfect_cast_for_injection
+                    data[node]['crew'] = safe_crew
+                    data[node].pop('guest_stars', None)
+            data['created_by'] = [
+                {'id': member['id'], 'name': member['name']} for member in existing_crew
+                if member['job'] == 'Director'
+            ]
+            data.pop('guest_stars', None)
             
+            self._revalidate_person_metadata_batch(final_cast_override + existing_crew, item_details)
             with open(main_json_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         else:
@@ -4731,6 +4678,185 @@ class MediaProcessor:
             )
 
     # --- 辅助函数：从不同数据源构建演员列表 ---
+    def _revalidate_person_metadata_batch(self, members, source):
+        """Last check before a file can become an external Person write input."""
+        for member in members:
+            frozen = ExactPersonTarget.from_person({
+                'Id': member.get('emby_person_id'), 'Type': 'Person',
+                'ProviderIds': member.get('_person_provider_snapshot'),
+                'Name': member.get('name'),
+            }, source.get('Id'), source.get('Type'))
+            matches = emby.resolve_frozen_person_target(self.emby_url, self.emby_api_key, frozen)
+            current = emby.get_emby_item_details(
+                frozen.emby_person_id, self.emby_url, self.emby_api_key, self.emby_user_id,
+            )
+            denial = validate_person_write_target(frozen, current, matches)
+            if denial:
+                person_write_audit(frozen, 'metadata_file', 'DENY', denial)
+                raise ValueError(denial)
+            if current.get('Name') != member.get('name'):
+                # Display drift does not redefine identity; stale text must
+                # nevertheless not trigger the server's name-based creation.
+                raise ValueError('metadata_display_drift')
+            if not emby.is_person_name_write_safe(
+                self.emby_url, self.emby_api_key, current.get('Name'), frozen.emby_person_id,
+            ):
+                raise ValueError('person_name_collision_or_unknown')
+
+    def _prepare_existing_person_crew(self, item_details):
+        """Keep exact existing crew; raw provider crew cannot create new Persons."""
+        source_id = str(item_details.get('Id') or '')
+        if not source_id or source_id == 'pending':
+            return []
+        source = emby.get_emby_item_details(
+            source_id, self.emby_url, self.emby_api_key, self.emby_user_id,
+        )
+        if not source or not isinstance(source.get('People'), list):
+            raise ValueError('source_people_unavailable')
+        if source.get('Type') not in {'Movie', 'Series', 'Season', 'Episode'} or source.get('Type') != item_details.get('Type'):
+            raise ValueError('source_item_type_changed')
+        crew = [p for p in source['People'] if p.get('Type') not in {None, 'Actor'}]
+        if len(crew) > actor_cap(self.config.get(constants.CONFIG_OPTION_MAX_ACTORS_TO_PROCESS, 50)):
+            raise ValueError('legacy_relation_set_exceeds_processing_cap')
+        result = []
+        for member in crew:
+            current = emby.get_emby_item_details(
+                member.get('Id'), self.emby_url, self.emby_api_key, self.emby_user_id,
+            )
+            target = ExactPersonTarget.from_person(current, source_id, source.get('Type'))
+            matches = emby.resolve_frozen_person_target(self.emby_url, self.emby_api_key, target)
+            denial = validate_person_write_target(target, current, matches)
+            if denial or target.provider_name != 'tmdb':
+                raise ValueError(denial or 'unsupported_existing_provider_relation')
+            result.append({'id': target.provider_person_id, 'name': current['Name'],
+                           'job': member['Type'], 'department': member['Type'],
+                           'emby_person_id': target.emby_person_id,
+                           '_person_provider_snapshot': dict(target.provider_ids)})
+        return result
+
+    def _prepare_person_metadata_cast(self, actors, item_details):
+        """Only emit exact existing identities, with their current Emby names.
+
+        Unsupported creates are durably held. Existing media relations outside
+        this task's processing budget are retained verbatim, never detached.
+        """
+        from services.person_write_safety import identity_lock, PersonOperationJournal, cast_identity
+        source_id = str(item_details.get('Id') or '')
+        source_type = item_details.get('Type')
+        if not source_id or source_id == 'pending':
+            logger.warning('[PERSON_GOVERNANCE] DEFER metadata_create source_item_pending')
+            return []
+        source = emby.get_emby_item_details(
+            source_id, self.emby_url, self.emby_api_key, self.emby_user_id,
+        )
+        if not source or not isinstance(source.get('People'), list):
+            raise ValueError('source_people_unavailable')
+        if source.get('Type') not in {'Movie', 'Series', 'Season', 'Episode'} or source.get('Type') != source_type:
+            raise ValueError('source_item_type_changed')
+        # Preservation must not become an unbounded enrichment pass over old
+        # casts. Hold large legacy actor sets rather than truncate associations.
+        if len([p for p in source['People'] if p.get('Type') == 'Actor']) > actor_cap(
+            self.config.get(constants.CONFIG_OPTION_MAX_ACTORS_TO_PROCESS, 50)
+        ):
+            raise ValueError('legacy_relation_set_exceeds_processing_cap')
+        output, emitted = [], set()
+        for actor in select_person_candidates(
+            actors, actor_cap(self.config.get(constants.CONFIG_OPTION_MAX_ACTORS_TO_PROCESS, 50)),
+        ):
+            pair = cast_identity(actor)
+            if not pair:
+                continue
+            with identity_lock(self.emby_url, *pair):
+                journal = PersonOperationJournal(self.emby_url, *pair)
+                intent = ExactPersonTarget.for_intent(
+                    *pair, source_id, source_type, actor.get('name'), journal.operation_id,
+                )
+                prior = journal.read()
+                if prior and prior.get('failure_stage') != 'complete':
+                    person_write_audit(intent, 'QUARANTINE', 'DENY', 'operation_requires_review')
+                    continue
+                matches = emby.resolve_exact_person_identity(self.emby_url, self.emby_api_key, *pair)
+                if matches is None or len(matches) != 1:
+                    reason = ('identity_unavailable' if matches is None else
+                              'identity_ambiguous' if matches else 'implicit_create_blocked')
+                    journal.record(source_id, reason)
+                    person_write_audit(intent, 'QUARANTINE', 'DENY', reason)
+                    continue
+                target = ExactPersonTarget.from_person(matches[0], source_id, source_type, journal.operation_id)
+                original_intent = actor.get('_person_write_target')
+                if isinstance(original_intent, ExactPersonTarget):
+                    from dataclasses import replace
+                    if original_intent.source_item_id != source_id:
+                        raise ValueError('source_item_changed')
+                    target = replace(original_intent, operation_id=journal.operation_id)
+                matches = emby.resolve_frozen_person_target(self.emby_url, self.emby_api_key, target)
+                current = emby.get_emby_item_details(
+                    target.emby_person_id, self.emby_url, self.emby_api_key, self.emby_user_id,
+                )
+                denial = validate_person_write_target(target, current, matches)
+                frozen_id = str(actor.get('emby_person_id') or '')
+                if frozen_id and frozen_id != target.emby_person_id:
+                    denial = 'stale_emby_mapping'
+                advertised = actor.get('provider_ids') or {}
+                current_ids = {str(k).lower(): str(v) for k, v in (current or {}).get('ProviderIds', {}).items()}
+                if any(str(k).lower() in current_ids and current_ids[str(k).lower()] != str(v)
+                       for k, v in advertised.items() if v):
+                    denial = 'identity_changed'
+                if denial:
+                    journal.record(source_id, denial, target.emby_person_id)
+                    person_write_audit(target, 'SKIP', 'DENY', denial)
+                    continue
+                desired_name = actor.get('name')
+                if (isinstance(original_intent, ExactPersonTarget)
+                        and desired_name and desired_name != current.get('Name')):
+                    journal.record(source_id, 'person_update_reserved', target.emby_person_id)
+                    if not emby.update_person_details(
+                        target.emby_person_id, {'Name': desired_name},
+                        self.emby_url, self.emby_api_key, self.emby_user_id, target=target,
+                    ):
+                        journal.record(source_id, 'person_update_result_unknown', target.emby_person_id)
+                        continue
+                    current = emby.get_emby_item_details(
+                        target.emby_person_id, self.emby_url, self.emby_api_key, self.emby_user_id,
+                    )
+                    if (validate_person_write_target(target, current, matches)
+                            or current.get('Name') != desired_name):
+                        journal.record(source_id, 'person_update_not_verified', target.emby_person_id)
+                        continue
+                    journal.record(source_id, 'complete', target.emby_person_id)
+                member = dict(actor)
+                # Name remains display data. The plugin must not be asked to
+                # create a translated alias by writing a new name to a media DTO.
+                member.update(name=current['Name'], emby_person_id=target.emby_person_id)
+                member['_person_provider_snapshot'] = dict(target.provider_ids)
+                output.append(member)
+                emitted.add(target.emby_person_id)
+                person_write_audit(target, 'UPDATE', 'ALLOW', 'exact_metadata_target')
+        # Preserve historical associations without enriching them or counting
+        # them as this task's targets. Unknown provider => hold the entire actor
+        # file write, because dropping it would create a new orphan.
+        for member in source['People']:
+            if member.get('Type') != 'Actor' or str(member.get('Id') or '') in emitted:
+                continue
+            current = emby.get_emby_item_details(
+                member.get('Id'), self.emby_url, self.emby_api_key, self.emby_user_id,
+            )
+            target = ExactPersonTarget.from_person(current, source_id, source_type)
+            if target.provider_name != 'tmdb':
+                # Cannot prove the external TMDb reader retains this relation.
+                # Hold this actor-bearing file update rather than detach it.
+                raise ValueError('unsupported_existing_provider_relation')
+            output.append({'id': target.provider_person_id, 'name': current['Name'],
+                           'character': member.get('Role') or '', 'emby_person_id': target.emby_person_id,
+                           '_person_provider_snapshot': dict(target.provider_ids),
+                           '_preserved_existing_relation': True})
+        names = {}
+        for actor in output:
+            previous_id = names.setdefault(actor['name'], str(actor.get('id') or ''))
+            if previous_id != str(actor.get('id') or ''):
+                raise ValueError('metadata_name_collision')
+        return output
+
     def _build_cast_from_final_data(self, final_cast_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """辅助函数：从主流程的最终结果构建演员列表"""
         cast_list = []
@@ -5042,29 +5168,36 @@ class MediaProcessor:
                     if filtered_cast:
                         credits_node['cast'] = filtered_cast
                     
-                    # ★★★ 核心修复：如果 TMDb 没提供演员 (或被我们删了)，就用全剧通用的 ★★★
-                    if not credits_node.get('cast') and cast_list:
-                        credits_node['cast'] = cast_list
+                    # An explicit Episode-local empty cast is not permission
+                    # to copy every parent Person into this Episode.
+                    credits_node['cast'] = filtered_cast
 
                     # 2. 处理客串演员 (Guest Stars) - 这个保留 TMDb 的
                     raw_guests = specific_tmdb_data.get('credits', {}).get('guest_stars', [])
                     filtered_guests = process_actor_list(raw_guests)
-                    if filtered_guests:
-                        credits_node['guest_stars'] = filtered_guests
+                    credits_node['guest_stars'] = filtered_guests
                     
                     # 3. 处理幕后 (Crew)
                     if specific_tmdb_data.get('credits', {}).get('crew'):
                         credits_node['crew'] = specific_tmdb_data['credits']['crew']
                 
                 elif is_episode_file:
-                    if not credits_node.get('cast'):
-                        credits_node['cast'] = cast_list
+                    # Retain only the Episode's own data when provider data is
+                    # unavailable; do not synthesize it from Series cast.
+                    credits_node.setdefault('cast', [])
 
                 elif is_season_file:
                     if not credits_node.get('cast'):
                         credits_node['cast'] = cast_list
 
-                # 应用主演员表的翻译成果 
+                # Episode cast + guests share one deterministic cap. This is a
+                # child-local copy; it can never expand the parent target set.
+                credits_node = cap_episode_credits(
+                    credits_node,
+                    actor_cap(self.config.get(constants.CONFIG_OPTION_MAX_ACTORS_TO_PROCESS, 50)),
+                )
+                child_data['credits'] = credits_node
+                # 应用主演员表的翻译成果
                 if credits_node.get('cast'):
                     patch_actor_list(credits_node['cast'])
                 
@@ -5080,6 +5213,28 @@ class MediaProcessor:
                         child_data['overview'] = fresh_emby_data.get('Overview', child_data.get('overview'))
                     if fresh_emby_data.get('CommunityRating'):
                         child_data['vote_average'] = fresh_emby_data.get('CommunityRating')
+                if fresh_emby_data and fresh_emby_data.get('Id') and not is_pending:
+                    guest_ids = {str(a.get('id')) for a in credits_node.get('guest_stars', [])}
+                    prepared_child_cast = self._prepare_person_metadata_cast(
+                        credits_node.get('cast', []) + credits_node.get('guest_stars', []),
+                        fresh_emby_data,
+                    )
+                    child_cast = self._build_cast_from_final_data(prepared_child_cast)
+                    credits_node['cast'] = [a for a in child_cast if str(a.get('id')) not in guest_ids]
+                    credits_node['guest_stars'] = [a for a in child_cast if str(a.get('id')) in guest_ids]
+                    child_crew = self._prepare_existing_person_crew(fresh_emby_data)
+                    self._revalidate_person_metadata_batch(prepared_child_cast + child_crew, fresh_emby_data)
+                    credits_node['crew'] = [
+                        {key: member[key] for key in ('id', 'name', 'job', 'department')}
+                        for member in child_crew
+                    ]
+                else:
+                    # No confirmed source yet: prepare non-person metadata only.
+                    # Original provider Episode data remains untouched in memory.
+                    for field in ('cast', 'guest_stars', 'crew'):
+                        credits_node.pop(field, None)
+                child_data.pop('guest_stars', None)
+                child_data.pop('created_by', None)
 
                 # 步骤 F: 写入文件 
                 try:
@@ -5092,6 +5247,7 @@ class MediaProcessor:
             logger.info(f"  ➜ {log_prefix} 成功智能同步了 {updated_children_count} 个季/集文件。")
         except Exception as e_list:
             logger.error(f"  ➜ {log_prefix} 遍历并更新季/集文件时发生错误: {e_list}", exc_info=True)
+            raise
 
     # 提取标签
     def extract_tag_names(item_data):
@@ -5217,6 +5373,9 @@ class MediaProcessor:
         item_type = item_details.get("Type")
         tmdb_id = item_details.get("ProviderIds", {}).get("Tmdb")
         log_prefix = "[覆盖缓存-元数据持久化]"
+        if item_type not in {'Movie', 'Series'}:
+            logger.info('[PERSON_GOVERNANCE] SKIP non-media metadata webhook')
+            return
 
         if not all([item_id, item_type, tmdb_id]):
             logger.warning(f"  ➜ {log_prefix} 跳过 '{item_name_for_log}'，缺少关键ID。")
@@ -5338,6 +5497,28 @@ class MediaProcessor:
                         updated_count += 1
 
                 logger.info(f"  ➜ {log_prefix} 准备将 {updated_count} 项更新写入 '{main_json_filename}'。")
+
+                # A metadata-only webhook also rewrites actor-bearing JSON.
+                # Reuse exact identities and current names, not stale aliases.
+                cached_cast = (data.get('casts') or data.get('credits') or {}).get('cast', [])
+                if item_type == 'Series':
+                    scope = tmdb.get_tv_details(
+                        int(tmdb_id), self.tmdb_api_key, append_to_response='credits',
+                    ) if self.tmdb_api_key else None
+                    if not scope:
+                        raise ValueError('series_main_scope_unavailable')
+                    cached_cast = restrict_series_cached_cast(cached_cast, scope)
+                prepared = self._prepare_person_metadata_cast(cached_cast, item_details)
+                crew = self._prepare_existing_person_crew(item_details)
+                safe_cast = self._build_cast_from_final_data(prepared)
+                safe_crew = [{key: p[key] for key in ('id', 'name', 'job', 'department')} for p in crew]
+                for node in ('credits', 'casts', 'aggregate_credits'):
+                    if isinstance(data.get(node), dict):
+                        data[node]['cast'], data[node]['crew'] = safe_cast, safe_crew
+                        data[node].pop('guest_stars', None)
+                data['created_by'] = [{'id': p['id'], 'name': p['name']} for p in crew if p['job'] == 'Director']
+                data.pop('guest_stars', None)
+                self._revalidate_person_metadata_batch(prepared + crew, item_details)
 
                 f.seek(0)
                 json.dump(data, f, ensure_ascii=False, indent=2)

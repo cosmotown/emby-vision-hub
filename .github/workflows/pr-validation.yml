@@ -83,8 +83,8 @@ jobs:
       - name: Install frontend dependencies
         run: npm install --no-fund --legacy-peer-deps
 
-      - name: Run MediaInfo response ordering tests
-        run: npm run test:mediainfo
+      - name: Run all frontend contracts
+        run: node --test tests/*.test.mjs
 
       - name: Build frontend
         run: npm run build

@@ -63,11 +63,12 @@ def task_role_translation(processor, force_full_update: bool = False):
 # --- 使用手动编辑的结果处理媒体项 ---
 def task_manual_update(processor, item_id: str, manual_cast_list: list, item_name: str):
     """任务：使用手动编辑的结果处理媒体项"""
-    processor.process_item_with_manual_cast(
+    if not processor.process_item_with_manual_cast(
         item_id=item_id,
         manual_cast_list=manual_cast_list,
         item_name=item_name
-    )
+    ):
+        raise RuntimeError("手动人物修改未通过身份或处理校验；未完成更新，请查看人物治理日志。")
 
 def task_sync_images(processor, item_id: str, update_description: str, sync_timestamp_iso: str):
     """

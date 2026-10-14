@@ -2,6 +2,23 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.39",
+        "published_at": "2026-10-14T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.39",
+        "changelog": """## Person governance：阻止继续产生幽灵人物
+
+- Series 只处理自身 main cast；Episode cast / guest stars 保持单集归属，不再提升到父 Series。
+- 人物改名、元数据、图片和关联补充使用冻结 provider 身份与 Emby 实例 ID，写入前重新核验；同名人物不会被批量修改。
+- 演员数量上限仅为 cap，不补满 50；在昂贵补充前完成身份去重和范围限制。
+- 不完整同步不解绑旧映射；冲突导入和维护不自动合并身份。
+- 自动创建采用 existing-only 安全边界：仅复用精确已有 Person。缺失、歧义或结果不确定进入持久待复核，不自动解绑、删除或重放。
+- 因此部分新演员，特别是 Douban-only 补充，会暂停自动处理；无法精确保留的旧关联及超限历史关联会 HOLD，不截断历史 People。
+- 本版本不清理已有幽灵人物，不改变 Person Cleanup 删除资格或 DeletePerson 合同，不新增数据库 schema。
+- 保留 VidHub、Infuse、Recent 和官方 Emby 虚拟库/首页排序行为；未操作 NAS 生产。
+
+""",
+    },
+    {
         "version": "v7.2.38",
         "published_at": "2026-10-13T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.38",

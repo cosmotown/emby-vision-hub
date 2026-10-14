@@ -127,6 +127,14 @@ def api_update_edited_cast_sa(item_id):
         return jsonify({"error": "请求体中缺少有效的 'cast' 列表"}), 400
     
     edited_cast = data["cast"]
+    from services.person_write_safety import actor_cap, manual_person_target
+    if len(edited_cast) > actor_cap(config_manager.APP_CONFIG.get(constants.CONFIG_OPTION_MAX_ACTORS_TO_PROCESS, 50)):
+        return jsonify({"error": "演员数量超过本次处理上限。"}), 400
+    try:
+        for actor in edited_cast:
+            manual_person_target(actor, item_id, 'Manual')
+    except (ValueError, AttributeError, TypeError):
+        return jsonify({"error": "演员精确身份未确认，请刷新编辑页面后重试。当前仅支持已关联人物的修改。"}), 400
     item_name = data.get("item_name", f"未知项目(ID:{item_id})")
 
     task_manager.submit_task(

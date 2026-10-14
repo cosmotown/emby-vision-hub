@@ -139,7 +139,7 @@ def resolve_douban_actor_against_tmdb_cast(
     tmdb_profiles: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """
-    Use names only to retrieve candidates; require an exact birthday to merge.
+    Names and birthdays are discovery evidence only, never write identity.
 
     A non-empty candidate set without a unique birthday match is deliberately
     deferred so a translated or incomplete name can never create a false merge.
@@ -161,12 +161,6 @@ def resolve_douban_actor_against_tmdb_cast(
         and profile.get('birthday')
         and profile.get('birthday') == birthday
     ]
-    if len(birthday_matches) == 1:
-        return {
-            'status': 'confirmed',
-            'tmdb_id': birthday_matches[0].get('tmdb_id'),
-            'candidate_count': len(candidates),
-        }
     return {
         'status': 'ambiguous',
         'tmdb_id': None,

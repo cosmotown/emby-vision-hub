@@ -7,6 +7,9 @@ from unittest.mock import patch
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+# Initialize the application's configuration entry point before database modules.
+# Full discovery already does this; standalone PG runs must do so as well.
+import config_manager
 from database.actor_db import ActorDBManager
 from handler.actor_sync import UnifiedSyncHandler
 from services.person_sync_safety import PersonResultScope

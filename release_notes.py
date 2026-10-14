@@ -2,6 +2,36 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.38",
+        "published_at": "2026-10-13T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.38",
+        "changelog": """## 官方 Emby 首页最新内容排序修复
+
+- 修复 7.2.37 将原生库最新内容固定放在虚拟库之前的问题。
+- 最新内容分区复用现有 Views 顺序，跟随自建合集排序及原生库前置/后置配置。
+- 仅重排 latestmedia 分区，不移动继续观看、正在播放等其他首页分区，不改变分区内容。
+- 保持隐藏原生库、用户权限、show_in_latest 设置和 VidHub / Infuse 既有兼容行为。
+- 不修改 Items、Recent 时间排序、图片、详情、播放、人物治理或数据库结构。
+
+""",
+    },
+    {
+        "version": "v7.2.37",
+        "published_at": "2026-10-12T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.37",
+        "changelog": """## Emby 4.10 官方首页虚拟库兼容修复
+
+- 修复官方 Web 首页改用 HomeSections / Sections 后绕过 EVH Views，导致虚拟库消失、隐藏原生库重新显示的问题。
+- “我的媒体”复用现有 Views 的用户可见性、稳定 library ID 过滤、虚拟库注入与排序；不按库名称判断。
+- 首页原生最新内容分区遵循同一可见库集合；虚拟最新内容分区复用既有 Latest 查询，并尊重 show_in_latest 配置。
+- 新增首页入口使用当前客户端凭据确认用户身份，失败时拒绝返回，不借用服务端 API key 代替客户端认证。
+- 保持 VidHub、Infuse Direct、Hills 和普通客户端既有 CollectionType 决策，保持负数 View ID、图片、Movie/Series/Season/Episode、权限、详情和播放逻辑。
+- 不修改 Person governance、人物删除、更新器、Recent Episode 排序或数据库结构。
+
+""",
+    },
+
+    {
         "version": "v7.2.36",
         "published_at": "2026-09-23T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.36",

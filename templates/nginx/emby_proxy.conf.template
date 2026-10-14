@@ -59,6 +59,15 @@ server {
         proxy_pass http://virtual_library_proxy;
     }
 
+    # Official Web 4.10 home discovery no longer renders tiles from Views.
+    # Only observed catalogue sections are adapted; resume/playback stay native.
+    location ~ ^/(emby/)?Users/([a-f0-9]+)/(HomeSections|Sections/(smalllibrarytiles|latestmedia_-?[0-9]+)/Items)$ {
+        if ($request_method = GET) {
+            proxy_pass http://virtual_library_proxy;
+        }
+        proxy_pass http://emby_server;
+    }
+
     # Infuse Direct performs a second native-library discovery pass through
     # VirtualFolders. Route only that proven client family through the same EVH
     # exact-ID visibility contract; every other client keeps the native path.

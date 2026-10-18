@@ -2,6 +2,23 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.40",
+        "published_at": "2026-10-18T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.40",
+        "changelog": """## P0：Person 补充拒绝不再中断正常媒体入库
+
+- 修复 v7.2.39 中 Person 身份门禁拒绝向上传播，导致媒体缓存未同步、Webhook 失败的问题。
+- 明确的可选 Person 拒绝进入持久 HOLD / 待复核；正常媒体基本字段及 Series / Season / Episode 同步继续。
+- 保留原生 Emby People 和既有演员/导演缓存；HOLD 时不写空演员表、不触发读取旧演员覆盖文件的刷新。
+- existing-only、exact identity、Series main-only、Episode guest scope 和 actor cap 安全策略保持不变；不自动创建、解绑、删除或合并 Person。
+- 真实媒体缺失、数据库/事务失败及未知异常仍失败；仅在媒体事务提交后更新已处理缓存，避免重试被误判成功。
+- 增加姓名冲突、provider 缺失、同名异人、六集同步、失败事件重试和重复投递回归。
+- 不改变 VidHub、Infuse、虚拟库、Recent、播放、更新器、数据库结构或 UI；不包含历史人物清理工具及扫描产物。
+- 不自动重放历史失败事件。升级后请先核对失败事件的目标及 Episode IDs，再由管理员通过现有队列重试一次。
+
+""",
+    },
+    {
         "version": "v7.2.39",
         "published_at": "2026-10-14T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.39",

@@ -120,8 +120,7 @@ def task_sync_all_metadata(processor, item_id: str, item_name: str):
             fields="ProviderIds,Type,Name,OriginalTitle,Overview,Tagline,CommunityRating,OfficialRating,Genres,Studios,Tags,PremiereDate"
         )
         if not item_details:
-            logger.error(f"  ➜ {log_prefix} 失败：无法获取项目 {item_id} 的最新详情。")
-            return
+            raise ValueError('media_item_unavailable')
 
         # 步骤 2: 调用施工队，更新 override 文件
         processor.sync_emby_updates_to_override_files(item_details)

@@ -38,6 +38,9 @@ from ai_translator import AITranslator
 from watchlist_processor import WatchlistProcessor
 from handler.douban import DoubanApi
 from services.emby_ingest import get_confirmed_media_items, refresh_and_verify_paths
+from services.person_enrichment import (
+    PersonEnrichmentHold, optional_person_gate, persist_person_hold,
+)
 from services.person_write_safety import (
     ExactPersonTarget, actor_cap, audit as person_write_audit,
     select_person_candidates, series_main_cast, cap_episode_credits,
@@ -1044,7 +1047,8 @@ class MediaProcessor:
         item_type: str,
         final_processed_cast: List[Dict[str, Any]],
         source_data_package: Optional[Dict[str, Any]],
-        item_details_from_emby: Optional[Dict[str, Any]] = None
+        item_details_from_emby: Optional[Dict[str, Any]] = None,
+        preserve_person_fields: bool = False,
     ):
         """
         - 实时元数据写入 (终极稳健版)。
@@ -1497,6 +1501,12 @@ class MediaProcessor:
             cols_str = ", ".join(all_possible_columns)
             placeholders_str = ", ".join([f"%({col})s" for col in all_possible_columns])
             cols_to_update = [col for col in all_possible_columns if col not in ['tmdb_id', 'item_type', 'custom_rating']]
+            if preserve_person_fields:
+                # A Person HOLD must not clear existing EVH cast/crew cache
+                # relations either. New media rows carry unknown Person data.
+                for row in data_for_batch:
+                    row['actors_json'] = row['directors_json'] = None
+                cols_to_update = [c for c in cols_to_update if c not in {'actors_json', 'directors_json'}]
             
             cols_to_protect = ['subscription_sources_json']
             timestamp_field = "last_synced_at"
@@ -1532,7 +1542,7 @@ class MediaProcessor:
             raise
 
     # --- 标记为已处理 ---
-    def _mark_item_as_processed(self, cursor: psycopg2.extensions.cursor, item_id: str, item_name: str, score: float = 10.0):
+    def _mark_item_as_processed(self, cursor: psycopg2.extensions.cursor, item_id: str, item_name: str, score: float = 10.0, *, update_cache=True):
         """
         【重构】将一个项目标记为“已处理”的唯一官方方法。
         它会同时更新数据库和内存缓存，确保数据一致性。
@@ -1541,7 +1551,8 @@ class MediaProcessor:
         self.log_db_manager.save_to_processed_log(cursor, item_id, item_name, score=score)
         
         # 2. 实时更新内存缓存
-        self.processed_items_cache[item_id] = item_name
+        if update_cache:
+            self.processed_items_cache[item_id] = item_name
         
         logger.debug(f"  ➜ 已将 '{item_name}' 标记为已处理 (数据库 & 内存)。")
     # --- 清除已处理记录 ---
@@ -1980,6 +1991,7 @@ class MediaProcessor:
         
         try:
             authoritative_cast_source = []
+            person_hold = None
             tmdb_details_for_extra = None # 用于内部缓存
 
             # =========================================================
@@ -2299,13 +2311,18 @@ class MediaProcessor:
                     cursor = conn.cursor()
                     
                     all_emby_people = item_details_from_emby.get("People", [])
-                    current_emby_cast_raw = self._select_related_person_targets(
-                        [p for p in all_emby_people if p.get("Type") == "Actor"],
-                        authoritative_cast_source, item_type,
-                    )
+                    try:
+                        current_emby_cast_raw = self._select_related_person_targets(
+                            [p for p in all_emby_people if p.get("Type") == "Actor"],
+                            authoritative_cast_source, item_type,
+                        )
+                    except PersonEnrichmentHold as hold:
+                        self._record_person_enrichment_hold(item_details_from_emby, hold)
+                        person_hold = hold
+                        current_emby_cast_raw = []
                     emby_config = {"url": self.emby_url, "api_key": self.emby_api_key, "user_id": self.emby_user_id}
-                    enriched_emby_cast = self.actor_db_manager.enrich_actors_with_provider_ids(cursor, current_emby_cast_raw, emby_config)
-                    douban_cast_raw, _ = self._get_douban_data_with_local_cache(item_details_from_emby)
+                    enriched_emby_cast = self.actor_db_manager.enrich_actors_with_provider_ids(cursor, current_emby_cast_raw, emby_config) if person_hold is None else []
+                    douban_cast_raw, _ = self._get_douban_data_with_local_cache(item_details_from_emby) if person_hold is None else ([], None)
 
                     # 调用核心处理器处理演员表
                     final_processed_cast = self._process_cast_list(
@@ -2316,7 +2333,7 @@ class MediaProcessor:
                         cursor=cursor,
                         tmdb_api_key=self.tmdb_api_key,
                         stop_event=self.get_stop_event()
-                    )
+                    ) if person_hold is None else copy.deepcopy(authoritative_cast_source)
                     conn.commit()
 
             # =========================================================
@@ -2344,31 +2361,39 @@ class MediaProcessor:
                     # 写入 override 文件
                     # 注意：sync_single_item_assets 内部已经有针对 episode_ids_to_sync 的优化，
                     # 它只会下载新分集的图片，并复制新分集的 JSON，不会重新下载全套图片。
-                    assets_synced = self.sync_single_item_assets(
-                        item_id=item_id,
-                        update_description="主流程处理完成" if not specific_episode_ids else f"追更: {len(specific_episode_ids)}个分集",
-                        final_cast_override=final_processed_cast,
-                        episode_ids_to_sync=specific_episode_ids,
-                        metadata_override=tmdb_details_for_extra 
-                    )
+                    try:
+                        assets_synced = self.sync_single_item_assets(
+                            item_id=item_id,
+                            update_description="主流程处理完成" if not specific_episode_ids else f"追更: {len(specific_episode_ids)}个分集",
+                            final_cast_override=final_processed_cast,
+                            episode_ids_to_sync=specific_episode_ids,
+                            metadata_override=tmdb_details_for_extra,
+                        ) if person_hold is None else None
+                    except PersonEnrichmentHold as hold:
+                        self._record_person_enrichment_hold(item_details_from_emby, hold)
+                        person_hold = hold
+                        assets_synced = None
                     if assets_synced is False:
-                        raise ValueError('person_metadata_gate_denied')
+                        raise ValueError('media_asset_sync_failed')
 
                     # 通知 Emby 刷新
-                    logger.info(f"  ➜ 处理完成，正在通知 Emby 刷新...")
-                    self._refresh_emby_after_metadata_sync(
+                    if person_hold is None:
+                        logger.info(f"  ➜ 处理完成，正在通知 Emby 刷新...")
+                    if person_hold is None and self._refresh_emby_after_metadata_sync(
                         item_id=item_id,
                         item_name_for_log=item_name_for_log,
                         specific_episode_ids=specific_episode_ids,
-                    )
+                    ) is False:
+                        raise ValueError('media_refresh_failed')
 
-                # TMDb 元数据刷新不会携带豆瓣独有人物；刷新完成后按 Douban ID
-                # 单独创建/复用 Person，并在写后复核通过后再锁定 Emby Person ID。
-                self._sync_douban_only_cast_to_emby(
-                    item_id=item_id,
-                    final_cast=final_processed_cast,
-                    cursor=cursor,
-                )
+                # Optional exact-identity supplement is also held if the
+                # actor-bearing metadata path could not be proved safe.
+                if person_hold is None:
+                    self._sync_douban_only_cast_to_emby(
+                        item_id=item_id,
+                        final_cast=final_processed_cast,
+                        cursor=cursor,
+                    )
 
                 # 更新我们自己的数据库缓存
                 self._upsert_media_metadata(
@@ -2376,7 +2401,8 @@ class MediaProcessor:
                     item_type=item_type,
                     item_details_from_emby=item_details_from_emby,
                     final_processed_cast=final_processed_cast,
-                    source_data_package=tmdb_details_for_extra
+                    source_data_package=tmdb_details_for_extra,
+                    preserve_person_fields=person_hold is not None,
                 )
                 
                 # 综合质检 (视频流检查 + 演员匹配度评分)
@@ -2464,8 +2490,9 @@ class MediaProcessor:
                                 logger.warning(f"  ➜ [质检] 剧集《{item_name_for_log}》检测到坏分集: {reason}")
                                 break 
 
-                    except Exception as e_db_check:
-                        logger.warning(f"  ➜ [质检] 数据库验证分集流信息时出错: {e_db_check}")
+                    except Exception:
+                        # A database failure is not an optional Person HOLD.
+                        raise
 
                 # 演员处理质量评分
                 raw_genres = item_details_from_emby.get("Genres", [])
@@ -2519,7 +2546,7 @@ class MediaProcessor:
                     # 记录到 Series ID
                     self.log_db_manager.save_to_failed_log(cursor, target_log_id, target_log_name, stream_fail_reason, target_log_type, score=0.0)
                     # 标记为已处理 (防止死循环)，但在UI中会显示在“待复核”
-                    self._mark_item_as_processed(cursor, target_log_id, target_log_name, score=0.0)
+                    self._mark_item_as_processed(cursor, target_log_id, target_log_name, score=0.0, update_cache=False)
                     
                 elif processing_score < min_score_for_review:
                     # 情况 B: 评分过低 -> 待复核
@@ -2531,16 +2558,20 @@ class MediaProcessor:
                         logger.warning(f"  ➜ [质检]《{item_name_for_log}》处理质量不佳，已标记为【待复核】。原因: {reason}")
                         
                     self.log_db_manager.save_to_failed_log(cursor, target_log_id, target_log_name, reason, target_log_type, score=processing_score)
-                    self._mark_item_as_processed(cursor, target_log_id, target_log_name, score=processing_score)
+                    self._mark_item_as_processed(cursor, target_log_id, target_log_name, score=processing_score, update_cache=False)
                     
                 else:
                     # 情况 C: 一切正常 -> 移除待复核标记（如果之前有）
                     logger.info(f"  ➜ 《{item_name_for_log}》质检通过 (评分: {processing_score:.2f})，标记为已处理。")
                     # 只有当分集也通过时，才更新剧集的记录为成功
-                    self._mark_item_as_processed(cursor, target_log_id, target_log_name, score=processing_score)
+                    self._mark_item_as_processed(cursor, target_log_id, target_log_name, score=processing_score, update_cache=False)
                     self.log_db_manager.remove_from_failed_log(cursor, target_log_id)
                 
                 conn.commit()
+
+            # A failed commit must not leave a cache hit that turns a retry
+            # into a false success without executing the media transaction.
+            self.processed_items_cache[target_log_id] = target_log_name
 
             # 只有电影和剧集才需要刷新向量库，分集(Episode)入库不影响整体推荐，跳过以节省资源
             is_pure_episode_update = (item_type == 'Series' and specific_episode_ids)
@@ -2558,6 +2589,9 @@ class MediaProcessor:
                 logger.debug(f"  ➜ [智能推荐] 检测到为剧集追更模式，跳过向量缓存刷新。")
 
             logger.trace(f"--- 处理完成 '{item_name_for_log}' ---")
+            if person_hold is not None:
+                logger.warning('[PERSON_ENRICHMENT] source_item_id=%s '
+                               'MEDIA_PROCESSING=SUCCESS PERSON_ENRICHMENT=HOLD', item_id)
 
         except (ValueError, InterruptedError) as e:
             logger.warning(f"处理 '{item_name_for_log}' 的过程中断: {e}")
@@ -2575,6 +2609,11 @@ class MediaProcessor:
         return True
 
     # --- 核心处理器 ---
+    def _record_person_enrichment_hold(self, source, hold):
+        record = persist_person_hold(self.emby_url, source, hold)
+        logger.warning('[PERSON_ENRICHMENT] %s', json.dumps(record, ensure_ascii=False))
+
+    @optional_person_gate
     def _select_related_person_targets(self, people, provider_cast, item_type):
         """Cheap batch identity resolution, then scope/order/cap before enrichment."""
         current = emby.read_person_identity_batch(
@@ -4102,6 +4141,10 @@ class MediaProcessor:
             logger.trace(f"--- {log_prefix} 成功完成 (ItemID: {item_id}) ---")
             return True
 
+        except PersonEnrichmentHold:
+            # Only the media orchestrator may degrade this to an optional HOLD.
+            # Never mark assets synced or refresh stale actor-bearing files.
+            raise
         except Exception as e:
             logger.error(f"{log_prefix} 执行时发生错误 (ItemID: {item_id}): {e}", exc_info=True)
             return False
@@ -4678,6 +4721,7 @@ class MediaProcessor:
             )
 
     # --- 辅助函数：从不同数据源构建演员列表 ---
+    @optional_person_gate
     def _revalidate_person_metadata_batch(self, members, source):
         """Last check before a file can become an external Person write input."""
         for member in members:
@@ -4701,8 +4745,10 @@ class MediaProcessor:
             if not emby.is_person_name_write_safe(
                 self.emby_url, self.emby_api_key, current.get('Name'), frozen.emby_person_id,
             ):
-                raise ValueError('person_name_collision_or_unknown')
+                raise PersonEnrichmentHold('person_name_collision_or_unknown',
+                                           source.get('Id'), frozen.emby_person_id)
 
+    @optional_person_gate
     def _prepare_existing_person_crew(self, item_details):
         """Keep exact existing crew; raw provider crew cannot create new Persons."""
         source_id = str(item_details.get('Id') or '')
@@ -4711,10 +4757,12 @@ class MediaProcessor:
         source = emby.get_emby_item_details(
             source_id, self.emby_url, self.emby_api_key, self.emby_user_id,
         )
-        if not source or not isinstance(source.get('People'), list):
-            raise ValueError('source_people_unavailable')
+        if not source:
+            raise ValueError('source_item_unavailable')
         if source.get('Type') not in {'Movie', 'Series', 'Season', 'Episode'} or source.get('Type') != item_details.get('Type'):
             raise ValueError('source_item_type_changed')
+        if not isinstance(source.get('People'), list):
+            raise ValueError('source_people_unavailable')
         crew = [p for p in source['People'] if p.get('Type') not in {None, 'Actor'}]
         if len(crew) > actor_cap(self.config.get(constants.CONFIG_OPTION_MAX_ACTORS_TO_PROCESS, 50)):
             raise ValueError('legacy_relation_set_exceeds_processing_cap')
@@ -4734,6 +4782,7 @@ class MediaProcessor:
                            '_person_provider_snapshot': dict(target.provider_ids)})
         return result
 
+    @optional_person_gate
     def _prepare_person_metadata_cast(self, actors, item_details):
         """Only emit exact existing identities, with their current Emby names.
 
@@ -4749,10 +4798,12 @@ class MediaProcessor:
         source = emby.get_emby_item_details(
             source_id, self.emby_url, self.emby_api_key, self.emby_user_id,
         )
-        if not source or not isinstance(source.get('People'), list):
-            raise ValueError('source_people_unavailable')
+        if not source:
+            raise ValueError('source_item_unavailable')
         if source.get('Type') not in {'Movie', 'Series', 'Season', 'Episode'} or source.get('Type') != source_type:
             raise ValueError('source_item_type_changed')
+        if not isinstance(source.get('People'), list):
+            raise ValueError('source_people_unavailable')
         # Preservation must not become an unbounded enrichment pass over old
         # casts. Hold large legacy actor sets rather than truncate associations.
         if len([p for p in source['People'] if p.get('Type') == 'Actor']) > actor_cap(
@@ -5295,8 +5346,7 @@ class MediaProcessor:
             item_details = emby.get_emby_item_details(item_id, self.emby_url, self.emby_api_key, self.emby_user_id, fields=fields_to_get)
             
             if not item_details:
-                logger.warning(f"  ➜ {log_prefix} 无法获取详情，跳过。")
-                return
+                raise ValueError('media_item_unavailable')
             
             tmdb_id = item_details.get("ProviderIds", {}).get("Tmdb")
             item_type = item_details.get("Type")
@@ -5361,6 +5411,7 @@ class MediaProcessor:
 
         except Exception as e:
             logger.error(f"{log_prefix} 执行时发生错误: {e}", exc_info=True)
+            raise
 
     # --- 将来自 Emby 的实时元数据更新同步到 override 缓存文件 ---
     def sync_emby_updates_to_override_files(self, item_details: Dict[str, Any]):
@@ -5535,8 +5586,13 @@ class MediaProcessor:
 
             logger.info(f"  ➜ {log_prefix} 成功为 '{item_name_for_log}' 持久化了元数据修改。")
 
+        except PersonEnrichmentHold as hold:
+            self._record_person_enrichment_hold(item_details, hold)
+            # Leave the entire actor-bearing file intact, not an empty People
+            # payload. task_sync_all_metadata still mirrors native media data.
         except Exception as e:
             logger.error(f"  ➜ {log_prefix} 为 '{item_name_for_log}' 更新覆盖缓存文件时发生错误: {e}", exc_info=True)
+            raise
 
 
     def close(self):

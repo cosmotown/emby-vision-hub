@@ -382,6 +382,9 @@ def resume_persistent_webhook_queue():
         recovered = webhook_event_db.recover_interrupted_events(stale_minutes=0)
         if recovered:
             logger.info(f"  ➜ [Webhook队列] 已从上次重启恢复 {recovered} 个处理中事件。")
+        resolved = webhook_event_db.reconcile_failed_events()
+        if resolved:
+            logger.info(f"  ➜ [Webhook队列] {resolved} 条历史失败已被后续成功事件精确覆盖，标记已恢复（未重放）。")
         pruned = webhook_event_db.prune_old_events(retention_days=30)
         if pruned:
             logger.info(f"  ➜ [Webhook队列] 已清理 {pruned} 条超过 30 天的完成记录。")

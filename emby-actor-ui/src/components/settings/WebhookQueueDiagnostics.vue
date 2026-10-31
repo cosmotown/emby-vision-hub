@@ -21,7 +21,7 @@
       :show-icon="true"
       style="margin-bottom: 16px;"
     >
-      当前有 {{ summary.failed_count }} 个失败事件，可在下方查看原因并重试。
+      当前有 {{ summary.failed_count }} 个待处理失败事件。媒体未恢复时可重试；已确认媒体正常时可归档，无需重复处理。
     </n-alert>
 
     <div class="queue-summary">
@@ -52,18 +52,38 @@
             <span>尝试 {{ event.attempt_count }}/{{ event.max_attempts }}</span>
             <span>{{ formatDate(event.updated_at || event.created_at) }}</span>
           </div>
-          <div v-if="event.last_error" class="event-error">{{ event.last_error }}</div>
+          <div v-if="event.last_error" :class="['failed', 'retry'].includes(event.status) ? 'event-error' : 'event-meta'">
+            历史错误：{{ event.last_error }}
+          </div>
+          <div v-if="event.status === 'recovered'" class="event-meta">
+            已由成功事件 #{{ event.resolution_json?.event_id }} 精确覆盖，未重放旧事件。
+          </div>
+          <div v-if="event.status === 'archived'" class="event-meta">
+            管理员已确认媒体正常并归档；不代表原事件执行成功，未重放任务。
+          </div>
         </div>
-        <n-button
-          v-if="event.status === 'failed'"
-          size="small"
-          type="warning"
-          ghost
-          :loading="retryingId === event.id"
-          @click="retryEvent(event.id)"
-        >
-          重试
-        </n-button>
+        <n-space v-if="event.status === 'failed'">
+          <n-button
+            size="small"
+            type="warning"
+            ghost
+            :disabled="archivingId !== null"
+            :loading="retryingId === event.id"
+            @click="retryEvent(event.id)"
+          >重试</n-button>
+          <n-popconfirm
+            positive-text="确认正常并归档"
+            negative-text="取消"
+            @positive-click="archiveEvent(event.id)"
+          >
+            <template #trigger>
+              <n-button size="small" :disabled="retryingId !== null || archivingId !== null">
+                确认已恢复并归档
+              </n-button>
+            </template>
+            请先确认该事件涉及的媒体、集数、详情及播放均正常。仅归档此记录，保留历史错误，不重放任务，也不修复媒体。
+          </n-popconfirm>
+        </n-space>
       </div>
     </div>
   </n-card>
@@ -77,6 +97,7 @@ import {
   NCard,
   NDivider,
   NEmpty,
+  NPopconfirm,
   NSpace,
   NTag,
   useMessage,
@@ -91,18 +112,23 @@ const summary = ref({
   retry_count: 0,
   failed_count: 0,
   completed_count: 0,
+  recovered_count: 0,
+  archived_count: 0,
 });
 const loading = ref(false);
 const testing = ref(false);
 const retryingId = ref(null);
+const archivingId = ref(null);
 const loadError = ref('');
 
 const summaryItems = computed(() => [
   { key: 'pending', label: '待处理', value: summary.value.pending_count || 0, className: '' },
   { key: 'processing', label: '处理中', value: summary.value.processing_count || 0, className: 'is-running' },
   { key: 'retry', label: '待重试', value: summary.value.retry_count || 0, className: 'is-warning' },
-  { key: 'failed', label: '失败', value: summary.value.failed_count || 0, className: 'is-error' },
+  { key: 'failed', label: '待处理失败', value: summary.value.failed_count || 0, className: 'is-error' },
   { key: 'completed', label: '已完成', value: summary.value.completed_count || 0, className: 'is-success' },
+  { key: 'recovered', label: '已恢复', value: summary.value.recovered_count || 0, className: 'is-success' },
+  { key: 'archived', label: '已归档', value: summary.value.archived_count || 0, className: '' },
 ]);
 
 const statusMeta = (status) => ({
@@ -112,6 +138,8 @@ const statusMeta = (status) => ({
   failed: { label: '失败', type: 'error' },
   completed: { label: '已完成', type: 'success' },
   superseded: { label: '已合并', type: 'default' },
+  recovered: { label: '已恢复', type: 'success' },
+  archived: { label: '已归档', type: 'default' },
 }[status] || { label: status || '未知', type: 'default' });
 
 const formatDate = (value) => {
@@ -167,6 +195,7 @@ const runDiagnostic = async () => {
 };
 
 const retryEvent = async (eventId) => {
+  if (retryingId.value !== null || archivingId.value !== null) return;
   retryingId.value = eventId;
   try {
     await axios.post(`/api/tasks/webhook-events/${eventId}/retry`);
@@ -179,13 +208,28 @@ const retryEvent = async (eventId) => {
   }
 };
 
+const archiveEvent = async (eventId) => {
+  if (retryingId.value !== null || archivingId.value !== null) return;
+  archivingId.value = eventId;
+  try {
+    await axios.post(`/api/tasks/webhook-events/${eventId}/archive`, { confirmed_media_ok: true });
+    message.success('已归档，历史错误保留；未重放任务');
+    await loadEvents(true);
+  } catch (error) {
+    message.error(error.response?.data?.error || '归档失败');
+    await loadEvents(true);
+  } finally {
+    archivingId.value = null;
+  }
+};
+
 onMounted(loadEvents);
 </script>
 
 <style scoped>
 .queue-summary {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
   gap: 10px;
 }
 .summary-item {

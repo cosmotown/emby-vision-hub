@@ -188,6 +188,12 @@ def init_db():
                 """)
 
                 cursor.execute("""
+                    ALTER TABLE webhook_event_queue
+                    ADD COLUMN IF NOT EXISTS resolution_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP WITH TIME ZONE
+                """)
+
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS strm_ingest_retry_queue (
                         id BIGSERIAL PRIMARY KEY,
                         file_path TEXT NOT NULL UNIQUE,
@@ -1416,6 +1422,10 @@ def init_db():
                     cursor.execute("""
                         CREATE INDEX IF NOT EXISTS idx_webhook_event_runnable
                         ON webhook_event_queue (status, next_attempt_at, id)
+                    """)
+                    cursor.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_webhook_event_resolution
+                        ON webhook_event_queue (dedupe_key, status, id)
                     """)
                     cursor.execute("""
                         CREATE INDEX IF NOT EXISTS idx_webhook_event_item

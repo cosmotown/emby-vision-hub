@@ -2,7 +2,7 @@
 
 import logging
 import uuid
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, session
 
 # 导入您项目中用于管理和执行任务的核心模块
 import task_manager 
@@ -137,6 +137,21 @@ def retry_webhook_event(event_id):
     except Exception as exc:
         logger.error(f"重试 Webhook 事件 {event_id} 失败: {exc}", exc_info=True)
         return jsonify({"error": "无法重试 Webhook 事件"}), 500
+
+
+@tasks_bp.route('/webhook-events/<int:event_id>/archive', methods=['POST'])
+@admin_required
+def archive_webhook_event(event_id):
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or data.get('confirmed_media_ok') is not True:
+        return jsonify({"error": "请先确认媒体、集数及播放已恢复正常；归档不会执行修复或重放"}), 400
+    try:
+        if not webhook_event_db.archive_failed_event(event_id, session.get('emby_user_id')):
+            return jsonify({"error": "事件不存在或已不再是失败状态，请刷新列表"}), 409
+        return jsonify({"message": "已确认并归档；保留原错误记录，未重放任务", "event_id": event_id}), 200
+    except Exception as exc:
+        logger.error(f"归档 Webhook 事件 {event_id} 失败: {exc}", exc_info=True)
+        return jsonify({"error": "无法归档 Webhook 事件"}), 500
 
 
 @tasks_bp.route('/strm-ingest-events', methods=['GET'])

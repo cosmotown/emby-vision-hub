@@ -7,6 +7,93 @@ logger = logging.getLogger(__name__)
 ACTIVE_PENDING_STATUSES = ('pending', 'retry')
 RETRY_DELAYS_SECONDS = (5, 20, 60)
 
+# Only a completed media_process with the same exact target and payload semantics
+# can prove recovery. A title match, a later timestamp, or a Series-only refresh
+# is NOT proof that an earlier Episode batch was handled.
+_RECOVERY_MATCH_SQL = """
+    s.status = 'completed' AND s.task_kind = 'media_process'
+    AND f.task_kind = s.task_kind AND f.event_source = s.event_source
+    AND s.event_source = 'emby' AND f.dedupe_key = s.dedupe_key
+    AND f.item_id = s.item_id AND f.item_id IS NOT NULL AND btrim(f.item_id) <> ''
+    AND f.item_type IS NOT DISTINCT FROM s.item_type
+    AND s.id > f.id AND s.started_at >= f.completed_at
+    AND s.completed_at >= s.started_at
+    AND f.payload_json->>'item_id' = f.item_id
+    AND s.payload_json->>'item_id' = s.item_id
+    AND jsonb_typeof(f.payload_json->'item_id') = 'string'
+    AND jsonb_typeof(s.payload_json->'item_id') = 'string'
+    AND jsonb_typeof(f.payload_json->'force_full_update') = 'boolean'
+    AND jsonb_typeof(f.payload_json->'is_new_item') = 'boolean'
+    AND (f.payload_json - 'new_episode_ids') = (s.payload_json - 'new_episode_ids')
+    AND (f.payload_json - ARRAY[
+        'item_id', 'force_full_update', 'is_new_item', 'new_episode_ids'
+    ]::text[]) = '{}'::jsonb
+    AND COALESCE(jsonb_typeof(f.payload_json->'new_episode_ids'), 'null') IN ('null', 'array')
+    AND COALESCE(jsonb_typeof(s.payload_json->'new_episode_ids'), 'null') IN ('null', 'array')
+    AND NOT EXISTS (
+        SELECT 1 FROM jsonb_array_elements(fe.ids || se.ids) AS episode(value)
+        WHERE jsonb_typeof(value) <> 'string' OR btrim(value #>> '{}') = ''
+    )
+    AND se.ids @> fe.ids
+    AND (fe.ids <> '[]'::jsonb OR se.ids = '[]'::jsonb)
+"""
+
+
+def _reconcile_failed_events(cursor, successful_event_id=None) -> int:
+    """One set-based update; never replay a task or claim current media health."""
+    cursor.execute(
+        """
+        WITH covered AS (
+            SELECT f.id, proof.success_id
+            FROM webhook_event_queue f
+            JOIN LATERAL (
+                SELECT s.id AS success_id
+                FROM webhook_event_queue s
+                CROSS JOIN LATERAL (SELECT CASE
+                    WHEN jsonb_typeof(f.payload_json->'new_episode_ids') = 'array'
+                    THEN f.payload_json->'new_episode_ids' ELSE '[]'::jsonb END AS ids) fe
+                CROSS JOIN LATERAL (SELECT CASE
+                    WHEN jsonb_typeof(s.payload_json->'new_episode_ids') = 'array'
+                    THEN s.payload_json->'new_episode_ids' ELSE '[]'::jsonb END AS ids) se
+                WHERE """ + _RECOVERY_MATCH_SQL + """
+                  AND (%s::bigint IS NULL OR s.id = %s::bigint)
+                ORDER BY s.id DESC LIMIT 1
+            ) proof ON TRUE
+            WHERE f.status = 'failed'
+        )
+        UPDATE webhook_event_queue f
+        SET status = 'recovered', resolved_at = NOW(), updated_at = NOW(),
+            resolution_json = jsonb_build_object(
+                'method', 'covered_by_success', 'event_id', covered.success_id)
+        FROM covered
+        WHERE f.id = covered.id AND f.status = 'failed'
+        """,
+        (successful_event_id, successful_event_id),
+    )
+    return cursor.rowcount
+
+
+def reconcile_failed_events() -> int:
+    """Backfill provable recovery after upgrading, using queue evidence only."""
+    with get_db_connection() as conn, conn.cursor() as cursor:
+        return _reconcile_failed_events(cursor)
+
+
+def archive_failed_event(event_id: int, actor_id: str) -> bool:
+    """Explicit administrator acknowledgement, not execution success or replay."""
+    with get_db_connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            """
+            UPDATE webhook_event_queue
+            SET status = 'archived', resolved_at = NOW(), updated_at = NOW(),
+                resolution_json = jsonb_build_object(
+                    'method', 'manual_confirmation', 'actor_id', %s::text)
+            WHERE id = %s AND status = 'failed'
+            """,
+            (str(actor_id or 'auth_disabled')[:128], event_id),
+        )
+        return cursor.rowcount > 0
+
 
 def get_db_connection():
     # Keep payload helpers importable in lightweight test environments where
@@ -251,6 +338,7 @@ def mark_completed(event_id: int) -> None:
                 """,
                 (event_id,),
             )
+            _reconcile_failed_events(cursor, successful_event_id=event_id)
 
 
 def mark_failed(event_id: int, error: str) -> str:
@@ -421,7 +509,8 @@ def list_recent_events(limit: int = 50) -> List[Dict[str, Any]]:
                 """
                 SELECT id, event_source, task_kind, task_name, item_id, item_name,
                        item_type, status, attempt_count, max_attempts, next_attempt_at,
-                       last_error, created_at, updated_at, started_at, completed_at
+                       last_error, created_at, updated_at, started_at, completed_at,
+                       resolution_json, resolved_at
                 FROM webhook_event_queue
                 ORDER BY id DESC
                 LIMIT %s
@@ -442,6 +531,8 @@ def get_queue_summary() -> Dict[str, Any]:
                     COUNT(*) FILTER (WHERE status = 'retry') AS retry_count,
                     COUNT(*) FILTER (WHERE status = 'failed') AS failed_count,
                     COUNT(*) FILTER (WHERE status = 'completed') AS completed_count,
+                    COUNT(*) FILTER (WHERE status = 'recovered') AS recovered_count,
+                    COUNT(*) FILTER (WHERE status = 'archived') AS archived_count,
                     MIN(created_at) FILTER (
                         WHERE status IN ('pending', 'retry')
                     ) AS oldest_pending_at,
@@ -471,8 +562,8 @@ def prune_old_events(retention_days: int = 30) -> int:
             cursor.execute(
                 """
                 DELETE FROM webhook_event_queue
-                WHERE status IN ('completed', 'superseded')
-                  AND completed_at < NOW() - (%s * INTERVAL '1 day')
+                WHERE status IN ('completed', 'superseded', 'recovered', 'archived')
+                  AND COALESCE(resolved_at, completed_at) < NOW() - (%s * INTERVAL '1 day')
                 """,
                 (max(1, int(retention_days)),),
             )

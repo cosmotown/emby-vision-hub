@@ -2,6 +2,22 @@
 
 CUSTOM_RELEASES = [
     {
+        "version": "v7.2.41",
+        "published_at": "2026-10-31T00:00:00+08:00",
+        "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.41",
+        "changelog": """## Webhook 历史失败记录恢复与归档
+
+- 修复媒体已经恢复，但旧 Webhook 失败仍长期计入告警、只能反复重试的问题。
+- 后续媒体处理成功且来源、精确媒体 ID、任务参数、Episode 集合及时间顺序证明完整覆盖时，将旧失败标记为“已恢复”；不按剧名判断，不重放旧事件。
+- 增加管理员“确认已恢复并归档”：显式确认后仅归档单条 failed，保留原错误和确认记录，不伪造 completed、不重新执行媒体任务。
+- 已恢复/归档从待处理失败计数中移出，沿用30天历史保留；证据不足的失败不会自动核销或过期。
+- 升级启动时使用已有成功证据核对历史失败；仅对 webhook_event_queue 增加两个审计字段和一个索引，不迁移人物或媒体表。
+- 不改变 v7.2.40 Person enrichment HOLD / 媒体处理边界，不修改 Person Cleanup、人物身份或保护配置、虚拟库、VidHub、Infuse、STRM或更新器逻辑。
+- 不包含历史人物审计工具、生产扫描结果或测试数据；本次发布不自动操作 NAS。
+
+""",
+    },
+    {
         "version": "v7.2.40",
         "published_at": "2026-10-18T00:00:00+08:00",
         "url": "https://github.com/cosmotown/emby-vision-hub/releases/tag/v7.2.40",
